@@ -1,0 +1,101 @@
+name: Sentry Release
+
+on:
+  workflow_call:
+    inputs:
+      sentry_org:
+        required: true
+        type: string
+      sentry_project:
+        required: true
+        type: string
+      has_frontend:
+        description: "Set to true for repos with Vite frontend builds that need source map uploads"
+        required: false
+        type: boolean
+        default: false
+      node_version:
+        required: false
+        type: string
+        default: "20"
+      needs_github_packages:
+        description: "Set to true if npm ci needs GitHub Packages registry auth"
+        required: false
+        type: boolean
+        default: false
+
+# Only one release at a time
+concurrency:
+  group: sentry-release
+  cancel-in-progress: true
+
+jobs:
+  sentry_release:
+    name: Create Sentry Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+      SENTRY_ORG: ${{ inputs.sentry_org }}
+      SENTRY_PROJECT: ${{ inputs.sentry_project }}
+      SENTRY_RELEASE: ${{ github.sha }}
+
+    steps:
+      - name: Check Sentry configuration
+        run: |
+          if [ -z "$SENTRY_AUTH_TOKEN" ]; then
+            echo "::warning::SENTRY_AUTH_TOKEN not configured. Skipping Sentry release."
+            echo "SKIP_SENTRY=true" >> $GITHUB_ENV
+          fi
+
+      - name: Checkout code
+        if: env.SKIP_SENTRY != 'true'
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # --- Frontend path: source map upload via Vite build ---
+
+      - name: Set up Node.js
+        if: env.SKIP_SENTRY != 'true' && inputs.has_frontend
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: "npm"
+          registry-url: ${{ inputs.needs_github_packages && 'https://npm.pkg.github.com' || '' }}
+
+      - name: Install npm dependencies
+        if: env.SKIP_SENTRY != 'true' && inputs.has_frontend
+        run: npm ci
+        env:
+          NODE_AUTH_TOKEN: ${{ inputs.needs_github_packages && secrets.GITHUB_TOKEN || '' }}
+
+      - name: Install sentry-cli
+        if: env.SKIP_SENTRY != 'true' && inputs.has_frontend
+        run: npm install -g @sentry/cli
+
+      - name: Create Sentry release and associate commits
+        if: env.SKIP_SENTRY != 'true' && inputs.has_frontend
+        run: |
+          sentry-cli releases new "$SENTRY_RELEASE"
+          sentry-cli releases set-commits "$SENTRY_RELEASE" --auto
+
+      - name: Build frontend assets with source map upload
+        if: env.SKIP_SENTRY != 'true' && inputs.has_frontend
+        env:
+          NODE_ENV: production
+        run: npx vite build
+
+      - name: Finalize Sentry release (frontend)
+        if: env.SKIP_SENTRY != 'true' && inputs.has_frontend
+        run: sentry-cli releases finalize "$SENTRY_RELEASE"
+
+      # --- Backend-only path: simple release via action ---
+
+      - name: Create Sentry release (backend)
+        if: env.SKIP_SENTRY != 'true' && !inputs.has_frontend
+        uses: getsentry/action-release@v3
+        with:
+          environment: production
+          version: ${{ github.sha }}

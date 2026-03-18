@@ -1,0 +1,258 @@
+name: Promote to Production
+
+on:
+  workflow_call:
+    inputs:
+      sentry_org:
+        required: true
+        type: string
+      sentry_project:
+        required: true
+        type: string
+      dry_run:
+        required: false
+        type: boolean
+        default: false
+      ref:
+        required: false
+        type: string
+        default: ""
+
+# Never cancel an in-progress promotion
+concurrency:
+  group: promote-production
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Promote to Production
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+
+    env:
+      SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+      SENTRY_ORG: ${{ inputs.sentry_org }}
+      SENTRY_PROJECT: ${{ inputs.sentry_project }}
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine target SHA
+        id: main
+        run: |
+          REF="${{ inputs.ref }}"
+          if [ -n "$REF" ]; then
+            if ! git rev-parse --verify "$REF" &>/dev/null; then
+              echo "::error::Ref '$REF' is not a valid commit"
+              exit 1
+            fi
+            if ! git merge-base --is-ancestor "$REF" HEAD; then
+              echo "::error::Ref '$REF' is not an ancestor of main — can only promote commits on main"
+              exit 1
+            fi
+            SHA=$(git rev-parse "$REF")
+            echo "Promoting up to specified ref: $SHA"
+          else
+            SHA=$(git rev-parse HEAD)
+            echo "Promoting main HEAD: $SHA"
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Verify CI passed on main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SHA="${{ steps.main.outputs.sha }}"
+          echo "Checking CI status for $SHA"
+
+          CONCLUSION=""
+          for i in 1 2 3; do
+            CONCLUSION=$(gh run list \
+              --workflow=ci.yml \
+              --branch=main \
+              --json headSha,conclusion \
+              --jq ".[] | select(.headSha == \"$SHA\") | .conclusion" \
+              | head -1)
+            if [ -n "$CONCLUSION" ]; then
+              break
+            fi
+            echo "CI run not found yet, retrying in 10s... (attempt $i/3)"
+            sleep 10
+          done
+
+          if [ -z "$CONCLUSION" ]; then
+            echo "::error::No CI run found for SHA $SHA"
+            exit 1
+          fi
+
+          if [ "$CONCLUSION" != "success" ]; then
+            echo "::error::CI status is '$CONCLUSION' (expected 'success') for SHA $SHA"
+            exit 1
+          fi
+
+          echo "CI passed for $SHA"
+
+      - name: Check production branch state
+        id: check
+        run: |
+          SHA="${{ steps.main.outputs.sha }}"
+
+          if ! git rev-parse --verify origin/production &>/dev/null; then
+            echo "::error::production branch does not exist — create it first"
+            exit 1
+          fi
+
+          PROD_SHA=$(git rev-parse origin/production)
+          echo "prod_sha=$PROD_SHA" >> "$GITHUB_OUTPUT"
+
+          if [ "$SHA" = "$PROD_SHA" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::production branch is already at $SHA — nothing to promote"
+            exit 0
+          fi
+
+          if ! git merge-base --is-ancestor origin/production "$SHA"; then
+            echo "::error::production branch has diverged from target — manual resolution required"
+            exit 1
+          fi
+
+          COMMIT_COUNT=$(git rev-list origin/production.."$SHA" --count)
+          echo "commit_count=$COMMIT_COUNT" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "Promoting $COMMIT_COUNT commit(s) to production"
+
+      - name: Generate release tag
+        if: steps.check.outputs.skip != 'true'
+        id: tag
+        run: |
+          TODAY=$(date -u +%Y.%m.%d)
+          PREFIX="v${TODAY}"
+
+          EXISTING=$(git tag -l "${PREFIX}.*" | sort -t. -k4 -n | tail -1)
+          if [ -n "$EXISTING" ]; then
+            LAST_N=$(echo "$EXISTING" | rev | cut -d. -f1 | rev)
+            NEXT_N=$((LAST_N + 1))
+          else
+            NEXT_N=1
+          fi
+
+          TAG="${PREFIX}.${NEXT_N}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Generated tag: $TAG"
+
+      - name: Write deploy summary
+        if: steps.check.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SHA="${{ steps.main.outputs.sha }}"
+          TAG="${{ steps.tag.outputs.tag }}"
+          DRY_RUN="${{ inputs.dry_run }}"
+
+          {
+            echo "## Production Promotion"
+            echo ""
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "> **DRY RUN** — no changes will be promoted"
+              echo ""
+            fi
+            echo "**Tag:** \`$TAG\`"
+            echo "**SHA:** \`$SHA\`"
+            echo "**Commits:** ${{ steps.check.outputs.commit_count }}"
+            echo ""
+            echo "### Commits"
+            echo ""
+            git log origin/production.."$SHA" --format="- %h %s" --reverse
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Promote main to production branch
+        if: steps.check.outputs.skip != 'true' && inputs.dry_run != true
+        run: |
+          SHA="${{ steps.main.outputs.sha }}"
+          git push origin "${SHA}:refs/heads/production"
+
+          git fetch origin production
+          PUSHED_SHA=$(git rev-parse origin/production)
+          if [ "$PUSHED_SHA" != "$SHA" ]; then
+            echo "::error::Production branch promotion failed — expected $SHA, got $PUSHED_SHA"
+            exit 1
+          fi
+
+          echo "Promoted production branch to $SHA"
+
+      - name: Create release tag
+        if: steps.check.outputs.skip != 'true' && inputs.dry_run != true
+        run: |
+          SHA="${{ steps.main.outputs.sha }}"
+          TAG="${{ steps.tag.outputs.tag }}"
+
+          git tag -a "$TAG" "$SHA" -m "Production release $TAG"
+          git push origin "$TAG"
+          echo "Created and pushed tag $TAG"
+
+      - name: Create GitHub Release
+        if: steps.check.outputs.skip != 'true' && inputs.dry_run != true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SHA="${{ steps.main.outputs.sha }}"
+          TAG="${{ steps.tag.outputs.tag }}"
+          PREV_SHA="${{ steps.check.outputs.prod_sha }}"
+
+          COMMIT_COUNT=$(git rev-list ${PREV_SHA}..${SHA} --count)
+          NOTES=$(git log ${PREV_SHA}..${SHA} --format="- %h %s (%an)" --reverse | head -50)
+
+          if [ "$COMMIT_COUNT" -gt 50 ]; then
+            NOTES="$NOTES"$'\n'"_($((COMMIT_COUNT - 50)) more commits not shown)_"
+          fi
+
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes "$NOTES" \
+            --target "$SHA"
+
+          echo "Created GitHub Release $TAG"
+
+      - name: Notify Sentry of production deploy
+        if: steps.check.outputs.skip != 'true' && inputs.dry_run != true
+        run: |
+          SHA="${{ steps.main.outputs.sha }}"
+
+          if [ -z "$SENTRY_AUTH_TOKEN" ]; then
+            echo "::warning::SENTRY_AUTH_TOKEN not configured — skipping Sentry deploy notification"
+            exit 0
+          fi
+
+          npm install -g @sentry/cli
+
+          sentry-cli releases new "$SHA" 2>/dev/null || true
+
+          if sentry-cli releases deploys "$SHA" new \
+            -e production \
+            --name "${{ steps.tag.outputs.tag }}"; then
+            echo "Recorded Sentry deploy for release $SHA in production environment"
+          else
+            echo "::warning::Failed to notify Sentry of deploy — deployment itself succeeded"
+          fi
+
+      - name: Final summary
+        if: always()
+        run: |
+          SHA="${{ steps.main.outputs.sha }}"
+          TAG="${{ steps.tag.outputs.tag }}"
+          SKIP="${{ steps.check.outputs.skip }}"
+          DRY_RUN="${{ inputs.dry_run }}"
+
+          if [ "$SKIP" = "true" ]; then
+            echo "::notice::No-op — production is already at main ($SHA)"
+          elif [ "$DRY_RUN" = "true" ]; then
+            echo "::notice::Dry run complete — would have promoted $TAG ($SHA)"
+          else
+            echo "::notice::Promoted $TAG ($SHA) to production"
+          fi
