@@ -1,0 +1,70 @@
+# .github
+
+Shared GitHub Actions workflows for the Sidekick Labs organization.
+
+## Reusable Workflows
+
+### `build-and-push-image.yml`
+
+Builds a Docker image and pushes it to DigitalOcean Container Registry (DOCR). Any repo in the org can call this workflow.
+
+**Inputs:**
+
+| Input | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `dockerfile` | Yes | - | Path to the Dockerfile |
+| `image_name` | Yes | - | Image name in DOCR (e.g., `sidekick-web-base`) |
+| `tags` | Yes | - | Comma-separated image tags (e.g., `ruby-3.4.4,latest`) |
+| `context` | No | `.` | Docker build context path |
+| `build_args` | No | `''` | Docker build arguments (multiline, `KEY=VALUE` format) |
+| `registry` | No | `sidekick-labs` | DOCR registry name |
+| `timeout` | No | `20` | Job timeout in minutes |
+
+**Required secrets:** `DIGITALOCEAN_ACCESS_TOKEN` (set as a GitHub org secret).
+
+#### Example: calling from a repo
+
+```yaml
+# .github/workflows/build-base-images.yml
+name: Build Base Images
+
+on:
+  push:
+    paths:
+      - 'Dockerfile.base'
+      - 'Dockerfile.deps'
+  workflow_dispatch:
+
+jobs:
+  build-base:
+    uses: sidekick-labs/.github/.github/workflows/build-and-push-image.yml@main
+    with:
+      dockerfile: ./Dockerfile.base
+      image_name: sidekick-web-base
+      tags: ruby-3.4.4,latest
+    secrets: inherit
+
+  build-deps:
+    needs: build-base
+    uses: sidekick-labs/.github/.github/workflows/build-and-push-image.yml@main
+    with:
+      dockerfile: ./Dockerfile.deps
+      image_name: sidekick-web-deps
+      tags: latest
+      build_args: |
+        BASE_TAG=ruby-3.4.4
+        NODE_AUTH_TOKEN=${{ secrets.GITHUB_TOKEN }}
+    secrets: inherit
+```
+
+### `deploy-production.yml`
+
+Promotes the main branch to production with release tagging and Sentry deploy notification.
+
+### `sentry-release.yml`
+
+Creates a Sentry release with optional frontend source map upload.
+
+## DOCR Setup
+
+See [DOCR-SETUP.md](DOCR-SETUP.md) for the manual provisioning checklist.
