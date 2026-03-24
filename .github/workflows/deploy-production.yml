@@ -17,6 +17,16 @@ on:
         required: false
         type: string
         default: ""
+      do_app_id:
+        required: false
+        type: string
+        default: ""
+        description: "DigitalOcean App Platform app ID for deploy status tracking"
+      app_url:
+        required: false
+        type: string
+        default: ""
+        description: "Production URL for GitHub environment link"
 
 # Never cancel an in-progress promotion
 concurrency:
@@ -171,6 +181,22 @@ jobs:
             git log origin/production.."$SHA" --format="- %h %s" --reverse
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Create GitHub deployment
+        if: steps.check.outputs.skip != 'true' && inputs.dry_run != true
+        id: deployment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SHA="${{ steps.main.outputs.sha }}"
+          DEPLOY_ID=$(gh api repos/${{ github.repository }}/deployments \
+            -f ref="$SHA" \
+            -f environment="production" \
+            -f description="Production release ${{ steps.tag.outputs.tag }}" \
+            -f auto_merge=false \
+            --jq '.id')
+          echo "deployment_id=$DEPLOY_ID" >> "$GITHUB_OUTPUT"
+          echo "Created GitHub deployment $DEPLOY_ID"
+
       - name: Promote main to production branch
         if: steps.check.outputs.skip != 'true' && inputs.dry_run != true
         run: |
@@ -185,6 +211,85 @@ jobs:
           fi
 
           echo "Promoted production branch to $SHA"
+
+      - name: Wait for DigitalOcean deployment
+        if: steps.check.outputs.skip != 'true' && inputs.dry_run != true && inputs.do_app_id != ''
+        id: do_deploy
+        env:
+          DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+        run: |
+          APP_ID="${{ inputs.do_app_id }}"
+
+          # Install doctl
+          wget -qO- https://github.com/digitalocean/doctl/releases/download/v1.115.0/doctl-1.115.0-linux-amd64.tar.gz | tar xz
+          sudo mv doctl /usr/local/bin/
+          doctl auth init --access-token "$DIGITALOCEAN_ACCESS_TOKEN"
+
+          # Wait for DO to detect the branch push
+          echo "Waiting for DigitalOcean to start deployment..."
+          sleep 30
+
+          # Get the latest deployment
+          DEPLOY_ID=$(doctl apps list-deployments "$APP_ID" --format ID --no-header | head -1)
+          if [ -z "$DEPLOY_ID" ]; then
+            echo "::warning::No deployment found for app $APP_ID"
+            exit 0
+          fi
+
+          echo "Watching deployment $DEPLOY_ID..."
+
+          TIMEOUT=600
+          ELAPSED=0
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            PHASE=$(doctl apps get-deployment "$APP_ID" "$DEPLOY_ID" --format Phase --no-header)
+            echo "  Status: $PHASE (${ELAPSED}s elapsed)"
+
+            case "$PHASE" in
+              ACTIVE)
+                echo "deploy_status=success" >> "$GITHUB_OUTPUT"
+                echo "DigitalOcean deployment succeeded"
+                exit 0
+                ;;
+              ERROR|FAILED|CANCELED)
+                echo "deploy_status=failure" >> "$GITHUB_OUTPUT"
+                echo "::error::DigitalOcean deployment $PHASE"
+                exit 1
+                ;;
+            esac
+
+            sleep 15
+            ELAPSED=$((ELAPSED + 15))
+          done
+
+          echo "deploy_status=timeout" >> "$GITHUB_OUTPUT"
+          echo "::error::DigitalOcean deployment timed out after ${TIMEOUT}s"
+          exit 1
+
+      - name: Update deployment status (success)
+        if: steps.check.outputs.skip != 'true' && inputs.dry_run != true && steps.deployment.outputs.deployment_id != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          APP_URL="${{ inputs.app_url }}"
+          EXTRA_ARGS=""
+          if [ -n "$APP_URL" ]; then
+            EXTRA_ARGS="-f environment_url=$APP_URL"
+          fi
+          gh api repos/${{ github.repository }}/deployments/${{ steps.deployment.outputs.deployment_id }}/statuses \
+            -f state="success" \
+            -f environment="production" \
+            -f description="Deployed ${{ steps.tag.outputs.tag }}" \
+            $EXTRA_ARGS
+
+      - name: Update deployment status (failure)
+        if: failure() && steps.deployment.outputs.deployment_id != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api repos/${{ github.repository }}/deployments/${{ steps.deployment.outputs.deployment_id }}/statuses \
+            -f state="failure" \
+            -f environment="production" \
+            -f description="Deployment failed"
 
       - name: Create release tag
         if: steps.check.outputs.skip != 'true' && inputs.dry_run != true
