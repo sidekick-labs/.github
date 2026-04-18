@@ -95,7 +95,7 @@ jobs:
 
       - name: Create Sentry release (backend)
         if: env.SKIP_SENTRY != 'true' && !inputs.has_frontend
-        uses: getsentry/action-release@v3
+        uses: getsentry/action-release@5657c9e888b4e2cc85f4d29143ea4131fde4a73a # v3.6.0
         with:
           environment: production
           version: ${{ github.sha }}
