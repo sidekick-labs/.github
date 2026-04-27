@@ -1,0 +1,521 @@
+name: Reusable Weekly Maintenance
+
+# Reusable weekly-maintenance workflow.
+#
+# Consumers reference this with:
+#
+#   jobs:
+#     maintenance:
+#       uses: <org>/.github/.github/workflows/reusable-weekly-maintenance.yml@v1
+#       with:
+#         stack: rails
+#         run-brakeman: true
+#         run-sorbet-rbi: true
+#       secrets:
+#         claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+#
+# See docs/reusable-workflows.md for the full input contract.
+
+on:
+  workflow_call:
+    inputs:
+      stack:
+        description: 'Stack: rails | ruby-gem | node-lib | node-app | kmp'
+        required: true
+        type: string
+      ruby-version-file:
+        description: 'Path to .ruby-version file (rails, ruby-gem stacks).'
+        required: false
+        type: string
+        default: '.ruby-version'
+      ruby-version:
+        description: 'Explicit ruby-version override (takes precedence over ruby-version-file).'
+        required: false
+        type: string
+        default: ''
+      node-version:
+        description: 'Node version (rails, node-lib, node-app stacks).'
+        required: false
+        type: string
+        default: 'lts/*'
+      jdk-version:
+        description: 'JDK version (kmp stack).'
+        required: false
+        type: string
+        default: '17'
+      bundle-update-strategy:
+        description: 'Bundler update strategy: lock-update | conservative | none.'
+        required: false
+        type: string
+        default: 'lock-update'
+      run-bundler-audit:
+        description: 'Run bundler-audit (rails, ruby-gem stacks).'
+        required: false
+        type: boolean
+        default: true
+      run-brakeman:
+        description: 'Run brakeman (rails stack only).'
+        required: false
+        type: boolean
+        default: false
+      run-sorbet-rbi:
+        description: 'Regenerate Sorbet RBI files via tapioca and include drift in the PR (rails stack only).'
+        required: false
+        type: boolean
+        default: false
+      run-npm-audit:
+        description: 'Run npm audit fix (rails, node-lib, node-app stacks).'
+        required: false
+        type: boolean
+        default: true
+      lint-commands:
+        description: 'Multiline shell commands run as part of pre-PR verification (e.g. rubocop, eslint, tsc).'
+        required: false
+        type: string
+        default: ''
+      test-commands:
+        description: 'Multiline shell commands for the full test suite, run as part of pre-PR verification.'
+        required: false
+        type: string
+        default: ''
+      gradle-test-command:
+        description: 'Gradle test command (kmp stack).'
+        required: false
+        type: string
+        default: './gradlew test'
+      linear-fallback:
+        description: 'When true, Claude opens a Linear issue for risky/judgment-call items instead of dropping them.'
+        required: false
+        type: boolean
+        default: false
+      additional-allowed-tools:
+        description: 'Comma-separated extra entries appended to claude_args --allowed-tools.'
+        required: false
+        type: string
+        default: ''
+      todo-fixme-paths:
+        description: 'Space-separated paths scanned for TODO/FIXME census (default: project root).'
+        required: false
+        type: string
+        default: '.'
+      todo-fixme-exclude:
+        description: 'Space-separated globs excluded from the TODO/FIXME census.'
+        required: false
+        type: string
+        default: 'node_modules/** vendor/** tmp/** log/** .worktrees/** dist/** build/** coverage/** sorbet/rbi/**'
+      timeout-minutes:
+        description: 'Job-level timeout.'
+        required: false
+        type: number
+        default: 45
+      claude-timeout-minutes:
+        description: 'Timeout for the Claude action step.'
+        required: false
+        type: number
+        default: 25
+
+    secrets:
+      claude-code-oauth-token:
+        description: 'CLAUDE_CODE_OAUTH_TOKEN for the anthropics action.'
+        required: true
+      linear-api-key:
+        description: 'LINEAR_API_KEY for the Linear MCP server (only used when linear-fallback=true).'
+        required: false
+
+permissions: {}
+
+jobs:
+  maintenance:
+    name: Weekly Maintenance (${{ inputs.stack }})
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
+
+    steps:
+      - name: Validate inputs
+        env:
+          STACK: ${{ inputs.stack }}
+          STRATEGY: ${{ inputs.bundle-update-strategy }}
+        run: |
+          set -euo pipefail
+          case "$STACK" in
+            rails|ruby-gem|node-lib|node-app|kmp) ;;
+            *) echo "::error::Invalid stack: $STACK"; exit 1 ;;
+          esac
+          case "$STRATEGY" in
+            lock-update|conservative|none) ;;
+            *) echo "::error::Invalid bundle-update-strategy: $STRATEGY"; exit 1 ;;
+          esac
+
+      - name: Validate required secrets
+        env:
+          CLAUDE_TOKEN: ${{ secrets.claude-code-oauth-token }}
+          LINEAR_KEY: ${{ secrets.linear-api-key }}
+          LINEAR_FALLBACK: ${{ inputs.linear-fallback }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CLAUDE_TOKEN:-}" ]; then
+            echo "::error::claude-code-oauth-token secret is not set"
+            exit 1
+          fi
+          if [ "$LINEAR_FALLBACK" = "true" ] && [ -z "${LINEAR_KEY:-}" ]; then
+            echo "::warning::linear-fallback enabled but linear-api-key is empty - Linear fallback will be unavailable"
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+
+      - name: Detect default branch
+        id: default-branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          DEFAULT_BRANCH=$(gh repo view --json defaultBranchRef -q '.defaultBranchRef.name' 2>/dev/null || echo "main")
+          echo "branch=$DEFAULT_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "Detected default branch: $DEFAULT_BRANCH"
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # ----- stack setup -----
+
+      - name: Set up Ruby
+        if: ${{ inputs.stack == 'rails' || inputs.stack == 'ruby-gem' }}
+        uses: ruby/setup-ruby@7372622e62b60b3cb750dcd2b9e32c247ffec26a # v1.302.0
+        with:
+          ruby-version: ${{ inputs.ruby-version != '' && inputs.ruby-version || '' }}
+          ruby-version-file: ${{ inputs.ruby-version == '' && inputs.ruby-version-file || '' }}
+          bundler-cache: true
+
+      - name: Set up Node.js
+        if: ${{ inputs.stack == 'rails' || inputs.stack == 'node-lib' || inputs.stack == 'node-app' }}
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+
+      - name: Install npm dependencies
+        if: ${{ inputs.stack == 'rails' || inputs.stack == 'node-lib' || inputs.stack == 'node-app' }}
+        run: npm ci
+
+      - name: Set up JDK
+        if: ${{ inputs.stack == 'kmp' }}
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'zulu'
+          java-version: ${{ inputs.jdk-version }}
+
+      - name: Set up Gradle
+        if: ${{ inputs.stack == 'kmp' }}
+        uses: gradle/actions/setup-gradle@v6
+
+      # ----- TODO/FIXME census (week-over-week diff via cache) -----
+
+      - name: Restore previous TODO/FIXME census
+        id: census-cache
+        uses: actions/cache@v4
+        with:
+          path: .maintenance-cache/todo-fixme.previous.txt
+          key: weekly-maintenance-todo-fixme-${{ github.repository_id }}-${{ github.run_id }}
+          restore-keys: |
+            weekly-maintenance-todo-fixme-${{ github.repository_id }}-
+
+      - name: Capture TODO/FIXME census
+        id: census
+        env:
+          PATHS: ${{ inputs.todo-fixme-paths }}
+          EXCLUDES: ${{ inputs.todo-fixme-exclude }}
+        run: |
+          set -euo pipefail
+          mkdir -p .maintenance-cache tmp/maintenance
+          GLOB_ARGS=()
+          for pattern in $EXCLUDES; do
+            GLOB_ARGS+=(--glob "!$pattern")
+          done
+          # shellcheck disable=SC2086
+          if command -v rg >/dev/null 2>&1; then
+            rg -n --no-heading --color=never \
+              -e '\b(TODO|FIXME|XXX|HACK)\b' \
+              "${GLOB_ARGS[@]}" $PATHS \
+              > tmp/maintenance/todo-fixme.current.txt || true
+          else
+            grep -rEn '\b(TODO|FIXME|XXX|HACK)\b' $PATHS \
+              > tmp/maintenance/todo-fixme.current.txt || true
+          fi
+          CURRENT_COUNT=$(wc -l < tmp/maintenance/todo-fixme.current.txt | tr -d ' ')
+          echo "current_count=$CURRENT_COUNT" >> "$GITHUB_OUTPUT"
+
+          if [ -f .maintenance-cache/todo-fixme.previous.txt ]; then
+            PREVIOUS_COUNT=$(wc -l < .maintenance-cache/todo-fixme.previous.txt | tr -d ' ')
+            DELTA=$((CURRENT_COUNT - PREVIOUS_COUNT))
+            echo "previous_count=$PREVIOUS_COUNT" >> "$GITHUB_OUTPUT"
+            echo "delta=$DELTA" >> "$GITHUB_OUTPUT"
+            diff -u .maintenance-cache/todo-fixme.previous.txt tmp/maintenance/todo-fixme.current.txt \
+              > tmp/maintenance/todo-fixme.diff.txt || true
+          else
+            echo "previous_count=" >> "$GITHUB_OUTPUT"
+            echo "delta=" >> "$GITHUB_OUTPUT"
+            : > tmp/maintenance/todo-fixme.diff.txt
+          fi
+
+          # Refresh cached "previous" for next run.
+          cp tmp/maintenance/todo-fixme.current.txt .maintenance-cache/todo-fixme.previous.txt
+
+          {
+            echo "## TODO/FIXME census"
+            echo
+            echo "- Current count: $CURRENT_COUNT"
+            if [ -n "${PREVIOUS_COUNT:-}" ]; then
+              echo "- Previous count: $PREVIOUS_COUNT"
+              echo "- Delta: $DELTA"
+            else
+              echo "- Previous count: (no prior run)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ----- assemble prompt + allowed-tools (shell is much easier than expressions) -----
+
+      - name: Assemble Claude prompt and MCP config
+        id: build-prompt
+        env:
+          STACK: ${{ inputs.stack }}
+          BUNDLE_STRATEGY: ${{ inputs.bundle-update-strategy }}
+          RUN_BUNDLER_AUDIT: ${{ inputs.run-bundler-audit }}
+          RUN_BRAKEMAN: ${{ inputs.run-brakeman }}
+          RUN_SORBET_RBI: ${{ inputs.run-sorbet-rbi }}
+          RUN_NPM_AUDIT: ${{ inputs.run-npm-audit }}
+          LINT_COMMANDS: ${{ inputs.lint-commands }}
+          TEST_COMMANDS: ${{ inputs.test-commands }}
+          GRADLE_TEST_COMMAND: ${{ inputs.gradle-test-command }}
+          LINEAR_FALLBACK: ${{ inputs.linear-fallback }}
+          LINEAR_API_KEY: ${{ secrets.linear-api-key }}
+          ADDITIONAL_ALLOWED_TOOLS: ${{ inputs.additional-allowed-tools }}
+          DEFAULT_BRANCH: ${{ steps.default-branch.outputs.branch }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_ID: ${{ github.run_id }}
+          TODO_CURRENT: ${{ steps.census.outputs.current_count }}
+          TODO_PREVIOUS: ${{ steps.census.outputs.previous_count }}
+          TODO_DELTA: ${{ steps.census.outputs.delta }}
+        run: |
+          set -euo pipefail
+          mkdir -p tmp/maintenance
+
+          PROMPT_FILE=tmp/maintenance/prompt.txt
+          {
+            echo "REPO: $REPO"
+            echo "DEFAULT_BRANCH: $DEFAULT_BRANCH"
+            echo "RUN_URL: $RUN_URL"
+            echo "RUN_ID: $RUN_ID"
+            echo "STACK: $STACK"
+            echo "TODO_FIXME_CURRENT_COUNT: $TODO_CURRENT"
+            echo "TODO_FIXME_PREVIOUS_COUNT: $TODO_PREVIOUS"
+            echo "TODO_FIXME_DELTA: $TODO_DELTA"
+            echo "CENSUS_FILE: tmp/maintenance/todo-fixme.current.txt"
+            echo "CENSUS_DIFF_FILE: tmp/maintenance/todo-fixme.diff.txt"
+            echo
+            echo "Perform weekly repository maintenance. You MUST attempt to create a PR with fixes when changes are produced."
+            echo
+            echo "## Update steps (run in order; skip any that don't apply to this stack)"
+            echo
+
+            case "$STACK" in
+              rails|ruby-gem)
+                if [ "$BUNDLE_STRATEGY" = "conservative" ]; then
+                  echo "- Run \`bundle update --conservative\` then \`bundle install\`"
+                elif [ "$BUNDLE_STRATEGY" = "lock-update" ]; then
+                  echo "- Run \`bundle lock --update\` then \`bundle install\`"
+                fi
+                ;;
+            esac
+
+            case "$STACK" in
+              rails|node-lib|node-app)
+                if [ "$RUN_NPM_AUDIT" = "true" ]; then
+                  echo "- Run \`npm audit fix\` (do NOT run \`npm update\` — Dependabot handles version bumps)"
+                fi
+                ;;
+            esac
+
+            case "$STACK" in
+              rails|ruby-gem)
+                if [ "$RUN_BUNDLER_AUDIT" = "true" ]; then
+                  echo "- Run \`bundle exec bundler-audit check --update\` to surface known gem CVEs"
+                fi
+                ;;
+            esac
+
+            if [ "$STACK" = "rails" ] && [ "$RUN_BRAKEMAN" = "true" ]; then
+              echo "- Run \`bin/brakeman --no-pager -q\` to surface security findings (informational; capture summary in PR body)"
+            fi
+
+            if [ "$STACK" = "rails" ] && [ "$RUN_SORBET_RBI" = "true" ]; then
+              echo "- Regenerate Sorbet RBIs: \`RAILS_ENV=test SECRET_KEY_BASE_DUMMY=1 bin/tapioca dsl --no-halt-upon-load-error && bin/tapioca gems && bin/tapioca annotations\`. Include any \`sorbet/\` drift in the PR."
+            fi
+
+            if [ "$STACK" = "kmp" ]; then
+              echo "- Review \`gradle/libs.versions.toml\` for safe minor/patch dependency bumps"
+            fi
+
+            echo
+            echo "Always:"
+            echo "- Check open PRs older than 90 days: \`gh pr list --state open\`"
+            echo "- Review the TODO/FIXME census at \`tmp/maintenance/todo-fixme.current.txt\`. If TODO_FIXME_DELTA is set, summarise the change in the PR body. If TODO_FIXME_DELTA > 0, include the new entries from \`tmp/maintenance/todo-fixme.diff.txt\`."
+            echo
+            echo "## Verification (after updates, before PR)"
+            echo
+            echo "Run every command below. If ANY fails, do NOT create a PR — emit a summary of failures and exit."
+            echo
+
+            if [ -n "$LINT_COMMANDS" ]; then
+              echo "Lint:"
+              echo '```bash'
+              printf '%s\n' "$LINT_COMMANDS"
+              echo '```'
+              echo
+            fi
+
+            if [ -n "$TEST_COMMANDS" ]; then
+              echo "Tests:"
+              echo '```bash'
+              printf '%s\n' "$TEST_COMMANDS"
+              echo '```'
+              echo
+            fi
+
+            if [ "$STACK" = "kmp" ] && [ -n "$GRADLE_TEST_COMMAND" ]; then
+              echo "Tests:"
+              echo '```bash'
+              printf '%s\n' "$GRADLE_TEST_COMMAND"
+              echo '```'
+              echo
+            fi
+
+            echo "## Output rules"
+            echo
+            echo "- If \`git diff\` is empty after updates: output \"No dependency changes needed\" and summarise findings (TODO/FIXME, stale PRs, audit). No PR."
+            echo "- If diff is non-empty AND verification passed: open a signed PR via the steps below."
+            echo "- If diff is non-empty AND verification failed: do NOT open a PR; output the failure summary."
+            if [ "$LINEAR_FALLBACK" = "true" ]; then
+              echo "- For risky judgment-call items (major bumps, code-changing fixes, design-decision TODOs): create ONE Linear issue summarising findings. Determine team/project/labels by querying Linear. Always include RUN_URL in the issue body."
+            fi
+            echo "- Do NOT create or reference GitHub Issues (these repos do not use them)."
+            echo "- Always include RUN_URL in the PR body."
+            echo
+            echo "## PR creation (when there are changes AND verification passes)"
+            echo
+            echo '```bash'
+            echo 'BRANCH="maintenance/weekly-$GITHUB_RUN_ID"'
+            echo 'git checkout -b "$BRANCH"'
+            echo 'git add -A'
+            echo 'git commit -m "chore: weekly dependency maintenance"'
+            echo 'git push -u origin HEAD'
+            echo
+            echo '# Replace the unsigned commit with a signed one via the GitHub API.'
+            echo 'TREE=$(git rev-parse HEAD^{tree})'
+            echo 'PARENT=$(git rev-parse HEAD^)'
+            echo 'SIGNED=$(gh api "repos/$GITHUB_REPOSITORY/git/commits" \'
+            echo '  --method POST \'
+            echo '  -f message="chore: weekly dependency maintenance" \'
+            echo '  -f tree="$TREE" \'
+            echo '  -f "parents[]=$PARENT" \'
+            echo "  --jq '.sha')"
+            echo '[ -z "$SIGNED" ] && { echo "ERROR: failed to create signed commit via API" >&2; exit 1; }'
+            echo
+            echo 'gh api "repos/$GITHUB_REPOSITORY/git/refs/heads/$BRANCH" \'
+            echo '  --method PATCH \'
+            echo '  -f sha="$SIGNED" \'
+            echo '  -F force=true'
+            echo
+            echo '# Verify the ref now points at the signed commit before opening the PR.'
+            echo "UPDATED=\$(gh api \"repos/\$GITHUB_REPOSITORY/git/refs/heads/\$BRANCH\" --jq '.object.sha')"
+            echo '[ "$UPDATED" != "$SIGNED" ] && { echo "ERROR: branch ref did not advance to signed SHA" >&2; exit 1; }'
+            echo '```'
+            echo
+            echo "Then open the PR with \`gh pr create --base \"$DEFAULT_BRANCH\" --title \"chore: weekly dependency maintenance\" --body \"...\"\` and include RUN_URL plus the maintenance findings (audit results, TODO/FIXME delta, stale PRs)."
+          } > "$PROMPT_FILE"
+
+          # Build the --allowed-tools list.
+          BASE_TOOLS='Read,Glob,Grep,Bash(git checkout:*),Bash(git add:*),Bash(git commit:*),Bash(git push:*),Bash(git diff:*),Bash(git status:*),Bash(git log:*),Bash(git rev-parse:*),Bash(bundle lock:*),Bash(bundle update:*),Bash(bundle install:*),Bash(bundle exec bundler-audit:*),Bash(bundle exec rubocop:*),Bash(bundle exec rspec:*),Bash(bundle audit:*),Bash(bin/rspec:*),Bash(bin/rubocop:*),Bash(bin/brakeman:*),Bash(bin/tapioca:*),Bash(npm audit:*),Bash(npm run:*),Bash(npm outdated:*),Bash(npm test:*),Bash(./gradlew:*),Bash(cat tmp/maintenance/*),Bash(wc:*),Bash(head:*),Bash(tail:*),Bash(diff:*),Bash(gh pr:*),Bash(gh repo:*),Bash(gh api:*)'
+          TOOLS="$BASE_TOOLS"
+          if [ -n "$ADDITIONAL_ALLOWED_TOOLS" ]; then
+            TOOLS="$TOOLS,$ADDITIONAL_ALLOWED_TOOLS"
+          fi
+          if [ "$LINEAR_FALLBACK" = "true" ]; then
+            TOOLS="$TOOLS,mcp__linear__*"
+          fi
+
+          # Build the MCP config. Only declare the Linear server when
+          # linear-fallback is enabled, otherwise emit an empty config so the
+          # action does not try to spawn mcp-remote with an empty bearer.
+          if [ "$LINEAR_FALLBACK" = "true" ]; then
+            MCP_CONFIG=$(cat <<EOF
+          {
+            "mcpServers": {
+              "linear": {
+                "command": "npx",
+                "args": [
+                  "-y",
+                  "mcp-remote",
+                  "https://mcp.linear.app/mcp",
+                  "--header",
+                  "Authorization:Bearer ${LINEAR_API_KEY:-}"
+                ]
+              }
+            }
+          }
+          EOF
+          )
+          else
+            MCP_CONFIG='{"mcpServers":{}}'
+          fi
+
+          # Emit prompt + tools + mcp config as multi-line outputs.
+          {
+            echo 'prompt<<MAINT_PROMPT_EOF'
+            cat "$PROMPT_FILE"
+            echo 'MAINT_PROMPT_EOF'
+            echo "allowed-tools=$TOOLS"
+            echo 'mcp-config<<MAINT_MCP_EOF'
+            printf '%s\n' "$MCP_CONFIG"
+            echo 'MAINT_MCP_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      # ----- weekly maintenance -----
+
+      - name: Weekly maintenance
+        id: maintenance
+        uses: anthropics/claude-code-action@38ec876110f9fbf8b950c79f534430740c3ac009 # v1
+        timeout-minutes: ${{ inputs.claude-timeout-minutes }}
+        env:
+          LINEAR_API_KEY: ${{ secrets.linear-api-key }}
+        with:
+          claude_code_oauth_token: ${{ secrets.claude-code-oauth-token }}
+          show_full_output: true
+          # MCP config is built in the previous step. When `linear-fallback`
+          # is true it includes the Linear remote MCP server; otherwise it is
+          # empty so we do not spawn `mcp-remote` with an empty bearer.
+          # See: https://linear.app/docs/mcp
+          mcp_config: ${{ steps.build-prompt.outputs.mcp-config }}
+          prompt: ${{ steps.build-prompt.outputs.prompt }}
+          claude_args: --allowed-tools "${{ steps.build-prompt.outputs.allowed-tools }}"
+
+      # ----- artifacts -----
+
+      - name: Upload maintenance artifacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: weekly-maintenance-${{ github.run_id }}
+          path: tmp/maintenance/
+          if-no-files-found: ignore
+          retention-days: 90
