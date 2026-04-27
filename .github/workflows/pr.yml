@@ -1,0 +1,25 @@
+name: PR
+
+# Triggers reviews on pull requests opened against this repo. The actual
+# review logic lives in `claude-code-review.yml` (a `workflow_call` reusable
+# also consumed by the rest of the org), so this file is intentionally thin.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions: {}
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: Claude Code Review
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    uses: ./.github/workflows/claude-code-review.yml
+    secrets: inherit
