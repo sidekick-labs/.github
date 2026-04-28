@@ -5,8 +5,12 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-    paths:
-      - '.github/workflows/**'
+    # Run on every PR. A `paths:` filter would skip the workflow on PRs
+    # that don't touch `.github/workflows/**`, but this check is required
+    # by branch protection — a skipped run leaves the required check in
+    # "Expected — Waiting for status to be reported" forever, which
+    # blocks every governance-only or doc-only PR. The CodeQL Actions
+    # analyzer is fast enough to run unconditionally.
   schedule:
     - cron: '30 6 * * 1'
 

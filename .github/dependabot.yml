@@ -1,0 +1,22 @@
+version: 2
+
+# Dependabot config for the sidekick-labs/.github repository itself.
+# Keeps the SHA-pinned third-party actions in our reusable workflows
+# (claude-agent, claude-code-review, deploy-production, sentry-release,
+# reusable-weekly-maintenance, codeql-actions) moving forward without
+# manual SHA bumps.
+
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      timezone: "Asia/Singapore"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
