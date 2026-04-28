@@ -232,8 +232,13 @@ jobs:
           # Get the latest deployment
           DEPLOY_ID=$(doctl apps list-deployments "$APP_ID" --format ID --no-header | head -1)
           if [ -z "$DEPLOY_ID" ]; then
-            echo "::warning::No deployment found for app $APP_ID"
-            exit 0
+            # Don't `exit 0` here — that would mark this step success and
+            # trigger the downstream "Update deployment status (success)"
+            # step (which only checks deployment_id, not poll outcome),
+            # producing a misleading ✅ badge on the commit.
+            echo "deploy_status=missing" >> "$GITHUB_OUTPUT"
+            echo "::error::No deployment found for app $APP_ID after the 30s settle window. The branch promotion succeeded but DigitalOcean did not pick up the change — investigate the App Platform integration."
+            exit 1
           fi
 
           echo "Watching deployment $DEPLOY_ID..."
