@@ -1,0 +1,92 @@
+name: Build and Push Docker Image to DOCR
+
+on:
+  workflow_call:
+    inputs:
+      context:
+        description: 'Docker build context path'
+        required: false
+        type: string
+        default: '.'
+      dockerfile:
+        description: 'Path to Dockerfile'
+        required: true
+        type: string
+      image_name:
+        description: 'Image name in DOCR (e.g., sidekick-web-base)'
+        required: true
+        type: string
+      tags:
+        description: 'Comma-separated image tags (e.g., ruby-3.4.4,latest)'
+        required: true
+        type: string
+      build_args:
+        description: 'Docker build arguments (multiline, KEY=VALUE format)'
+        required: false
+        type: string
+        default: ''
+      registry:
+        description: 'DOCR registry name'
+        required: false
+        type: string
+        default: 'sidekick-labs'
+      timeout:
+        description: 'Job timeout in minutes'
+        required: false
+        type: number
+        default: 20
+
+jobs:
+  build-and-push:
+    name: Build & Push ${{ inputs.image_name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+      - name: Log in to DOCR
+        run: doctl registry login --expiry-seconds 1200
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Generate image tags
+        id: tags
+        env:
+          INPUT_TAGS: ${{ inputs.tags }}
+          REGISTRY: ${{ inputs.registry }}
+          IMAGE: ${{ inputs.image_name }}
+        run: |
+          FULL_REGISTRY="registry.digitalocean.com/${REGISTRY}"
+          TAGS=""
+          IFS=',' read -ra TAG_ARRAY <<< "$INPUT_TAGS"
+          for tag in "${TAG_ARRAY[@]}"; do
+            tag=$(echo "$tag" | xargs)
+            if [ -n "$TAGS" ]; then
+              TAGS="${TAGS}"$'\n'
+            fi
+            TAGS="${TAGS}${FULL_REGISTRY}/${IMAGE}:${tag}"
+          done
+          {
+            echo "tags<<EOF"
+            echo "$TAGS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: ${{ inputs.build_args }}
+          cache-from: type=registry,ref=registry.digitalocean.com/${{ inputs.registry }}/${{ inputs.image_name }}:latest
+          cache-to: type=inline
