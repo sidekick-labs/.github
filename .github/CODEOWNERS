@@ -1,0 +1,6 @@
+# Default owner for everything in this repository. Branch protection on
+# `main` doesn't currently require approving reviews, so this is primarily
+# documentation of intent — @jaryl is the responsible party for the org-wide
+# workflows here. If review-required protection is enabled later, this file
+# is what will gate the PRs.
+* @jaryl
