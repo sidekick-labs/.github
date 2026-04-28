@@ -6,8 +6,8 @@ this `.github` repo). Individual repos may override it.
 
 ## Getting set up
 
-Most repos use git worktrees + devcontainers for development. The repo's own
-`CLAUDE.md` (or `README.md`) has the specifics. The pattern across the org:
+Repos typically use git worktrees + devcontainers for development. The repo's
+own `CLAUDE.md` (or `README.md`) has the specifics. The pattern across the org:
 
 ```bash
 git worktree add .worktrees/<feature-name> -b <branch-name> origin/main
@@ -62,4 +62,4 @@ do not open public issues for vulnerabilities.
 
 ## Questions?
 
-Open an issue on the relevant repo, or `@`-mention `@jaryl` in a PR comment.
+Open an issue on the relevant repo, or `@`-mention `@sidekick-labs/core-platform` in a PR comment.
