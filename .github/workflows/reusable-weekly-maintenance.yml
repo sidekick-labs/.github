@@ -190,7 +190,7 @@ jobs:
 
       - name: Set up Ruby
         if: ${{ inputs.stack == 'rails' || inputs.stack == 'ruby-gem' }}
-        uses: ruby/setup-ruby@7372622e62b60b3cb750dcd2b9e32c247ffec26a # v1.302.0
+        uses: ruby/setup-ruby@c4e5b1316158f92e3d49443a9d58b31d25ac0f8f # v1.306.0
         with:
           ruby-version: ${{ inputs.ruby-version != '' && inputs.ruby-version || '' }}
           ruby-version-file: ${{ inputs.ruby-version == '' && inputs.ruby-version-file || '' }}
@@ -222,7 +222,7 @@ jobs:
 
       - name: Restore previous TODO/FIXME census
         id: census-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: .maintenance-cache/todo-fixme.previous.txt
           key: weekly-maintenance-todo-fixme-${{ github.repository_id }}-${{ github.run_id }}
@@ -494,7 +494,7 @@ jobs:
 
       - name: Weekly maintenance
         id: maintenance
-        uses: anthropics/claude-code-action@38ec876110f9fbf8b950c79f534430740c3ac009 # v1
+        uses: anthropics/claude-code-action@11a9dadd198803a0cea6bd53da3e0e8a762fc6ea # v1
         timeout-minutes: ${{ inputs.claude-timeout-minutes }}
         env:
           LINEAR_API_KEY: ${{ secrets.linear-api-key }}
