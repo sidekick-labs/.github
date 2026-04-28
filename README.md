@@ -53,9 +53,25 @@ jobs:
       tags: latest
       build_args: |
         BASE_TAG=ruby-3.4.4
+      build_secrets: |
         NODE_AUTH_TOKEN=${{ secrets.GITHUB_TOKEN }}
     secrets: inherit
 ```
+
+> **Note on `build_args` vs `build_secrets`:** anything passed via `build_args`
+> is baked into the image metadata and visible to anyone who can pull the
+> image (`docker history --no-trunc`). Use `build_secrets` for tokens, API
+> keys, or anything else that must not leak. Reference them inside the
+> Dockerfile with:
+>
+> ```dockerfile
+> RUN --mount=type=secret,id=NODE_AUTH_TOKEN \
+>     NODE_AUTH_TOKEN=$(cat /run/secrets/NODE_AUTH_TOKEN) \
+>     npm ci
+> ```
+>
+> BuildKit mounts the secret at `/run/secrets/<id>` only for the duration
+> of the `RUN` step — it's never written to image layers.
 
 ### `deploy-production.yml`
 

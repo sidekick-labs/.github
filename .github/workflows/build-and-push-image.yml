@@ -21,7 +21,19 @@ on:
         required: true
         type: string
       build_args:
-        description: 'Docker build arguments (multiline, KEY=VALUE format)'
+        description: |
+          Docker build arguments (multiline, KEY=VALUE format).
+          ⚠️  DO NOT pass secrets via build_args — they are stored in image
+          metadata (visible via `docker history --no-trunc`). Use
+          `build_secrets` below for anything that must not leak.
+        required: false
+        type: string
+        default: ''
+      build_secrets:
+        description: |
+          BuildKit secrets passed to the build (multiline, KEY=VALUE format).
+          Mounted only during build, never written to image layers or metadata.
+          Reference inside the Dockerfile with `RUN --mount=type=secret,id=KEY ...`.
         required: false
         type: string
         default: ''
@@ -88,5 +100,6 @@ jobs:
           push: true
           tags: ${{ steps.tags.outputs.tags }}
           build-args: ${{ inputs.build_args }}
+          secrets: ${{ inputs.build_secrets }}
           cache-from: type=registry,ref=registry.digitalocean.com/${{ inputs.registry }}/${{ inputs.image_name }}:latest
           cache-to: type=inline
