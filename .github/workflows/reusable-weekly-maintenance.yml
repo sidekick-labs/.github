@@ -373,7 +373,22 @@ jobs:
             echo
             echo "## Verification (after updates, before PR)"
             echo
-            echo "Run every command below. If ANY fails, do NOT create a PR — emit a summary of failures and exit."
+            echo "Run every command below. A command qualifies as PASSED only if it"
+            echo "actually executed and exited zero. Do NOT open a PR if any of these"
+            echo "is true:"
+            echo
+            echo "- a command exits non-zero"
+            echo "- a command can't run because a required service is missing (e.g."
+            echo "  database connection refused, redis unreachable, missing binary)"
+            echo "- a command can't run because a precondition isn't met (missing"
+            echo "  config, schema not loaded, env var unset)"
+            echo
+            echo "**Inability to verify counts as verification failure.** Do not"
+            echo "rationalise a skipped check as \"passed in another environment\"."
+            echo "Do not list a check as ✅ in any output if it didn't actually run"
+            echo "to completion in this run. If a check couldn't run, mark it"
+            echo "explicitly (e.g. ⚠️ \"could not run: <reason>\") and treat the run"
+            echo "as failed for the purposes of opening a PR."
             echo
 
             if [ -n "$LINT_COMMANDS" ]; then
@@ -403,8 +418,8 @@ jobs:
             echo "## Output rules"
             echo
             echo "- If \`git diff\` is empty after updates: output \"No dependency changes needed\" and summarise findings (TODO/FIXME, stale PRs, audit). No PR."
-            echo "- If diff is non-empty AND verification passed: open a signed PR via the steps below."
-            echo "- If diff is non-empty AND verification failed: do NOT open a PR; output the failure summary."
+            echo "- If diff is non-empty AND every verification command actually ran and passed: open a signed PR via the steps below."
+            echo "- If diff is non-empty AND any verification command failed OR could not run: do NOT open a PR; output the failure summary including which checks couldn't run and why."
             if [ "$LINEAR_FALLBACK" = "true" ]; then
               echo "- For risky judgment-call items (major bumps, code-changing fixes, design-decision TODOs): create ONE Linear issue summarising findings. Determine team/project/labels by querying Linear. Always include RUN_URL in the issue body."
             fi
@@ -418,6 +433,18 @@ jobs:
             echo 'git checkout -b "$BRANCH"'
             echo 'git add -A'
             echo 'git commit -m "chore: weekly dependency maintenance"'
+            echo
+            echo '# Rebase onto the latest default branch BEFORE pushing, so the PR'
+            echo '# starts even with main rather than going stale between dispatch and'
+            echo '# review. If rebase has conflicts, abort cleanly and emit a summary —'
+            echo '# a human will need to resolve.'
+            echo "git fetch origin \"$DEFAULT_BRANCH\""
+            echo "git rebase \"origin/$DEFAULT_BRANCH\" || {"
+            echo "  echo \"ERROR: rebase against $DEFAULT_BRANCH failed; aborting (a human needs to resolve)\" >&2"
+            echo '  git rebase --abort'
+            echo '  exit 1'
+            echo '}'
+            echo
             echo 'git push -u origin HEAD'
             echo
             echo '# Replace the unsigned commit with a signed one via the GitHub API.'
