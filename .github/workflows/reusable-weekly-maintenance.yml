@@ -454,11 +454,15 @@ jobs:
             TOOLS="$TOOLS,mcp__linear__*"
           fi
 
-          # Build the MCP config. Only declare the Linear server when
+          # Build the MCP config file. Only declare the Linear server when
           # linear-fallback is enabled, otherwise emit an empty config so the
           # action does not try to spawn mcp-remote with an empty bearer.
+          # Written to a file rather than an action input because
+          # claude-code-action no longer accepts a top-level `mcp_config:` —
+          # the supported form is `claude_args: --mcp-config <path-or-json>`.
+          MCP_CONFIG_FILE=tmp/maintenance/mcp-config.json
           if [ "$LINEAR_FALLBACK" = "true" ]; then
-            MCP_CONFIG=$(cat <<EOF
+            cat > "$MCP_CONFIG_FILE" <<EOF
           {
             "mcpServers": {
               "linear": {
@@ -474,40 +478,39 @@ jobs:
             }
           }
           EOF
-          )
           else
-            MCP_CONFIG='{"mcpServers":{}}'
+            echo '{"mcpServers":{}}' > "$MCP_CONFIG_FILE"
           fi
 
-          # Emit prompt + tools + mcp config as multi-line outputs.
+          # Emit prompt + tools + mcp config path as outputs.
           {
             echo 'prompt<<MAINT_PROMPT_EOF'
             cat "$PROMPT_FILE"
             echo 'MAINT_PROMPT_EOF'
             echo "allowed-tools=$TOOLS"
-            echo 'mcp-config<<MAINT_MCP_EOF'
-            printf '%s\n' "$MCP_CONFIG"
-            echo 'MAINT_MCP_EOF'
+            echo "mcp-config-path=$MCP_CONFIG_FILE"
           } >> "$GITHUB_OUTPUT"
 
       # ----- weekly maintenance -----
 
       - name: Weekly maintenance
         id: maintenance
-        uses: anthropics/claude-code-action@fefa07e9c665b7320f08c3b525980457f22f58aa # v1
+        uses: anthropics/claude-code-action@63322d7b2bc79e7b621b89f41b53ceb8e5a5d314 # v1
         timeout-minutes: ${{ inputs.claude-timeout-minutes }}
         env:
           LINEAR_API_KEY: ${{ secrets.linear-api-key }}
         with:
           claude_code_oauth_token: ${{ secrets.claude-code-oauth-token }}
           show_full_output: true
-          # MCP config is built in the previous step. When `linear-fallback`
-          # is true it includes the Linear remote MCP server; otherwise it is
-          # empty so we do not spawn `mcp-remote` with an empty bearer.
-          # See: https://linear.app/docs/mcp
-          mcp_config: ${{ steps.build-prompt.outputs.mcp-config }}
           prompt: ${{ steps.build-prompt.outputs.prompt }}
-          claude_args: --allowed-tools "${{ steps.build-prompt.outputs.allowed-tools }}"
+          # MCP config is written to a file by the build-prompt step.
+          # When linear-fallback is true it declares the Linear remote MCP
+          # server; otherwise it's an empty config so the action does not
+          # spawn mcp-remote with an empty bearer.
+          # See: https://linear.app/docs/mcp
+          claude_args: >-
+            --mcp-config ${{ steps.build-prompt.outputs.mcp-config-path }}
+            --allowed-tools "${{ steps.build-prompt.outputs.allowed-tools }}"
 
       # ----- artifacts -----
 
@@ -516,6 +519,12 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: weekly-maintenance-${{ github.run_id }}
-          path: tmp/maintenance/
+          # Exclude mcp-config.json — when linear-fallback is true it
+          # contains a LINEAR_API_KEY bearer token, and artifacts have
+          # 90-day retention plus a wider visibility surface than a
+          # masked $GITHUB_OUTPUT value.
+          path: |
+            tmp/maintenance/
+            !tmp/maintenance/mcp-config.json
           if-no-files-found: ignore
           retention-days: 90
