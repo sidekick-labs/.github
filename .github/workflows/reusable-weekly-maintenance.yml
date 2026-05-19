@@ -190,7 +190,7 @@ jobs:
 
       - name: Set up Ruby
         if: ${{ inputs.stack == 'rails' || inputs.stack == 'ruby-gem' }}
-        uses: ruby/setup-ruby@6aaa311d81eba98ae12eaffbcb63296ace0efcde # v1.307.0
+        uses: ruby/setup-ruby@97ecb7b512899eb71ab1bf2310a624c6f1589ac6 # v1.308.0
         with:
           ruby-version: ${{ inputs.ruby-version != '' && inputs.ruby-version || '' }}
           ruby-version-file: ${{ inputs.ruby-version == '' && inputs.ruby-version-file || '' }}
@@ -522,7 +522,7 @@ jobs:
 
       - name: Weekly maintenance
         id: maintenance
-        uses: anthropics/claude-code-action@dde2242db6af13460b916652159b6ba19a598f30 # v1
+        uses: anthropics/claude-code-action@51ea8ea73a139f2a74ff649e3092c25a904aed7e # v1
         timeout-minutes: ${{ inputs.claude-timeout-minutes }}
         env:
           LINEAR_API_KEY: ${{ secrets.linear-api-key }}
