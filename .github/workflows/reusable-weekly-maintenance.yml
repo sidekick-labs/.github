@@ -4,9 +4,14 @@ name: Reusable Weekly Maintenance
 #
 # Consumers reference this with:
 #
+#   permissions:
+#     contents: write
+#     pull-requests: write
+#     id-token: write
+#     security-events: read   # required for the CodeQL alert review (read-only)
 #   jobs:
 #     maintenance:
-#       uses: <org>/.github/.github/workflows/reusable-weekly-maintenance.yml@v1
+#       uses: <org>/.github/.github/workflows/reusable-weekly-maintenance.yml@v2
 #       with:
 #         stack: rails
 #         run-brakeman: true
@@ -113,6 +118,11 @@ on:
         required: false
         type: number
         default: 25
+      review-security-alerts:
+        description: 'Fetch open CodeQL code-scanning alerts so Claude fixes actionable ones and reports the rest in the PR. Never auto-dismisses.'
+        required: false
+        type: boolean
+        default: true
 
     secrets:
       claude-code-oauth-token:
@@ -134,6 +144,7 @@ jobs:
       contents: write
       pull-requests: write
       id-token: write
+      security-events: read   # read-only: report/fix code-scanning alerts, never dismiss
 
     steps:
       - name: Validate inputs
@@ -209,20 +220,20 @@ jobs:
 
       - name: Set up JDK
         if: ${{ inputs.stack == 'kmp' }}
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5
         with:
           distribution: 'zulu'
           java-version: ${{ inputs.jdk-version }}
 
       - name: Set up Gradle
         if: ${{ inputs.stack == 'kmp' }}
-        uses: gradle/actions/setup-gradle@v6
+        uses: gradle/actions/setup-gradle@50e97c2cd7a37755bbfafc9c5b7cafaece252f6e # v6
 
       # ----- TODO/FIXME census (week-over-week diff via cache) -----
 
       - name: Restore previous TODO/FIXME census
         id: census-cache
-        uses: actions/cache@v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: .maintenance-cache/todo-fixme.previous.txt
           key: weekly-maintenance-todo-fixme-${{ github.repository_id }}-${{ github.run_id }}
@@ -282,6 +293,31 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # ----- open security alerts (code scanning) -----
+
+      - name: Capture open code-scanning alerts
+        id: security-alerts
+        if: ${{ inputs.review-security-alerts }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p tmp/maintenance
+          # security-events read may be unavailable (e.g. private repo without
+          # GHAS, or code scanning never enabled); tolerate failure gracefully.
+          # tool_name=CodeQL keeps this strictly CodeQL (other SAST tools are
+          # excluded by design); per_page caps the review at 100 open alerts.
+          if gh api "repos/$REPO/code-scanning/alerts?state=open&per_page=100&tool_name=CodeQL" \
+               > tmp/maintenance/codeql-alerts.json 2>/dev/null; then
+            COUNT=$(jq 'length' tmp/maintenance/codeql-alerts.json)
+          else
+            echo '[]' > tmp/maintenance/codeql-alerts.json
+            COUNT=0
+          fi
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "## Open CodeQL alerts: $COUNT" >> "$GITHUB_STEP_SUMMARY"
+
       # ----- assemble prompt + allowed-tools (shell is much easier than expressions) -----
 
       - name: Assemble Claude prompt and MCP config
@@ -306,6 +342,8 @@ jobs:
           TODO_CURRENT: ${{ steps.census.outputs.current_count }}
           TODO_PREVIOUS: ${{ steps.census.outputs.previous_count }}
           TODO_DELTA: ${{ steps.census.outputs.delta }}
+          REVIEW_SECURITY_ALERTS: ${{ inputs.review-security-alerts }}
+          CODEQL_ALERT_COUNT: ${{ steps.security-alerts.outputs.count }}
         run: |
           set -euo pipefail
           mkdir -p tmp/maintenance
@@ -370,6 +408,17 @@ jobs:
             echo "Always:"
             echo "- Check open PRs older than 90 days: \`gh pr list --state open\`"
             echo "- Review the TODO/FIXME census at \`tmp/maintenance/todo-fixme.current.txt\`. If TODO_FIXME_DELTA is set, summarise the change in the PR body. If TODO_FIXME_DELTA > 0, include the new entries from \`tmp/maintenance/todo-fixme.diff.txt\`."
+
+            if [ "${REVIEW_SECURITY_ALERTS:-}" = "true" ]; then
+              echo
+              echo "## Security findings (code scanning)"
+              echo "- Open CodeQL alerts: ${CODEQL_ALERT_COUNT:-0} (full details in \`tmp/maintenance/codeql-alerts.json\`)."
+              echo "- For each open alert: if it is genuinely actionable and a safe, minimal fix exists, apply it in this PR. Otherwise summarise it in the PR body (rule id, file:line, and why it's deferred — e.g. false positive / by design)."
+              echo "- Do NOT dismiss code-scanning alerts — dismissal is a human decision."
+              if [ "$LINEAR_FALLBACK" = "true" ]; then
+                echo "- Route any finding that needs a judgment call or a larger change to the single Linear issue."
+              fi
+            fi
             echo
             echo "## Verification (after updates, before PR)"
             echo
@@ -543,7 +592,7 @@ jobs:
 
       - name: Upload maintenance artifacts
         if: ${{ always() }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: weekly-maintenance-${{ github.run_id }}
           # Exclude mcp-config.json — when linear-fallback is true it
