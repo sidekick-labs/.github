@@ -7,8 +7,16 @@ repos. Consumers reference workflows here via:
 uses: sidekick-labs/.github/.github/workflows/<name>.yml@v1
 ```
 
-Pin to the `v1` tag (or a specific SHA) — `@main` works but does not give you
+Pin to the `v2` tag (or a specific SHA) — `@main` works but does not give you
 a stable contract.
+
+Available reusable workflows:
+
+- **`reusable-weekly-maintenance.yml`** — weekly dependency-update / lint /
+  test / CodeQL-alert sweep across every stack.
+- **`reusable-sentry-autofix.yml`** — daily Sentry-issue triage with
+  optional auto-fix PRs (the apply step mirrors the post-deploy autofix
+  safety model).
 
 ## `reusable-weekly-maintenance.yml`
 
@@ -186,8 +194,194 @@ jobs:
       claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 ```
 
-## Versioning
+## `reusable-sentry-autofix.yml`
 
-The `v1` tag is a moving major-version pointer. Backwards-compatible changes
-land on `v1`; breaking input changes will publish under `v2`. Pin to a SHA if
+Daily (or webhook-triggered) Sentry sweep. Picks the top unresolved Sentry
+issue for the project that does NOT already have an open or recently-closed
+auto-fix PR, hands it to Claude for triage, and — when the verdict is
+high-confidence — opens a draft PR with a minimal forward-fix. Validation
+mirrors the post-deploy-triage autofix composite: hard path blocklist
+(migrations, workflows, `config/credentials*`, `config/master.key`, lockfiles)
+plus a 50-line diff cap. Never merges. Always opens a draft for human review.
+
+The fetch step queries Sentry for the project's top issues, then dedups against
+auto-fix PRs by matching the HTML marker `<!-- sentry-autofix: <SHORT_ID> -->`
+in PR bodies (open + closed within `dedup-window-days`). That same marker is
+stamped into every autofix PR opened by this workflow, closing the loop.
+
+### Inputs
+
+| Input | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `sentry-org` | string | no | `sidekick-labs` | Sentry organization slug. |
+| `sentry-project` | string | yes | — | Sentry project slug (e.g. `sidekick-web`). |
+| `stack` | string | yes | — | One of `rails`, `ruby-gem`, `node-lib`, `node-app`, `kmp`. Drives toolchain setup for the apply step. |
+| `mode` | string | no | `autofix` | `autofix` attempts a PR when triage is high-confidence; `triage-only` skips the apply step. `stack: kmp` always forces `triage-only`. |
+| `max-candidates` | number | no | `10` | Top N Sentry issues considered before dedup filtering. Only ONE is triaged per run. |
+| `issue-query` | string | no | `is:unresolved` | Sentry search query. Append modifiers (e.g. `is:unresolved level:error`) to narrow. |
+| `ruby-version-file` | string | no | `.ruby-version` | Ruby version file (rails, ruby-gem stacks). |
+| `ruby-version` | string | no | `""` | Explicit ruby-version override. |
+| `node-version` | string | no | `lts/*` | Node version (rails, node-lib, node-app stacks). |
+| `jdk-version` | string | no | `17` | JDK version (kmp stack, triage-only). |
+| `lint-commands` | string | no | `""` | Multiline lint commands run post-apply. All must exit 0 or the fix is rejected. Keep fast. |
+| `test-commands` | string | no | `""` | Multiline test commands run post-apply. Use a focused subset, not the full suite — runs daily. |
+| `linear-fallback` | boolean | no | `false` | When true, opens a Linear issue for triage-only runs and for autofix-skipped candidates. Requires `linear-api-key`. |
+| `diff-line-cap` | number | no | `50` | Hard cap on total insertions+deletions in the apply diff. |
+| `dedup-window-days` | number | no | `30` | How far back to scan closed PRs for the autofix marker. |
+| `timeout-minutes` | number | no | `30` | Job-level timeout. |
+| `claude-timeout-minutes` | number | no | `15` | Advisory — composite-action steps can't enforce this; job timeout is the hard bound. |
+| `additional-allowed-tools` | string | no | `""` | Comma-separated entries appended to the apply step `--allowed-tools` (e.g. `Bash(bin/rspec:*)`). |
+
+### Secrets
+
+| Secret | Required | Description |
+|---|---|---|
+| `claude-code-oauth-token` | yes | OAuth token for `anthropics/claude-code-action`. |
+| `sentry-api-token` | yes | **Read-scoped** Sentry token (`event:read` + `project:read`). NOT the deploy-release write token. See "Setting up `SENTRY_API_TOKEN`" below. |
+| `linear-api-key` | no | Required only when `linear-fallback: true`. |
+
+### Triggers
+
+Consumers typically schedule the workflow daily and also expose `workflow_dispatch`
+for manual runs. `repository_dispatch` (with a `sentry-autofix` event type) is
+the recommended hook for future Sentry-webhook integration once a relay sits
+between Sentry's webhook output and GitHub's authenticated dispatch API.
+
+### Example — Rails app (sidekick-web)
+
+```yaml
+name: Sentry Autofix
+on:
+  schedule:
+    - cron: '17 8 * * *'  # 08:17 UTC daily (off-hour to avoid GH cron stampede)
+  workflow_dispatch:
+  repository_dispatch:
+    types: [sentry-autofix]
+
+permissions: {}
+
+jobs:
+  sentry-autofix:
+    uses: sidekick-labs/.github/.github/workflows/reusable-sentry-autofix.yml@v2
+    with:
+      sentry-project: sidekick-web
+      stack: rails
+      linear-fallback: true
+      lint-commands: |
+        bin/rubocop --force-exclusion
+      test-commands: |
+        bin/rspec --tag ~slow
+      additional-allowed-tools: 'Bash(bin/rspec:*)'
+    secrets:
+      claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      sentry-api-token: ${{ secrets.SENTRY_API_TOKEN }}
+      linear-api-key: ${{ secrets.LINEAR_API_KEY }}
+```
+
+### Example — Node app (sidekick-harness)
+
+```yaml
+name: Sentry Autofix
+on:
+  schedule:
+    - cron: '23 8 * * *'
+  workflow_dispatch:
+  repository_dispatch:
+    types: [sentry-autofix]
+
+permissions: {}
+
+jobs:
+  sentry-autofix:
+    uses: sidekick-labs/.github/.github/workflows/reusable-sentry-autofix.yml@v2
+    with:
+      sentry-project: sidekick-harness
+      stack: node-app
+      node-version: '24'
+      linear-fallback: true
+      lint-commands: |
+        npm run lint
+        npm run typecheck
+    secrets:
+      claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      sentry-api-token: ${{ secrets.SENTRY_API_TOKEN }}
+      linear-api-key: ${{ secrets.LINEAR_API_KEY }}
+```
+
+### Example — Ruby gem (sidekick-rdp-client)
+
+```yaml
+name: Sentry Autofix
+on:
+  schedule:
+    - cron: '29 8 * * *'
+  workflow_dispatch:
+  repository_dispatch:
+    types: [sentry-autofix]
+
+permissions: {}
+
+jobs:
+  sentry-autofix:
+    uses: sidekick-labs/.github/.github/workflows/reusable-sentry-autofix.yml@v2
+    with:
+      sentry-project: sidekick-rdp-client
+      stack: ruby-gem
+      linear-fallback: true
+      lint-commands: |
+        bundle exec rubocop
+    secrets:
+      claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      sentry-api-token: ${{ secrets.SENTRY_API_TOKEN }}
+      linear-api-key: ${{ secrets.LINEAR_API_KEY }}
+```
+
+### Example — KMP / Android (triage-only)
+
+```yaml
+name: Sentry Triage
+on:
+  schedule:
+    - cron: '37 8 * * *'
+  workflow_dispatch:
+  repository_dispatch:
+    types: [sentry-autofix]
+
+permissions: {}
+
+jobs:
+  sentry-triage:
+    uses: sidekick-labs/.github/.github/workflows/reusable-sentry-autofix.yml@v2
+    with:
+      sentry-project: sidekick-companion-kit
+      stack: kmp
+      mode: triage-only
+      linear-fallback: true
+    secrets:
+      claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      sentry-api-token: ${{ secrets.SENTRY_API_TOKEN }}
+      linear-api-key: ${{ secrets.LINEAR_API_KEY }}
+```
+
+### Setting up `SENTRY_API_TOKEN`
+
+The org-level `SENTRY_AUTH_TOKEN` secret is scoped to `project:releases:write`
+for the deploy / sentry-release workflows. Issue reads need a separate
+read-only token.
+
+1. Visit https://sidekick-labs.sentry.io/settings/auth-tokens/
+2. Create a **user auth token** (or, preferably, an **Internal Integration**
+   under `/settings/developer-settings/new-internal/` for org-owned tokens
+   that survive employee turnover).
+3. Required scopes: `event:read`, `project:read`. Optional: `org:read` if you
+   later want to query org-wide issue lists.
+4. Add as a GitHub **organization secret** named `SENTRY_API_TOKEN`,
+   visibility "All repositories" (or "Private repositories" matching the
+   existing `SENTRY_AUTH_TOKEN`).
+5. Verify with `gh secret list --org sidekick-labs`.
+
+### Versioning
+
+The `v2` tag bundles both reusable workflows. New input contracts will
+land on `v2`; breaking changes will publish under `v3`. Pin to a SHA if
 you need stricter immutability.
