@@ -454,7 +454,11 @@ jobs:
             console.log(`Already-addressed shortIds: ${processed.size}`)
 
             const q = encodeURIComponent(SENTRY_QUERY)
-            const sortedBy = 'sort=priority'
+            // sort=priority is not accepted by the project-issues endpoint
+            // (returns 400 "Sort key 'priority' not supported"). sort=freq
+            // surfaces the highest-volume regressions first, which fits the
+            // autofix prioritisation better than recency (sort=date / new).
+            const sortedBy = 'sort=freq'
             const issues = await sentryFetch(
               `projects/${SENTRY_ORG}/${SENTRY_PROJECT}/issues/?query=${q}&${sortedBy}&limit=${MAX_CANDIDATES * 2}`,
             )
