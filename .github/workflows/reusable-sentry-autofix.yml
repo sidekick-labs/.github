@@ -111,6 +111,17 @@ on:
         required: false
         type: string
         default: ''
+      release-bot-client-id:
+        description: >-
+          GitHub App Client ID (or numeric App ID) used to mint an
+          installation token for pushing the auto-fix branch and opening
+          the PR. Required to bypass the GITHUB_TOKEN event-suppression
+          rule that prevents CI from firing on bot-opened PRs. When
+          unset, the workflow falls back to GITHUB_TOKEN — the PR opens
+          as a draft and CI must be triggered manually.
+        required: false
+        type: string
+        default: ''
 
     secrets:
       claude-code-oauth-token:
@@ -121,6 +132,13 @@ on:
         required: true
       linear-api-key:
         description: 'LINEAR_API_KEY for the linear-fallback path. Required only when linear-fallback=true.'
+        required: false
+      release-bot-private-key:
+        description: >-
+          GitHub App private key (.pem contents) for the bot used to
+          open auto-fix PRs. When combined with release-bot-client-id,
+          a short-lived installation token is minted and used instead
+          of GITHUB_TOKEN so CI fires on the bot-opened PR.
         required: false
 
 permissions: {}
@@ -220,10 +238,49 @@ jobs:
             echo "LINEAR_AVAILABLE=false" >> "$GITHUB_ENV"
           fi
 
+      - name: Determine bot token availability
+        # Sets BOT_TOKEN_AVAILABLE=true only when BOTH the App Client ID
+        # input AND the private-key secret are present. The mint step
+        # below gates on this so a half-configured caller falls back
+        # cleanly to GITHUB_TOKEN rather than failing.
+        env:
+          BOT_CLIENT_ID: ${{ inputs.release-bot-client-id }}
+          BOT_PRIVATE_KEY: ${{ secrets.release-bot-private-key }}
+        run: |
+          set -euo pipefail
+          if [ -n "${BOT_CLIENT_ID:-}" ] && [ -n "${BOT_PRIVATE_KEY:-}" ]; then
+            echo "BOT_TOKEN_AVAILABLE=true" >> "$GITHUB_ENV"
+            echo "Release-bot credentials present — autofix PR will open as ready-for-review (CI fires)."
+          else
+            echo "BOT_TOKEN_AVAILABLE=false" >> "$GITHUB_ENV"
+            echo "::warning::release-bot credentials not configured for this caller — autofix PR will open as draft via GITHUB_TOKEN (CI will not fire until a human nudges the PR). Add release-bot-client-id input + release-bot-private-key secret to enable the full flow."
+          fi
+
+      - name: Mint GitHub App installation token
+        # Only fires when both bot credentials are present. The token is
+        # scoped to the minimum permissions needed for the auto-fix flow:
+        # contents:write (push branch) + pull-requests:write (open PR).
+        # When the App token is in play, events it generates (the push,
+        # the PR open) DO fire downstream workflows — that's the whole
+        # reason this step exists. See promote-production.yml for the
+        # established org pattern.
+        id: app_token
+        if: env.BOT_TOKEN_AVAILABLE == 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ inputs.release-bot-client-id }}
+          private-key: ${{ secrets.release-bot-private-key }}
+          permission-contents: write
+          permission-pull-requests: write
+
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 1
+          # Persist the bot token (when available) as the git remote
+          # credential so `git push origin` later uses it. When BOT_TOKEN_AVAILABLE
+          # is false, fall back to GITHUB_TOKEN (the action's default).
+          token: ${{ steps.app_token.outputs.token || github.token }}
 
       - name: Detect default branch
         id: default-branch
@@ -836,14 +893,22 @@ jobs:
             echo "::endgroup::"
           done <<< "$TEST_COMMANDS"
 
-      - name: Push auto-fix branch and open draft PR
+      - name: Push auto-fix branch and open PR
         id: push
         if: steps.gate.outputs.should_run == 'true' && steps.validate.outputs.applied == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          # Use the App-installation token when available so the push +
+          # PR-open events fire downstream CI workflows. GitHub
+          # deliberately suppresses workflow runs for events caused by
+          # GITHUB_TOKEN, which is why a vanilla bot-opened PR sits with
+          # no checks. Falling back to GITHUB_TOKEN is intentional: the
+          # workflow still works, but the resulting PR opens as a draft
+          # and a human must close/reopen (or push) to trigger CI.
+          GH_TOKEN: ${{ steps.app_token.outputs.token || github.token }}
           SHORT_ID: ${{ steps.gate.outputs.short_id }}
           DEFAULT_BRANCH: ${{ steps.default-branch.outputs.branch }}
           AUTOFIX_MARKER_PREFIX: ${{ env.AUTOFIX_MARKER_PREFIX }}
+          BOT_TOKEN_AVAILABLE: ${{ env.BOT_TOKEN_AVAILABLE }}
         run: |
           set -euo pipefail
 
@@ -865,9 +930,19 @@ jobs:
 
           🤖 Generated by Claude Code via reusable-sentry-autofix.yml"
 
+          # PR body wording depends on whether the bot token is in play:
+          # when it is, CI fires immediately and the reviewer checklist
+          # doesn't need to mention the "mark ready" workaround.
+          if [ "$BOT_TOKEN_AVAILABLE" = "true" ]; then
+            READY_LINE=""
+          else
+            READY_LINE="
+          - [ ] Mark \"Ready for review\" once verified — CI does not run on draft PRs created by \`GITHUB_TOKEN\`. The repo's release-bot App is not configured (see [reusable-sentry-autofix.yml docs](https://github.com/sidekick-labs/.github/blob/main/docs/reusable-workflows.md))."
+          fi
+
           PR_BODY="## Auto-fix from Sentry sweep
 
-          A daily sweep of unresolved Sentry issues in \`${{ inputs.sentry-project }}\` triaged this issue as a **likely problem** with **high confidence**. Claude applied a minimal forward-fix; this draft PR is opened for human review.
+          A daily sweep of unresolved Sentry issues in \`${{ inputs.sentry-project }}\` triaged this issue as a **likely problem** with **high confidence**. Claude applied a minimal forward-fix and this PR is opened for human review.
 
           - **Sentry issue:** [${SHORT_ID}](${PERMALINK}) — ${TITLE}
           - **Fix summary:** ${FIX_SUMMARY}
@@ -879,8 +954,7 @@ jobs:
           - [ ] Diff matches the triage summary
           - [ ] The Sentry issue is genuinely caused by the code on the default branch (not an old release / rolled-back deploy)
           - [ ] Local tests pass
-          - [ ] No unintended scope creep
-          - [ ] Mark \"Ready for review\" once verified — CI does not run on draft PRs created by \`GITHUB_TOKEN\`
+          - [ ] No unintended scope creep${READY_LINE}
 
           🤖 Generated by Claude Code via \`reusable-sentry-autofix.yml\`
 
@@ -889,10 +963,13 @@ jobs:
           git add -A
           git commit -m "$COMMIT_MESSAGE"
 
-          # Push the unsigned commit so the remote ref exists; then PATCH
-          # to a signed commit created via the API. Same pattern as the
-          # post-deploy-triage autofix composite. `auto-fix/*` is exempted
-          # from the "Require signed commits" branch protection.
+          # Push the (locally-unsigned) commit so the remote ref exists;
+          # then PATCH the ref to point at a server-signed commit created
+          # via the API. Same pattern as the post-deploy-triage autofix
+          # composite. `auto-fix/*` is exempted from the "Require signed
+          # commits" branch protection so the unsigned intermediate is
+          # acceptable. The remote credential helper picked up the bot
+          # token from the checkout step's `token:` input when available.
           git push origin "$AUTOFIX_BRANCH"
 
           TREE=$(git rev-parse HEAD^{tree})
@@ -913,14 +990,24 @@ jobs:
           UPDATED=$(gh api "repos/$GITHUB_REPOSITORY/git/refs/heads/$AUTOFIX_BRANCH" --jq '.object.sha')
           [ "$UPDATED" != "$SIGNED" ] && { echo "ERROR: branch ref did not advance to signed SHA" >&2; exit 1; }
 
+          # Draft only when falling back to GITHUB_TOKEN — CI won't run
+          # on it either way, so the draft state at least signals to the
+          # human reviewer that a manual nudge is needed. With the App
+          # token, CI fires and the PR opens ready-for-review.
+          if [ "$BOT_TOKEN_AVAILABLE" = "true" ]; then
+            DRAFT_FLAG=""
+          else
+            DRAFT_FLAG="--draft"
+          fi
+
           URL=$(gh pr create \
-            --draft \
+            $DRAFT_FLAG \
             --title "Auto-fix: Sentry ${SHORT_ID}" \
             --body "$PR_BODY" \
             --base "$DEFAULT_BRANCH" \
             --head "$AUTOFIX_BRANCH")
           echo "url=$URL" >> "$GITHUB_OUTPUT"
-          echo "Opened draft PR: $URL"
+          echo "Opened PR ($([ "$BOT_TOKEN_AVAILABLE" = "true" ] && echo "ready-for-review" || echo "draft")): $URL"
 
       # ----- Linear fallback (triage-only, autofix-skipped, or autofix-failed) -----
 
