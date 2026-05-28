@@ -264,8 +264,16 @@ jobs:
         # the PR open) DO fire downstream workflows — that's the whole
         # reason this step exists. See promote-production.yml for the
         # established org pattern.
+        #
+        # continue-on-error so a permission mismatch (App lacks
+        # pull_requests:write), key rotation, or App uninstall produces
+        # a degraded-but-functional run (falls back to GITHUB_TOKEN +
+        # draft + manual-nudge note) rather than a hard job failure.
+        # The post-mint resolution step below downgrades
+        # BOT_TOKEN_AVAILABLE to false in that case.
         id: app_token
         if: env.BOT_TOKEN_AVAILABLE == 'true'
+        continue-on-error: true
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           client-id: ${{ inputs.release-bot-client-id }}
@@ -273,13 +281,34 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
 
+      - name: Resolve bot token availability post-mint
+        # The presence-check earlier set BOT_TOKEN_AVAILABLE=true based on
+        # input presence; this step downgrades it to false when the mint
+        # actually failed (continue-on-error left the step in a `failure`
+        # outcome but didn't kill the job). Downstream steps key off
+        # BOT_TOKEN_AVAILABLE for both the credential choice and the
+        # draft-vs-ready PR shape; this is the single point of truth.
+        if: env.BOT_TOKEN_AVAILABLE == 'true'
+        env:
+          MINT_OUTCOME: ${{ steps.app_token.outcome }}
+          MINT_TOKEN: ${{ steps.app_token.outputs.token }}
+        run: |
+          set -euo pipefail
+          if [ "$MINT_OUTCOME" != "success" ] || [ -z "${MINT_TOKEN:-}" ]; then
+            echo "::warning::App token mint failed (outcome=$MINT_OUTCOME). Falling back to GITHUB_TOKEN — the autofix PR will open as draft and CI will not fire until a human nudges. Most common cause: the App lacks pull_requests:write permission. Verify with: gh api /orgs/<org>/installations --jq '.installations[] | select(.app_slug == \"<bot-slug>\") | .permissions'"
+            echo "BOT_TOKEN_AVAILABLE=false" >> "$GITHUB_ENV"
+          else
+            echo "App token mint succeeded — autofix PR will open ready-for-review."
+          fi
+
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 1
           # Persist the bot token (when available) as the git remote
-          # credential so `git push origin` later uses it. When BOT_TOKEN_AVAILABLE
-          # is false, fall back to GITHUB_TOKEN (the action's default).
+          # credential so `git push origin` later uses it. When the mint
+          # failed, steps.app_token.outputs.token is empty and the
+          # action falls back to GITHUB_TOKEN.
           token: ${{ steps.app_token.outputs.token || github.token }}
 
       - name: Detect default branch
