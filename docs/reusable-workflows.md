@@ -230,6 +230,7 @@ stamped into every autofix PR opened by this workflow, closing the loop.
 | `timeout-minutes` | number | no | `30` | Job-level timeout. |
 | `claude-timeout-minutes` | number | no | `15` | Advisory — composite-action steps can't enforce this; job timeout is the hard bound. |
 | `additional-allowed-tools` | string | no | `""` | Comma-separated entries appended to the apply step `--allowed-tools` (e.g. `Bash(bin/rspec:*)`). **Note:** entries are passed through unsanitised, and entries like `Bash(...)` widen Claude's blast radius beyond the default `Read,Edit,Grep,Glob`. Use sparingly and prefer tightly-scoped wildcards. |
+| `release-bot-client-id` | string | no | `""` | GitHub App Client ID (or numeric App ID) for the bot that opens auto-fix PRs. Required together with `release-bot-private-key` to bypass the GITHUB_TOKEN event-suppression rule and trigger CI on bot-opened PRs. See "Setting up the auto-fix bot" below. When unset, the workflow falls back to GITHUB_TOKEN — the PR opens as a draft and CI must be triggered by a human nudge (close/reopen or `git push`). |
 
 ### Secrets
 
@@ -238,6 +239,7 @@ stamped into every autofix PR opened by this workflow, closing the loop.
 | `claude-code-oauth-token` | yes | OAuth token for `anthropics/claude-code-action`. |
 | `sentry-api-token` | yes | **Read-scoped** Sentry token (`event:read` + `project:read`). NOT the deploy-release write token. See "Setting up `SENTRY_API_TOKEN`" below. |
 | `linear-api-key` | no | Required only when `linear-fallback: true`. |
+| `release-bot-private-key` | no | GitHub App private key (.pem contents). Required together with `release-bot-client-id` to bypass the GITHUB_TOKEN event-suppression rule. See "Setting up the auto-fix bot" below. |
 
 ### Triggers
 
@@ -266,6 +268,10 @@ jobs:
       sentry-project: sidekick-web
       stack: rails
       linear-fallback: true
+      # Open auto-fix PRs as ready-for-review via the sidekick-release-bot
+      # App so CI fires automatically. Without these two, the PR opens as
+      # a draft and needs a human nudge.
+      release-bot-client-id: ${{ vars.RELEASE_BOT_CLIENT_ID }}
       lint-commands: |
         bin/rubocop --force-exclusion
       test-commands: |
@@ -275,6 +281,7 @@ jobs:
       claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
       sentry-api-token: ${{ secrets.SENTRY_API_TOKEN }}
       linear-api-key: ${{ secrets.LINEAR_API_KEY }}
+      release-bot-private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
 ```
 
 ### Example — Node app (sidekick-harness)
@@ -364,6 +371,51 @@ jobs:
       sentry-api-token: ${{ secrets.SENTRY_API_TOKEN }}
       linear-api-key: ${{ secrets.LINEAR_API_KEY }}
 ```
+
+### Setting up the auto-fix bot
+
+GitHub deliberately suppresses workflow runs for events caused by `GITHUB_TOKEN`
+("anti-loop"). A bot-opened PR from the autofix workflow would therefore sit
+with **zero CI checks** — no required-check status to satisfy, no path to merge
+without a human pushing a commit or closing/reopening the PR.
+
+The fix is to mint a short-lived **GitHub App installation token** instead of
+using `GITHUB_TOKEN` for the push + PR open. Events caused by an App token
+*do* fire downstream workflows.
+
+The org already has a `sidekick-release-bot` App configured for the same
+purpose in `promote-production.yml`. Reuse it:
+
+1. **Install the App on each caller repo** that runs the autofix workflow.
+   Visit https://github.com/apps/sidekick-release-bot/installations/select_target
+   → pick `sidekick-labs` org → "Only select repositories" → add the repo.
+2. **Set the App's Client ID as a repo variable** (it's not a secret — Client IDs
+   are public). The variable name doesn't matter; the caller workflow passes
+   its value as `release-bot-client-id`.
+   ```bash
+   # If you don't have the Client ID, copy from the App's General Settings page
+   # at https://github.com/organizations/sidekick-labs/settings/apps/sidekick-release-bot
+   gh variable set RELEASE_BOT_CLIENT_ID --repo sidekick-labs/<repo> --body '<numeric-id-or-Iv1-string>'
+   ```
+3. **Set the App's private key as a repo secret** (or, for less per-repo
+   maintenance, an org-level secret with visibility restricted to the relevant
+   repos).
+   ```bash
+   gh secret set RELEASE_BOT_PRIVATE_KEY --repo sidekick-labs/<repo> --body "$(cat path/to/sidekick-release-bot.pem)"
+   ```
+4. **Wire the caller** to pass both values to the reusable workflow:
+   ```yaml
+   with:
+     # ...
+     release-bot-client-id: ${{ vars.RELEASE_BOT_CLIENT_ID }}
+   secrets:
+     # ...
+     release-bot-private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+   ```
+
+When **either** input is missing, the workflow falls back to `GITHUB_TOKEN`
+and opens the PR as a draft with a reviewer-checklist note explaining the
+manual nudge needed.
 
 ### Setting up `SENTRY_API_TOKEN`
 
