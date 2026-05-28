@@ -1,0 +1,1022 @@
+name: Reusable Sentry Autofix
+
+# Reusable scheduled-Sentry-sweep workflow.
+#
+# Each consumer schedules a daily call to this workflow with their Sentry
+# project slug. The workflow:
+#
+#   1. Fetches the top unresolved Sentry issues for the project.
+#   2. Filters out any whose short_id is already addressed by an open OR
+#      recently-closed auto-fix PR (HTML-marker dedup, same pattern as the
+#      post-deploy-triage autofix composite action).
+#   3. Picks the highest-priority remaining candidate and hands the issue +
+#      stack trace context to claude-code-action for triage.
+#   4. In `mode: autofix`, if Claude classifies the issue as a high-confidence
+#      regression with named suspect files, runs a second Claude pass to apply
+#      a minimal fix, validates the diff (hard path blocklist + line cap),
+#      pushes a signed commit, and opens a draft PR.
+#   5. In `mode: triage-only`, or when the autofix gate doesn't pass, optionally
+#      opens a Linear issue with the triage summary (linear-fallback=true).
+#
+# Reuses the same safety model as `.github/actions/autofix/action.yml` in
+# sidekick-web: path blocklist (migrations, workflows, config/credentials*,
+# config/master.key, lockfiles), configurable diff-line cap (default 50),
+# signed commit via GitHub API, draft PR for human review. Never merges.
+#
+# See docs/reusable-workflows.md for the full input contract.
+
+on:
+  workflow_call:
+    inputs:
+      sentry-org:
+        description: 'Sentry organization slug.'
+        required: false
+        type: string
+        default: 'sidekick-labs'
+      sentry-project:
+        description: 'Sentry project slug. Issues are queried from this project only.'
+        required: true
+        type: string
+      stack:
+        description: 'Stack: rails | ruby-gem | node-lib | node-app | kmp. Drives toolchain setup for the apply step.'
+        required: true
+        type: string
+      mode:
+        description: 'autofix (default) attempts a PR when triage is high-confidence; triage-only skips the apply step and only opens Linear issues.'
+        required: false
+        type: string
+        default: 'autofix'
+      max-candidates:
+        description: 'How many top Sentry issues to consider per run before dedup filtering. The triage step still picks only ONE issue per run.'
+        required: false
+        type: number
+        default: 10
+      issue-query:
+        description: 'Sentry search query. Defaults to is:unresolved. Append modifiers (e.g. "is:unresolved level:error") to narrow.'
+        required: false
+        type: string
+        default: 'is:unresolved'
+      ruby-version-file:
+        description: 'Path to .ruby-version file (rails, ruby-gem stacks).'
+        required: false
+        type: string
+        default: '.ruby-version'
+      ruby-version:
+        description: 'Explicit ruby-version override (takes precedence over ruby-version-file).'
+        required: false
+        type: string
+        default: ''
+      node-version:
+        description: 'Node version (rails, node-lib, node-app stacks).'
+        required: false
+        type: string
+        default: 'lts/*'
+      lint-commands:
+        description: 'Multiline shell commands run post-apply as part of diff validation (e.g. rubocop, eslint, tsc). Empty means no lint gate.'
+        required: false
+        type: string
+        default: ''
+      test-commands:
+        description: 'Multiline shell commands for a focused/fast test suite, run post-apply as part of diff validation. Empty means no test gate. Avoid running the full suite here — keep it under ~5 minutes.'
+        required: false
+        type: string
+        default: ''
+      linear-fallback:
+        description: 'When true, open a Linear issue for triage-only runs and for autofix-skipped (low-confidence / no suspect files / dedup) candidates. Requires linear-api-key secret.'
+        required: false
+        type: boolean
+        default: false
+      diff-line-cap:
+        description: 'Hard cap on total insertions+deletions in the apply step diff. Above this, the validate step rejects.'
+        required: false
+        type: number
+        default: 50
+      dedup-window-days:
+        description: 'How many days back to scan closed PRs for the autofix marker when deciding whether an issue is already addressed.'
+        required: false
+        type: number
+        default: 30
+      timeout-minutes:
+        description: 'Job-level timeout.'
+        required: false
+        type: number
+        default: 30
+      claude-timeout-minutes:
+        description: 'Timeout (advisory) for each Claude action step. Composite-action steps cannot enforce this; the job timeout is the hard bound.'
+        required: false
+        type: number
+        default: 15
+      additional-allowed-tools:
+        description: 'Comma-separated entries appended to the apply step claude_args --allowed-tools. Triage step always runs with Read,Grep,Glob,Write (writes only to /tmp).'
+        required: false
+        type: string
+        default: ''
+
+    secrets:
+      claude-code-oauth-token:
+        description: 'CLAUDE_CODE_OAUTH_TOKEN for the anthropics action.'
+        required: true
+      sentry-api-token:
+        description: 'Read-scoped Sentry token (event:read + project:read). NOT the deploy-release write token.'
+        required: true
+      linear-api-key:
+        description: 'LINEAR_API_KEY for the linear-fallback path. Required only when linear-fallback=true.'
+        required: false
+
+permissions: {}
+
+jobs:
+  sentry-autofix:
+    name: Sentry Autofix (${{ inputs.sentry-project }})
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+
+    # contents:write for the auto-fix branch push; pull-requests:write for
+    # `gh pr create --draft`; id-token:write so claude-code-action can mint
+    # its OIDC token. The validate-before-push gate (path blocklist + line
+    # cap) is the actual containment for write scope, mirroring the
+    # post-deploy-triage autofix composite's design.
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
+
+    env:
+      # HTML-comment marker stamped into the autofix PR body and read by the
+      # dedup query in the fetch step. Single source of truth so the body
+      # template and the dedup grep can't drift apart.
+      AUTOFIX_MARKER_PREFIX: '<!-- sentry-autofix: '
+
+    steps:
+      - name: Validate inputs
+        env:
+          STACK: ${{ inputs.stack }}
+          MODE: ${{ inputs.mode }}
+          SENTRY_ORG: ${{ inputs.sentry-org }}
+          SENTRY_PROJECT: ${{ inputs.sentry-project }}
+          MAX_CANDIDATES: ${{ inputs.max-candidates }}
+          DIFF_LINE_CAP: ${{ inputs.diff-line-cap }}
+          DEDUP_WINDOW_DAYS: ${{ inputs.dedup-window-days }}
+        run: |
+          set -euo pipefail
+          case "$STACK" in
+            rails|ruby-gem|node-lib|node-app|kmp) ;;
+            *) echo "::error::Invalid stack: $STACK"; exit 1 ;;
+          esac
+          case "$MODE" in
+            autofix|triage-only) ;;
+            *) echo "::error::Invalid mode: $MODE (expected autofix or triage-only)"; exit 1 ;;
+          esac
+          # Slug allowlist: lower-case letters, digits, hyphens. Refuses
+          # anything that could break out of a URL or shell quote.
+          if ! [[ "$SENTRY_ORG" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]]; then
+            echo "::error::Invalid sentry-org: $SENTRY_ORG"
+            exit 1
+          fi
+          if ! [[ "$SENTRY_PROJECT" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]]; then
+            echo "::error::Invalid sentry-project: $SENTRY_PROJECT"
+            exit 1
+          fi
+          for n in "$MAX_CANDIDATES" "$DIFF_LINE_CAP" "$DEDUP_WINDOW_DAYS"; do
+            if ! [[ "$n" =~ ^[0-9]+$ ]]; then
+              echo "::error::Numeric inputs must be non-negative integers (got: $n)"
+              exit 1
+            fi
+          done
+          # KMP autofix isn't supported in v1 — Gradle build verification is
+          # too heavy for a daily sweep and Compose/Kotlin diffs are riskier
+          # to auto-apply than the Rails/Node patterns. Downgrade silently
+          # so a caller that sets stack=kmp but forgets mode=triage-only
+          # still gets useful daily output rather than a hard failure.
+          if [ "$STACK" = "kmp" ] && [ "$MODE" = "autofix" ]; then
+            echo "::warning::stack=kmp + mode=autofix not supported in v1 — forcing mode=triage-only"
+            echo "EFFECTIVE_MODE=triage-only" >> "$GITHUB_ENV"
+          else
+            echo "EFFECTIVE_MODE=$MODE" >> "$GITHUB_ENV"
+          fi
+
+      - name: Validate required secrets
+        env:
+          CLAUDE_TOKEN: ${{ secrets.claude-code-oauth-token }}
+          SENTRY_TOKEN: ${{ secrets.sentry-api-token }}
+          LINEAR_KEY: ${{ secrets.linear-api-key }}
+          LINEAR_FALLBACK: ${{ inputs.linear-fallback }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CLAUDE_TOKEN:-}" ]; then
+            echo "::error::claude-code-oauth-token secret is not set"
+            exit 1
+          fi
+          if [ -z "${SENTRY_TOKEN:-}" ]; then
+            echo "::error::sentry-api-token secret is not set"
+            exit 1
+          fi
+          if [ "$LINEAR_FALLBACK" = "true" ] && [ -z "${LINEAR_KEY:-}" ]; then
+            echo "::warning::linear-fallback enabled but linear-api-key is empty - Linear fallback will be unavailable"
+            echo "LINEAR_AVAILABLE=false" >> "$GITHUB_ENV"
+          elif [ "$LINEAR_FALLBACK" = "true" ]; then
+            echo "LINEAR_AVAILABLE=true" >> "$GITHUB_ENV"
+          else
+            echo "LINEAR_AVAILABLE=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 1
+
+      - name: Detect default branch
+        id: default-branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          DEFAULT_BRANCH=$(gh repo view --json defaultBranchRef -q '.defaultBranchRef.name' 2>/dev/null || echo "main")
+          echo "branch=$DEFAULT_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "Detected default branch: $DEFAULT_BRANCH"
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # ----- stack setup (only when we may apply a fix) -----
+
+      - name: Set up Ruby
+        if: ${{ env.EFFECTIVE_MODE == 'autofix' && (inputs.stack == 'rails' || inputs.stack == 'ruby-gem') }}
+        uses: ruby/setup-ruby@afeafc3d1ab54a631816aba4c914a0081c12ff2f # v1.310.0
+        with:
+          ruby-version: ${{ inputs.ruby-version != '' && inputs.ruby-version || '' }}
+          ruby-version-file: ${{ inputs.ruby-version == '' && inputs.ruby-version-file || '' }}
+          bundler-cache: true
+
+      - name: Set up Node.js
+        if: ${{ env.EFFECTIVE_MODE == 'autofix' && (inputs.stack == 'rails' || inputs.stack == 'node-lib' || inputs.stack == 'node-app') }}
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+
+      - name: Install npm dependencies
+        # Guarded on lockfile presence: a Rails app on Sprockets-only or any
+        # Node stack that hasn't committed a lockfile would otherwise fail
+        # every daily run on `npm ci`'s hard-error exit. The lint/test gates
+        # downstream are no-ops without dependencies installed, so this is
+        # the right place to skip cleanly rather than fail.
+        if: ${{ env.EFFECTIVE_MODE == 'autofix' && (inputs.stack == 'rails' || inputs.stack == 'node-lib' || inputs.stack == 'node-app') }}
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            echo "::notice::No package-lock.json — skipping npm ci"
+          fi
+
+      # ----- fetch Sentry issues + dedup -----
+
+      # The fetch logic is a small Node script written to RUNNER_TEMP (NOT the
+      # caller's checkout) so it never appears in `git status` or `git diff`,
+      # which lets the autofix validate step use plain unfiltered globs and
+      # avoids any chance of accidentally committing tooling alongside the
+      # fix. Bundling the script with the reusable workflow as a separate
+      # `.github/scripts/` file would require checking out the .github repo
+      # in the caller's job — too much ceremony for ~120 lines of code.
+      - name: Fetch Sentry issues and filter dedup
+        id: fetch
+        env:
+          SENTRY_ORG: ${{ inputs.sentry-org }}
+          SENTRY_PROJECT: ${{ inputs.sentry-project }}
+          SENTRY_QUERY: ${{ inputs.issue-query }}
+          SENTRY_API_TOKEN: ${{ secrets.sentry-api-token }}
+          MAX_CANDIDATES: ${{ inputs.max-candidates }}
+          DEDUP_WINDOW_DAYS: ${{ inputs.dedup-window-days }}
+          AUTOFIX_MARKER_PREFIX: ${{ env.AUTOFIX_MARKER_PREFIX }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/fetch-sentry-candidates.mjs" <<'NODE_SCRIPT_EOF'
+          // Fetches top unresolved Sentry issues, filters out any whose
+          // shortId is already addressed by an open or recently-closed
+          // auto-fix PR (HTML-marker dedup), enriches with the latest event
+          // (stack frames), and writes /tmp/sentry-issues.{json,md}.
+          //
+          // Soft-fail: any API hiccup logs and exits 0 with an empty array.
+          // The autofix workflow treats "no candidates" as a normal outcome.
+
+          import { appendFileSync, writeFileSync } from 'node:fs'
+          import { spawnSync } from 'node:child_process'
+
+          const env = process.env
+          const need = (k) => {
+            const v = env[k]
+            if (!v) throw new Error(`Missing env: ${k}`)
+            return v
+          }
+
+          const SENTRY_ORG = need('SENTRY_ORG')
+          const SENTRY_PROJECT = need('SENTRY_PROJECT')
+          const SENTRY_API_TOKEN = need('SENTRY_API_TOKEN')
+          const SENTRY_QUERY = env.SENTRY_QUERY || 'is:unresolved'
+          const MAX_CANDIDATES = Math.max(1, parseInt(env.MAX_CANDIDATES || '10', 10))
+          const DEDUP_WINDOW_DAYS = Math.max(1, parseInt(env.DEDUP_WINDOW_DAYS || '30', 10))
+          const MARKER_PREFIX = env.AUTOFIX_MARKER_PREFIX || '<!-- sentry-autofix: '
+          const REPO = need('REPO')
+          const FETCH_TIMEOUT_MS = 15_000
+
+          async function sentryFetch(path) {
+            const url = `https://sentry.io/api/0/${path}`
+            const res = await fetch(url, {
+              headers: { Authorization: `Bearer ${SENTRY_API_TOKEN}` },
+              signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+            })
+            if (!res.ok) {
+              console.error(`Sentry ${path} -> ${res.status}: ${(await res.text()).slice(0, 200)}`)
+              return null
+            }
+            return res.json()
+          }
+
+          function ghPrList(state, since) {
+            // Plain list, then filter locally by headRefName prefix +
+            // closedAt window. `gh pr list --search "head:..."` does
+            // exact branch match, not prefix, which isn't what we want;
+            // and there's no native prefix filter. 200 PRs covers months
+            // of daily runs comfortably.
+            const args = [
+              'pr',
+              'list',
+              '--state',
+              state,
+              '--limit',
+              '200',
+              '--json',
+              'number,headRefName,body,closedAt',
+            ]
+            const res = spawnSync('gh', args, {
+              encoding: 'utf8',
+              maxBuffer: 10 * 1024 * 1024,
+              timeout: 30_000,
+              env: { ...env, GH_REPO: REPO },
+            })
+            if (res.status !== 0) {
+              console.error(`gh pr list (${state}) failed: ${(res.stderr || '').slice(0, 300)}`)
+              return []
+            }
+            try {
+              const all = JSON.parse(res.stdout || '[]')
+              const prefixed = all.filter((pr) =>
+                (pr.headRefName || '').startsWith('auto-fix/sentry-'),
+              )
+              if (!since) return prefixed
+              const sinceMs = since.getTime()
+              return prefixed.filter((pr) => {
+                if (!pr.closedAt) return true
+                return new Date(pr.closedAt).getTime() >= sinceMs
+              })
+            } catch (e) {
+              console.error('Parse gh output failed:', e.message)
+              return []
+            }
+          }
+
+          function collectProcessedShortIds() {
+            const sinceClosed = new Date(Date.now() - DEDUP_WINDOW_DAYS * 86400 * 1000)
+            const open = ghPrList('open')
+            const closed = ghPrList('closed', sinceClosed)
+            const processed = new Set()
+            for (const pr of [...open, ...closed]) {
+              const body = pr.body || ''
+              // Match the marker prefix + capture short_id up to ` -->`.
+              const re = new RegExp(
+                MARKER_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '([A-Z0-9-]+)\\s*-->',
+                'g',
+              )
+              let m
+              while ((m = re.exec(body)) !== null) {
+                processed.add(m[1])
+              }
+            }
+            return processed
+          }
+
+          function safeInline(s) {
+            return String(s ?? '').replace(/`/g, "'")
+          }
+
+          function pickFrames(event) {
+            const exception = event?.entries?.find((e) => e.type === 'exception')?.data?.values?.[0]
+            if (!exception) return { type: null, value: null, frames: [] }
+            const all = (exception.stacktrace?.frames || []).slice().reverse()
+            const inApp = all.filter((f) => f.in_app)
+            const picked = (inApp.length > 0 ? inApp : all).slice(0, 6).map((f) => ({
+              filename: f.filename || null,
+              lineno: f.lineno || null,
+              function: f.function || null,
+              contextLine: f.context_line || null,
+              inApp: !!f.in_app,
+            }))
+            return { type: exception.type, value: exception.value, frames: picked }
+          }
+
+          function formatMd(picked) {
+            const lines = ['# Sentry candidates', '']
+            for (let i = 0; i < picked.length; i++) {
+              const c = picked[i]
+              lines.push(`## ${i + 1}. ${c.title} (${c.shortId})`)
+              lines.push(`- Level: ${c.level} | Count: ${c.count} | First seen: ${c.firstSeen}`)
+              lines.push(`- URL: ${c.permalink}`)
+              if (c.latestEvent?.type) {
+                lines.push(
+                  `- Exception: \`${safeInline(c.latestEvent.type)}: ${safeInline(c.latestEvent.value)}\``,
+                )
+              }
+              if (c.latestEvent?.frames?.length) {
+                lines.push('- Top frames:')
+                for (const f of c.latestEvent.frames) {
+                  const loc = f.lineno ? `${f.filename}:${f.lineno}` : f.filename
+                  const tag = f.inApp ? '' : ' *[external]*'
+                  lines.push(
+                    `  - \`${safeInline(f.function || '?')}\` (\`${safeInline(loc)}\`)${tag}`,
+                  )
+                  if (f.contextLine) {
+                    lines.push(`    > \`${safeInline(f.contextLine.trim())}\``)
+                  }
+                }
+              }
+              lines.push('')
+            }
+            return lines.join('\n')
+          }
+
+          async function main() {
+            console.log(`Sentry sweep: ${SENTRY_ORG}/${SENTRY_PROJECT} query="${SENTRY_QUERY}"`)
+            const processed = collectProcessedShortIds()
+            console.log(`Already-addressed shortIds: ${processed.size}`)
+
+            const q = encodeURIComponent(SENTRY_QUERY)
+            const sortedBy = 'sort=priority'
+            const issues = await sentryFetch(
+              `projects/${SENTRY_ORG}/${SENTRY_PROJECT}/issues/?query=${q}&${sortedBy}&limit=${MAX_CANDIDATES * 2}`,
+            )
+            if (!Array.isArray(issues)) {
+              console.error('Sentry list returned non-array — emitting empty candidates')
+              writeFileSync('/tmp/sentry-issues.json', '[]')
+              writeFileSync('/tmp/sentry-issues.md', '# Sentry candidates\n\n(none)\n')
+              return
+            }
+
+            const undeduped = issues.filter((i) => !processed.has(i.shortId)).slice(0, MAX_CANDIDATES)
+            console.log(
+              `Sentry returned ${issues.length} issues; ${undeduped.length} remain after dedup`,
+            )
+
+            const picked = []
+            for (const issue of undeduped) {
+              const event = await sentryFetch(`issues/${issue.id}/events/latest/`)
+              picked.push({
+                id: issue.id,
+                shortId: issue.shortId,
+                title: issue.title,
+                level: issue.level,
+                count: issue.count,
+                firstSeen: issue.firstSeen,
+                lastSeen: issue.lastSeen,
+                permalink: issue.permalink,
+                latestEvent: event ? pickFrames(event) : null,
+              })
+            }
+
+            writeFileSync('/tmp/sentry-issues.json', JSON.stringify(picked, null, 2))
+            writeFileSync('/tmp/sentry-issues.md', formatMd(picked))
+            console.log(`Wrote /tmp/sentry-issues.json (${picked.length} candidate(s))`)
+          }
+
+          main().catch((err) => {
+            console.error('Fetch failed:', err.stack || err.message)
+            writeFileSync('/tmp/sentry-issues.json', '[]')
+            writeFileSync('/tmp/sentry-issues.md', '# Sentry candidates\n\n(fetch failed)\n')
+            process.exit(0)
+          })
+          NODE_SCRIPT_EOF
+
+          node "$RUNNER_TEMP/fetch-sentry-candidates.mjs"
+
+          if [ ! -s /tmp/sentry-issues.json ]; then
+            echo '[]' > /tmp/sentry-issues.json
+          fi
+          COUNT=$(jq 'length' /tmp/sentry-issues.json)
+          echo "candidate_count=$COUNT" >> "$GITHUB_OUTPUT"
+          if [ "$COUNT" -gt 0 ]; then
+            PICKED=$(jq -r '.[0].shortId' /tmp/sentry-issues.json)
+            echo "picked_short_id=$PICKED" >> "$GITHUB_OUTPUT"
+          else
+            echo "picked_short_id=" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Candidates after dedup: $COUNT"
+
+      - name: Skip when no candidates
+        if: steps.fetch.outputs.candidate_count == '0'
+        env:
+          PROJECT: ${{ inputs.sentry-project }}
+        run: |
+          {
+            echo "## Sentry autofix — ${PROJECT}"
+            echo ""
+            echo "No unresolved Sentry issues require attention (after dedup against existing autofix PRs)."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "No candidates — nothing to do."
+
+      # ----- triage -----
+
+      - name: Triage with Claude Code
+        if: steps.fetch.outputs.candidate_count != '0'
+        uses: anthropics/claude-code-action@787c5a0ce96a9a6cfb050ea0c8f4c05f2447c251 # v1
+        with:
+          claude_code_oauth_token: ${{ secrets.claude-code-oauth-token }}
+          claude_args: |
+            --allowed-tools Read,Grep,Glob,Write
+            --max-turns 10
+          prompt: |
+            You are a daily Sentry-sweep assistant for the `${{ inputs.sentry-project }}` project. The fetch step has identified the top-priority unresolved Sentry issue that does NOT already have an open or recently-closed auto-fix PR. Your job is to triage that issue and decide whether a minimal forward-fix is worth attempting.
+
+            ## Inputs (use the Read tool)
+
+            - **`/tmp/sentry-issues.json`** — JSON array of candidate Sentry issues, sorted by priority. The first element (`.[0]`) is the one to triage. Each entry has `shortId`, `title`, `level`, `count`, `firstSeen`, `permalink`, and `latestEvent` with stack frames (filename, lineno, function, contextLine, in_app).
+            - **`/tmp/sentry-issues.md`** — human-readable version of the same.
+            - The current checkout is the repository's default branch HEAD. Use `Read` / `Grep` on the source files referenced in the stack frames to confirm what the code currently looks like.
+
+            ## Your task
+
+            1. Read `/tmp/sentry-issues.json` and focus on the first entry.
+            2. For the issue's top in-app stack frames, `Read` the source files at the cited line numbers. The line numbers may have drifted since the event was captured — use the surrounding function name to relocate if needed.
+            3. Decide whether the issue is:
+               - **likely problem**: a bug in our code at the cited frames, where a minimal fix is identifiable.
+               - **minor concern**: a real issue but the fix is non-trivial, requires design judgment, or spans many files.
+               - **clean**: not actionable (third-party error, expected failure, environmental, already-fixed).
+            4. **Write** a human-readable triage to **`/tmp/triage.md`** using the exact format below.
+            5. **Also write** a machine-readable verdict to **`/tmp/triage.json`** using the schema below. The autofix gate keys off this file.
+
+            ## /tmp/triage.md format
+
+            ```
+            ### :robot: Sentry triage hint
+            _AI-generated, not a verdict. Verify before acting._
+
+            **Issue:** [<shortId>](<permalink>) — <title>
+            **Verdict:** likely problem | minor concern | clean
+            **Likely cause:** <1-2 sentences>
+            **Suspect lines:** <file:line — only if confident, else "no clear in-app frame">
+            **Fix suggestion:** <one sentence — what change would resolve this>
+            **Confidence:** low | medium | high
+            ```
+
+            ## /tmp/triage.json schema (valid JSON only, exactly these keys)
+
+            ```
+            {
+              "sentry_short_id": "<shortId from the issue>",
+              "sentry_permalink": "<permalink>",
+              "verdict": "likely problem" | "minor concern" | "clean",
+              "confidence": "low" | "medium" | "high",
+              "title": "<issue title>",
+              "suspect_files": ["app/path/to/file.rb", "..."],
+              "fix_summary": "<one sentence; empty when not actionable>"
+            }
+            ```
+
+            - `suspect_files` MUST be repo-relative paths that exist in the current checkout. No `:LINE` suffixes. No duplicates. Empty array `[]` when you cannot pin the issue to specific files.
+            - Only fill `suspect_files` when `verdict = "likely problem"`. Leave `[]` for "minor concern" or "clean".
+
+            ## Rules
+
+            - **"high" confidence** ONLY when you have Read the source at the top in-app stack frame and the code clearly reproduces the error path (e.g., a NoMethodError on a method that doesn't exist on the receiver, an unhandled nil deref at the exact line). Otherwise prefer "medium" or "low".
+            - **"clean"** for third-party-library errors that don't originate in our code, browser/network noise (ResizeObserver loops, fetch aborts on unload), and issues whose `firstSeen` is far in the past with low recent volume (signal-dead).
+            - **"minor concern"** when the fix would require touching tests, schema, configuration files, or more than ~3 source files. Those need a human.
+            - Your only allowed writes are `/tmp/triage.md` and `/tmp/triage.json`. Do NOT modify source files, do NOT run shell commands, do NOT call any GitHub or Sentry API.
+            - Be terse. Bullets and short sentences only.
+
+      - name: Post triage to step summary
+        if: always() && steps.fetch.outputs.candidate_count != '0'
+        run: |
+          set -euo pipefail
+          {
+            echo "## Sentry autofix — ${{ inputs.sentry-project }}"
+            echo ""
+            echo "- **Picked:** \`${{ steps.fetch.outputs.picked_short_id }}\`"
+            echo "- **Candidates after dedup:** ${{ steps.fetch.outputs.candidate_count }}"
+            echo "- **Effective mode:** \`${{ env.EFFECTIVE_MODE }}\`"
+            if [ -f /tmp/triage.md ]; then
+              echo ""
+              echo "<details><summary>Triage</summary>"
+              echo ""
+              cat /tmp/triage.md
+              echo ""
+              echo "</details>"
+            fi
+            if [ -f /tmp/triage.json ]; then
+              echo ""
+              echo "<details><summary>Machine-readable verdict</summary>"
+              echo ""
+              echo '```json'
+              cat /tmp/triage.json
+              echo '```'
+              echo "</details>"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Reset source tree before autofix
+        # Defense-in-depth against prompt injection during the triage step:
+        # the triage step has Write access (needed for /tmp output) but
+        # claude-code-action has no path-restricted Write flag. An injection
+        # in a Sentry issue title or stack frame could redirect a write to a
+        # source file. Without this reset, the autofix path's `git diff`
+        # would pick up the injection-modified file as if it were part of
+        # the legitimate fix. /tmp files are untouched.
+        if: steps.fetch.outputs.candidate_count != '0'
+        run: |
+          set -euo pipefail
+          if ! git diff --quiet HEAD --; then
+            echo "::warning::Triage step modified tracked files — resetting before autofix"
+            git diff --name-only HEAD -- | awk '{print "  - " $0}'
+          fi
+          UNTRACKED=$(git ls-files --others --exclude-standard)
+          if [ -n "$UNTRACKED" ]; then
+            echo "::warning::Triage step created untracked files — removing before autofix"
+            printf '%s\n' "$UNTRACKED" | awk '{print "  - " $0}'
+          fi
+          git restore --staged --worktree -- . || true
+          git clean -fd
+
+      # ----- autofix gate -----
+
+      - name: Check autofix gate
+        id: gate
+        if: ${{ steps.fetch.outputs.candidate_count != '0' && env.EFFECTIVE_MODE == 'autofix' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AUTOFIX_MARKER_PREFIX: ${{ env.AUTOFIX_MARKER_PREFIX }}
+        run: |
+          set -euo pipefail
+          if [ ! -s /tmp/triage.json ]; then
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            echo "reason=no-triage-json" >> "$GITHUB_OUTPUT"
+            echo "No /tmp/triage.json — skipping autofix"
+            exit 0
+          fi
+          if ! jq empty /tmp/triage.json 2>/dev/null; then
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            echo "reason=invalid-json" >> "$GITHUB_OUTPUT"
+            echo "/tmp/triage.json is not valid JSON — skipping autofix"
+            exit 0
+          fi
+
+          IFS=$'\t' read -r VERDICT CONFIDENCE SUSPECT_COUNT SHORT_ID < <(
+            jq -r '[.verdict // "", .confidence // "", (.suspect_files // [] | length), .sentry_short_id // ""] | @tsv' \
+              /tmp/triage.json
+          )
+
+          echo "Triage: verdict=$VERDICT confidence=$CONFIDENCE suspect_files=$SUSPECT_COUNT short_id=$SHORT_ID"
+
+          if [ "$VERDICT" != "likely problem" ] \
+            || [ "$CONFIDENCE" != "high" ] \
+            || [ "$SUSPECT_COUNT" -le 0 ] \
+            || [ -z "$SHORT_ID" ]; then
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            echo "reason=gate-not-passed" >> "$GITHUB_OUTPUT"
+            echo "short_id=$SHORT_ID" >> "$GITHUB_OUTPUT"
+            echo "Autofix gate not passed (need verdict='likely problem' + confidence=high + ≥1 suspect_files + non-empty short_id)"
+            exit 0
+          fi
+
+          # The fetch step already filtered by marker against open +
+          # recently-closed PRs. A second dedup check here would only
+          # catch the narrow race of a human opening a PR in the seconds
+          # between fetch and gate — not worth the implementation cost.
+          # The push step's `git push` would still fail loudly if the
+          # branch name collides, which is the real safety net.
+
+          echo "should_run=true" >> "$GITHUB_OUTPUT"
+          echo "short_id=$SHORT_ID" >> "$GITHUB_OUTPUT"
+          echo "Autofix gate passed — preparing branch for $SHORT_ID"
+
+      - name: Prepare autofix branch
+        if: steps.gate.outputs.should_run == 'true'
+        env:
+          SHORT_ID: ${{ steps.gate.outputs.short_id }}
+        run: |
+          set -euo pipefail
+          # SHORT_ID is upper-case (SIDEKICK-WEB-12). Lowercase + replace any
+          # remaining non-branch-safe chars defensively, even though the
+          # Sentry short_id grammar is already safe.
+          BRANCH_SUFFIX=$(printf '%s' "$SHORT_ID" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-')
+          BRANCH="auto-fix/sentry-${BRANCH_SUFFIX}"
+          git checkout -B "$BRANCH"
+          echo "AUTOFIX_BRANCH=$BRANCH" >> "$GITHUB_ENV"
+
+      - name: Apply auto-fix with Claude Code
+        if: steps.gate.outputs.should_run == 'true'
+        uses: anthropics/claude-code-action@787c5a0ce96a9a6cfb050ea0c8f4c05f2447c251 # v1
+        with:
+          claude_code_oauth_token: ${{ secrets.claude-code-oauth-token }}
+          claude_args: |
+            --allowed-tools Read,Edit,Grep,Glob${{ inputs.additional-allowed-tools != '' && format(',{0}', inputs.additional-allowed-tools) || '' }}
+            --max-turns 15
+          prompt: |
+            A Sentry issue in `${{ inputs.sentry-project }}` was triaged as a high-confidence regression. Apply the minimal forward-fix.
+
+            ## Inputs (use the Read tool)
+
+            - **`/tmp/triage.json`** — your prior verdict. `suspect_files` names the files to start from. `fix_summary` describes the intended change. `sentry_short_id` and `sentry_permalink` identify the issue.
+            - **`/tmp/triage.md`** — the human-readable triage you wrote.
+            - **`/tmp/sentry-issues.json`** / **`/tmp/sentry-issues.md`** — the full Sentry context (stack trace, latest event, in-app frames). The picked issue is `.[0]`.
+            - The current checkout is the repository's default branch HEAD. The output is a **draft PR** — a human reviews everything before it lands.
+
+            ## Your task
+
+            Apply the smallest change that would resolve the Sentry issue.
+
+            - **Start with the files in `suspect_files`.** Expand to other files only when the fix genuinely needs them. The draft PR is the human-review gate; don't artificially constrain yourself, but don't drift either.
+            - **Hard limit: ${{ inputs.diff-line-cap }} changed lines total** (insertions + deletions across all files). Anything bigger is too risky to land without a human writing it; if the minimal fix exceeds this, do nothing.
+            - **Off-limits regardless of suspect_files**: `db/migrate/`, `.github/`, `config/credentials*` (encrypted secrets), `config/master.key`, lockfiles (`Gemfile.lock`, `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`). A downstream validation step rejects any diff touching these. The rest of `config/` is application code and is fixable.
+            - **No refactors, no doc updates.** Tests are okay only when the failure is a test gap that lets the bug land — the fix is to update the assertion.
+            - **You can only modify existing files** — the `Write` tool is not available. If the fix genuinely needs a new file, do nothing and let a human handle it.
+            - **Higher bar than a CI-failure fix**: this code is already in production and the error has been recurring. Stack frames in `/tmp/sentry-issues.json` may point to edge cases (rare inputs, race conditions, third-party flakes) that aren't true regressions even when they look like one. If the cause is anything other than a clear bug in the source you can Read, do nothing.
+            - If the fix isn't obvious from the available context — if you're guessing — do nothing. The triage summary will still be reported in the run summary; that's enough value on its own.
+
+            Use `Read`, `Grep`, `Edit`. Do NOT call shell commands. Do NOT modify `/tmp/*` files.
+
+            When you're done (or have decided not to act), simply stop. The next workflow step inspects `git diff` directly.
+
+      - name: Validate auto-fix diff
+        id: validate
+        if: steps.gate.outputs.should_run == 'true'
+        env:
+          DIFF_LINE_CAP: ${{ inputs.diff-line-cap }}
+        run: |
+          set -euo pipefail
+
+          CHANGED_TRACKED=$(git diff --name-only)
+          CHANGED_UNTRACKED=$(git ls-files --others --exclude-standard)
+          CHANGED=$(printf '%s\n%s\n' "$CHANGED_TRACKED" "$CHANGED_UNTRACKED" \
+            | grep -v '^$' | sort -u || true)
+
+          if [ -z "$CHANGED" ]; then
+            echo "applied=false" >> "$GITHUB_OUTPUT"
+            echo "reason=no-diff" >> "$GITHUB_OUTPUT"
+            echo "No changes — Claude declined to apply a fix."
+            exit 0
+          fi
+
+          # Hard-blocked paths: never auto-fix migrations, workflow files,
+          # config secrets, or lockfiles. Mirrors the post-deploy-triage
+          # autofix composite blocklist.
+          BLOCKED=$(printf '%s\n' "$CHANGED" \
+            | grep -E '^(db/migrate/|\.github/|config/credentials|config/master\.key|Gemfile\.lock|package-lock\.json|yarn\.lock|pnpm-lock\.yaml)' \
+            || true)
+          if [ -n "$BLOCKED" ]; then
+            echo "::error::Auto-fix touched hard-blocked paths:"
+            echo "$BLOCKED" | awk '{print "  - " $0}'
+            echo "applied=false" >> "$GITHUB_OUTPUT"
+            echo "reason=blocked-path" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          DIFF_LINES=$(git diff --numstat \
+            | awk '{a += ($1 == "-" ? 0 : $1); d += ($2 == "-" ? 0 : $2)} END {print a + d + 0}')
+          NEW_LINES=0
+          if [ -n "$CHANGED_UNTRACKED" ]; then
+            NEW_LINES=$(printf '%s\n' "$CHANGED_UNTRACKED" \
+              | xargs -d '\n' wc -l 2>/dev/null \
+              | awk '{n = $1} END {print n + 0}')
+          fi
+          TOTAL=$((DIFF_LINES + NEW_LINES))
+          if [ "$TOTAL" -gt "$DIFF_LINE_CAP" ]; then
+            echo "::error::Auto-fix diff too large ($TOTAL lines; cap is $DIFF_LINE_CAP). Refusing to push."
+            echo "applied=false" >> "$GITHUB_OUTPUT"
+            echo "reason=diff-too-large" >> "$GITHUB_OUTPUT"
+            echo "diff_lines=$TOTAL" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          echo "applied=true" >> "$GITHUB_OUTPUT"
+          echo "diff_lines=$TOTAL" >> "$GITHUB_OUTPUT"
+          echo "Validated: ${TOTAL} lines across $(echo "$CHANGED" | wc -l | tr -d ' ') file(s)"
+          echo "$CHANGED" | awk '{print "  - " $0}'
+
+      - name: Run lint checks on diff
+        # Optional gate — only when the caller passed lint-commands. Each
+        # line is a command; all must exit 0 or the autofix is rejected
+        # before push. Mirrors the weekly-maintenance verification model.
+        if: steps.gate.outputs.should_run == 'true' && steps.validate.outputs.applied == 'true' && inputs.lint-commands != ''
+        env:
+          LINT_COMMANDS: ${{ inputs.lint-commands }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            echo "::group::lint: $cmd"
+            bash -c "$cmd"
+            echo "::endgroup::"
+          done <<< "$LINT_COMMANDS"
+
+      - name: Run focused test commands
+        if: steps.gate.outputs.should_run == 'true' && steps.validate.outputs.applied == 'true' && inputs.test-commands != ''
+        env:
+          TEST_COMMANDS: ${{ inputs.test-commands }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            echo "::group::test: $cmd"
+            bash -c "$cmd"
+            echo "::endgroup::"
+          done <<< "$TEST_COMMANDS"
+
+      - name: Push auto-fix branch and open draft PR
+        id: push
+        if: steps.gate.outputs.should_run == 'true' && steps.validate.outputs.applied == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHORT_ID: ${{ steps.gate.outputs.short_id }}
+          DEFAULT_BRANCH: ${{ steps.default-branch.outputs.branch }}
+          AUTOFIX_MARKER_PREFIX: ${{ env.AUTOFIX_MARKER_PREFIX }}
+        run: |
+          set -euo pipefail
+
+          TITLE=$(jq -r '.title // ""' /tmp/triage.json | head -c 100)
+          PERMALINK=$(jq -r '.sentry_permalink // ""' /tmp/triage.json)
+          FIX_SUMMARY=$(jq -r '.fix_summary // ""' /tmp/triage.json)
+          MARKER="${AUTOFIX_MARKER_PREFIX}${SHORT_ID} -->"
+
+          COMMIT_MESSAGE="Auto-fix: Sentry ${SHORT_ID}
+
+          Generated by the daily Sentry autofix sweep. Sentry classified this
+          issue as a high-confidence regression with a minimal forward-fix
+          identifiable in the source. Validated against a path blocklist
+          (migrations / workflows / config / lockfiles) and a ${{ inputs.diff-line-cap }}-line diff cap,
+          plus the caller's lint/test commands.
+
+          Sentry issue: ${SHORT_ID}
+          Sentry URL: ${PERMALINK}
+
+          🤖 Generated by Claude Code via reusable-sentry-autofix.yml"
+
+          PR_BODY="## Auto-fix from Sentry sweep
+
+          A daily sweep of unresolved Sentry issues in \`${{ inputs.sentry-project }}\` triaged this issue as a **likely problem** with **high confidence**. Claude applied a minimal forward-fix; this draft PR is opened for human review.
+
+          - **Sentry issue:** [${SHORT_ID}](${PERMALINK}) — ${TITLE}
+          - **Fix summary:** ${FIX_SUMMARY}
+          - **Diff size:** ${{ steps.validate.outputs.diff_lines }} lines
+          - **Triage run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          ### Reviewer checklist
+
+          - [ ] Diff matches the triage summary
+          - [ ] The Sentry issue is genuinely caused by the code on the default branch (not an old release / rolled-back deploy)
+          - [ ] Local tests pass
+          - [ ] No unintended scope creep
+          - [ ] Mark \"Ready for review\" once verified — CI does not run on draft PRs created by \`GITHUB_TOKEN\`
+
+          🤖 Generated by Claude Code via \`reusable-sentry-autofix.yml\`
+
+          ${MARKER}"
+
+          git add -A
+          git commit -m "$COMMIT_MESSAGE"
+
+          # Push the unsigned commit so the remote ref exists; then PATCH
+          # to a signed commit created via the API. Same pattern as the
+          # post-deploy-triage autofix composite. `auto-fix/*` is exempted
+          # from the "Require signed commits" branch protection.
+          git push origin "$AUTOFIX_BRANCH"
+
+          TREE=$(git rev-parse HEAD^{tree})
+          PARENT=$(git rev-parse HEAD^)
+          SIGNED=$(gh api "repos/$GITHUB_REPOSITORY/git/commits" \
+            --method POST \
+            -f message="$COMMIT_MESSAGE" \
+            -f tree="$TREE" \
+            -f "parents[]=$PARENT" \
+            --jq '.sha')
+          [ -z "$SIGNED" ] && { echo "ERROR: failed to create signed commit via API" >&2; exit 1; }
+
+          gh api "repos/$GITHUB_REPOSITORY/git/refs/heads/$AUTOFIX_BRANCH" \
+            --method PATCH \
+            -f sha="$SIGNED" \
+            -F force=true
+
+          UPDATED=$(gh api "repos/$GITHUB_REPOSITORY/git/refs/heads/$AUTOFIX_BRANCH" --jq '.object.sha')
+          [ "$UPDATED" != "$SIGNED" ] && { echo "ERROR: branch ref did not advance to signed SHA" >&2; exit 1; }
+
+          URL=$(gh pr create \
+            --draft \
+            --title "Auto-fix: Sentry ${SHORT_ID}" \
+            --body "$PR_BODY" \
+            --base "$DEFAULT_BRANCH" \
+            --head "$AUTOFIX_BRANCH")
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "Opened draft PR: $URL"
+
+      # ----- Linear fallback (triage-only, autofix-skipped, or autofix-failed) -----
+
+      - name: Write Linear MCP config
+        # Materialise the MCP config file BEFORE invoking claude-code-action
+        # so the LINEAR_API_KEY never appears in --mcp-config's argv (visible
+        # in /proc/<pid>/cmdline and any tool that logs its own args). Reading
+        # the key from env and writing the file via a heredoc keeps it out of
+        # argv entirely. jq builds the JSON so a key with quotes or backslashes
+        # can't break the file structure.
+        if: >-
+          inputs.linear-fallback == true &&
+          steps.fetch.outputs.candidate_count != '0' &&
+          env.LINEAR_AVAILABLE == 'true' &&
+          (env.EFFECTIVE_MODE == 'triage-only' ||
+           steps.gate.outputs.should_run != 'true' ||
+           steps.push.outputs.url == '')
+        env:
+          LINEAR_API_KEY: ${{ secrets.linear-api-key }}
+        run: |
+          set -euo pipefail
+          MCP_CFG="$RUNNER_TEMP/linear-mcp-config.json"
+          umask 077
+          jq -n --arg key "$LINEAR_API_KEY" \
+            '{mcpServers:{linear:{command:"npx",args:["-y","@linear/mcp-server"],env:{LINEAR_API_KEY:$key}}}}' \
+            > "$MCP_CFG"
+          chmod 600 "$MCP_CFG"
+          echo "LINEAR_MCP_CONFIG=$MCP_CFG" >> "$GITHUB_ENV"
+
+      - name: Open Linear issue (fallback)
+        # Conditions:
+        #   - linear-fallback explicitly enabled by caller
+        #   - we had a candidate
+        #   - linear key available
+        #   - AND either: triage-only mode, OR autofix gate didn't pass, OR
+        #     autofix didn't actually push a PR (validation rejected, etc.)
+        if: >-
+          inputs.linear-fallback == true &&
+          steps.fetch.outputs.candidate_count != '0' &&
+          env.LINEAR_AVAILABLE == 'true' &&
+          (env.EFFECTIVE_MODE == 'triage-only' ||
+           steps.gate.outputs.should_run != 'true' ||
+           steps.push.outputs.url == '')
+        uses: anthropics/claude-code-action@787c5a0ce96a9a6cfb050ea0c8f4c05f2447c251 # v1
+        with:
+          claude_code_oauth_token: ${{ secrets.claude-code-oauth-token }}
+          claude_args: |
+            --mcp-config ${{ env.LINEAR_MCP_CONFIG }}
+            --allowed-tools Read,mcp__linear__list_teams,mcp__linear__save_issue
+            --max-turns 8
+          prompt: |
+            A Sentry-sweep triage just produced a verdict for `${{ inputs.sentry-project }}` that the autofix path did not handle (mode=triage-only, or the gate didn't pass, or the apply step produced no valid diff). Create a Linear issue so a human can pick it up.
+
+            ## Inputs
+
+            - **`/tmp/triage.json`** — your prior verdict.
+            - **`/tmp/triage.md`** — human-readable triage.
+            - **`/tmp/sentry-issues.json`** — full Sentry context.
+
+            ## Your task
+
+            1. Read `/tmp/triage.json` and `/tmp/triage.md`.
+            2. Find the right Linear team via `mcp__linear__list_teams`. Pick the team whose key/name best matches `${{ inputs.sentry-project }}` (e.g. project `sidekick-web` → team with key `WEB`, `SW`, or name containing "web"). If multiple match, prefer the most specific. If none clearly match, pick the first team and note this in the issue body.
+            3. Before creating, check for duplicates: search for an open Linear issue whose title contains the Sentry shortId. If found, do nothing.
+            4. Otherwise call `mcp__linear__save_issue` with:
+               - `title`: "Sentry: <shortId> — <issue title>" (truncate to 100 chars)
+               - `description`: include shortId, permalink, verdict, confidence, fix_summary, and the full triage.md content.
+               - `team`: the team you picked.
+               - Do NOT set assignee, priority, or labels — leave for the human.
+
+            Be terse. Use Read for the /tmp files, then the Linear MCP tools. No source-file edits, no shell commands.
+
+      # ----- summary -----
+
+      - name: Final summary
+        if: always()
+        env:
+          PROJECT: ${{ inputs.sentry-project }}
+          CANDIDATE_COUNT: ${{ steps.fetch.outputs.candidate_count }}
+          PICKED: ${{ steps.fetch.outputs.picked_short_id }}
+          GATE: ${{ steps.gate.outputs.should_run }}
+          GATE_REASON: ${{ steps.gate.outputs.reason }}
+          APPLIED: ${{ steps.validate.outputs.applied }}
+          PR_URL: ${{ steps.push.outputs.url }}
+          DIFF_LINES: ${{ steps.validate.outputs.diff_lines }}
+        run: |
+          set -euo pipefail
+          {
+            echo ""
+            echo "### Outcome"
+            echo ""
+            echo "- **Candidates:** ${CANDIDATE_COUNT:-0}"
+            echo "- **Picked:** \`${PICKED:-none}\`"
+            echo "- **Autofix gate:** ${GATE:-skipped}${GATE_REASON:+ (${GATE_REASON})}"
+            if [ "${APPLIED:-}" = "true" ]; then
+              echo "- **Autofix applied:** yes (${DIFF_LINES} lines)"
+            elif [ -n "${APPLIED:-}" ]; then
+              echo "- **Autofix applied:** no"
+            fi
+            if [ -n "${PR_URL:-}" ]; then
+              echo "- **Draft PR:** ${PR_URL}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
