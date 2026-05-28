@@ -305,6 +305,9 @@ jobs:
       stack: node-app
       node-version: '24'
       linear-fallback: true
+      # Open auto-fix PRs as ready-for-review via the sidekick-release-bot
+      # App so CI fires automatically.
+      release-bot-client-id: ${{ vars.RELEASE_BOT_CLIENT_ID }}
       lint-commands: |
         npm run lint
         npm run typecheck
@@ -312,6 +315,7 @@ jobs:
       claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
       sentry-api-token: ${{ secrets.SENTRY_API_TOKEN }}
       linear-api-key: ${{ secrets.LINEAR_API_KEY }}
+      release-bot-private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
 ```
 
 ### Example — Ruby gem (sidekick-rdp-client)
