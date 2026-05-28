@@ -71,11 +71,6 @@ on:
         required: false
         type: string
         default: 'lts/*'
-      jdk-version:
-        description: 'JDK version (kmp stack).'
-        required: false
-        type: string
-        default: '17'
       lint-commands:
         description: 'Multiline shell commands run post-apply as part of diff validation (e.g. rubocop, eslint, tsc). Empty means no lint gate.'
         required: false
@@ -263,8 +258,18 @@ jobs:
           cache: 'npm'
 
       - name: Install npm dependencies
+        # Guarded on lockfile presence: a Rails app on Sprockets-only or any
+        # Node stack that hasn't committed a lockfile would otherwise fail
+        # every daily run on `npm ci`'s hard-error exit. The lint/test gates
+        # downstream are no-ops without dependencies installed, so this is
+        # the right place to skip cleanly rather than fail.
         if: ${{ env.EFFECTIVE_MODE == 'autofix' && (inputs.stack == 'rails' || inputs.stack == 'node-lib' || inputs.stack == 'node-app') }}
-        run: npm ci
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            echo "::notice::No package-lock.json — skipping npm ci"
+          fi
 
       # ----- fetch Sentry issues + dedup -----
 
@@ -915,6 +920,32 @@ jobs:
 
       # ----- Linear fallback (triage-only, autofix-skipped, or autofix-failed) -----
 
+      - name: Write Linear MCP config
+        # Materialise the MCP config file BEFORE invoking claude-code-action
+        # so the LINEAR_API_KEY never appears in --mcp-config's argv (visible
+        # in /proc/<pid>/cmdline and any tool that logs its own args). Reading
+        # the key from env and writing the file via a heredoc keeps it out of
+        # argv entirely. jq builds the JSON so a key with quotes or backslashes
+        # can't break the file structure.
+        if: >-
+          inputs.linear-fallback == true &&
+          steps.fetch.outputs.candidate_count != '0' &&
+          env.LINEAR_AVAILABLE == 'true' &&
+          (env.EFFECTIVE_MODE == 'triage-only' ||
+           steps.gate.outputs.should_run != 'true' ||
+           steps.push.outputs.url == '')
+        env:
+          LINEAR_API_KEY: ${{ secrets.linear-api-key }}
+        run: |
+          set -euo pipefail
+          MCP_CFG="$RUNNER_TEMP/linear-mcp-config.json"
+          umask 077
+          jq -n --arg key "$LINEAR_API_KEY" \
+            '{mcpServers:{linear:{command:"npx",args:["-y","@linear/mcp-server"],env:{LINEAR_API_KEY:$key}}}}' \
+            > "$MCP_CFG"
+          chmod 600 "$MCP_CFG"
+          echo "LINEAR_MCP_CONFIG=$MCP_CFG" >> "$GITHUB_ENV"
+
       - name: Open Linear issue (fallback)
         # Conditions:
         #   - linear-fallback explicitly enabled by caller
@@ -933,7 +964,7 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.claude-code-oauth-token }}
           claude_args: |
-            --mcp-config '{"mcpServers":{"linear":{"command":"npx","args":["-y","@linear/mcp-server"],"env":{"LINEAR_API_KEY":"${{ secrets.linear-api-key }}"}}}}'
+            --mcp-config ${{ env.LINEAR_MCP_CONFIG }}
             --allowed-tools Read,mcp__linear__list_teams,mcp__linear__save_issue
             --max-turns 8
           prompt: |

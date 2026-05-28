@@ -222,7 +222,6 @@ stamped into every autofix PR opened by this workflow, closing the loop.
 | `ruby-version-file` | string | no | `.ruby-version` | Ruby version file (rails, ruby-gem stacks). |
 | `ruby-version` | string | no | `""` | Explicit ruby-version override. |
 | `node-version` | string | no | `lts/*` | Node version (rails, node-lib, node-app stacks). |
-| `jdk-version` | string | no | `17` | JDK version (kmp stack, triage-only). |
 | `lint-commands` | string | no | `""` | Multiline lint commands run post-apply. All must exit 0 or the fix is rejected. Keep fast. |
 | `test-commands` | string | no | `""` | Multiline test commands run post-apply. Use a focused subset, not the full suite — runs daily. |
 | `linear-fallback` | boolean | no | `false` | When true, opens a Linear issue for triage-only runs and for autofix-skipped candidates. Requires `linear-api-key`. |
@@ -230,7 +229,7 @@ stamped into every autofix PR opened by this workflow, closing the loop.
 | `dedup-window-days` | number | no | `30` | How far back to scan closed PRs for the autofix marker. |
 | `timeout-minutes` | number | no | `30` | Job-level timeout. |
 | `claude-timeout-minutes` | number | no | `15` | Advisory — composite-action steps can't enforce this; job timeout is the hard bound. |
-| `additional-allowed-tools` | string | no | `""` | Comma-separated entries appended to the apply step `--allowed-tools` (e.g. `Bash(bin/rspec:*)`). |
+| `additional-allowed-tools` | string | no | `""` | Comma-separated entries appended to the apply step `--allowed-tools` (e.g. `Bash(bin/rspec:*)`). **Note:** entries are passed through unsanitised, and entries like `Bash(...)` widen Claude's blast radius beyond the default `Read,Edit,Grep,Glob`. Use sparingly and prefer tightly-scoped wildcards. |
 
 ### Secrets
 
@@ -354,6 +353,9 @@ jobs:
     uses: sidekick-labs/.github/.github/workflows/reusable-sentry-autofix.yml@v2
     with:
       sentry-project: sidekick-companion-kit
+      # `stack: kmp` is accepted but no toolchain is installed — KMP is
+      # triage-only in v1 (no autofix path), so the JDK/Gradle setup that
+      # would be needed for an apply step is intentionally omitted.
       stack: kmp
       mode: triage-only
       linear-fallback: true
