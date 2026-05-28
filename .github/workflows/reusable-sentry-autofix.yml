@@ -625,7 +625,7 @@ jobs:
           claude_code_oauth_token: ${{ secrets.claude-code-oauth-token }}
           claude_args: |
             --allowed-tools Read,Grep,Glob,Write
-            --max-turns 10
+            --max-turns 20
           prompt: |
             You are a daily Sentry-sweep assistant for the `${{ inputs.sentry-project }}` project. The fetch step has identified the top-priority unresolved Sentry issue that does NOT already have an open or recently-closed auto-fix PR. Your job is to triage that issue and decide whether a minimal forward-fix is worth attempting.
 
