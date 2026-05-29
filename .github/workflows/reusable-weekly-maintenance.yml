@@ -585,6 +585,7 @@ jobs:
           # spawn mcp-remote with an empty bearer.
           # See: https://linear.app/docs/mcp
           claude_args: >-
+            --model claude-opus-4-8
             --mcp-config ${{ steps.build-prompt.outputs.mcp-config-path }}
             --allowed-tools "${{ steps.build-prompt.outputs.allowed-tools }}"
 
