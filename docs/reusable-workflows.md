@@ -217,6 +217,7 @@ stamped into every autofix PR opened by this workflow, closing the loop.
 | `sentry-project` | string | yes | — | Sentry project slug (e.g. `sidekick-web`). |
 | `stack` | string | yes | — | One of `rails`, `ruby-gem`, `node-lib`, `node-app`, `kmp`. Drives toolchain setup for the apply step. |
 | `mode` | string | no | `autofix` | `autofix` attempts a PR when triage is high-confidence; `triage-only` skips the apply step. `stack: kmp` always forces `triage-only`. |
+| `engine` | string | no | `claude` | AI engine. `claude` uses `anthropics/claude-code-action` + `claude-code-oauth-token`. `codex` uses `openai/codex-action` + the `CODEX_AUTH_JSON` subscription credential (triage via `output-schema`, apply in a `workspace-write` sandbox, Linear fallback via the MCP `config.toml`). The gate / validation / signed-commit / PR logic is shared. See [codex-migration.md](codex-migration.md). |
 | `max-candidates` | number | no | `10` | Top N Sentry issues considered before dedup filtering. Only ONE is triaged per run. |
 | `issue-query` | string | no | `is:unresolved` | Sentry search query. Append modifiers (e.g. `is:unresolved level:error`) to narrow. |
 | `ruby-version-file` | string | no | `.ruby-version` | Ruby version file (rails, ruby-gem stacks). |
@@ -236,7 +237,8 @@ stamped into every autofix PR opened by this workflow, closing the loop.
 
 | Secret | Required | Description |
 |---|---|---|
-| `claude-code-oauth-token` | yes | OAuth token for `anthropics/claude-code-action`. |
+| `claude-code-oauth-token` | when `engine: claude` | OAuth token for `anthropics/claude-code-action`. |
+| `CODEX_AUTH_JSON` | when `engine: codex` | Codex subscription `auth.json` (org secret), supplied via `secrets: inherit`. See [codex-migration.md](codex-migration.md). |
 | `sentry-api-token` | yes | **Read-scoped** Sentry token (`event:read` + `project:read`). NOT the deploy-release write token. See "Setting up `SENTRY_API_TOKEN`" below. |
 | `linear-api-key` | no | Required only when `linear-fallback: true`. |
 | `release-bot-private-key` | no | GitHub App private key (.pem contents). Required together with `release-bot-client-id` to bypass the GITHUB_TOKEN event-suppression rule. See "Setting up the auto-fix bot" below. |
