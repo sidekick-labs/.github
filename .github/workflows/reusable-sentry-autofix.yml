@@ -1252,12 +1252,13 @@ jobs:
           auth-json: ${{ secrets.CODEX_AUTH_JSON }}
           enable-linear-mcp: 'true'
           linear-api-key: ${{ secrets.linear-api-key }}
+          enable-workspace-network: 'true'
 
       - name: Open Linear issue (fallback) with Codex
-        # NOTE: read-only sandbox for the agent; the Linear MCP server runs as a
-        # codex-spawned subprocess and makes the network call. If live runs show
-        # the MCP call blocked by the sandbox, enable network access for this
-        # step's codex-home. Verify during end-to-end validation.
+        # workspace-write + network_access=true (via the auth step) so the Linear
+        # MCP subprocess can reach the network — read-only has no network at all.
+        # Mirrors the weekly-maintenance codex path. The agent only reads /tmp and
+        # calls MCP tools; it doesn't write source.
         if: >-
           inputs.engine == 'codex' &&
           inputs.linear-fallback == true &&
@@ -1269,7 +1270,7 @@ jobs:
         uses: openai/codex-action@e0fdf01220eb9a88167c4898839d273e3f2609d1 # v1.8
         with:
           codex-home: ${{ steps.codex-auth-linear.outputs.codex-home }}
-          sandbox: read-only
+          sandbox: workspace-write
           model: ${{ env.CODEX_MODEL }}
           prompt: |
             A Sentry-sweep triage for `${{ inputs.sentry-project }}` produced a verdict the autofix path did not handle (mode=triage-only, the gate didn't pass, or the apply produced no valid diff). Create a Linear issue so a human can pick it up.
