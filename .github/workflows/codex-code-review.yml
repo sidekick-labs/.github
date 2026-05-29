@@ -124,7 +124,12 @@ jobs:
           github-token: ${{ github.token }}
           script: |
             const marker = '<!-- codex-review -->';
-            const body = `${marker}\n${process.env.CODEX_FINAL_MESSAGE}`;
+            // GitHub caps comment bodies at 65536 chars; truncate to stay under
+            // (createComment/updateComment 422 otherwise). Matches codex-agent.yml.
+            const msg = process.env.CODEX_FINAL_MESSAGE || '';
+            const max = 65000;
+            const text = msg.length > max ? `${msg.slice(0, max)}\n\n_…truncated…_` : msg;
+            const body = `${marker}\n${text}`;
             const { owner, repo } = context.repo;
             const issue_number = context.payload.pull_request.number;
             const comments = await github.paginate(github.rest.issues.listComments, {
