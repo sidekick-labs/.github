@@ -17,6 +17,10 @@ inputs:
     description: "Linear API key, required when enable-linear-mcp is 'true'."
     required: false
     default: ""
+  enable-workspace-network:
+    description: "If 'true', allow network access in the workspace-write sandbox (config.toml [sandbox_workspace_write] network_access = true). Needed for steps where Codex runs dependency updates / git push / gh from inside a workspace-write sandbox."
+    required: false
+    default: "false"
 
 outputs:
   codex-home:
@@ -33,6 +37,7 @@ runs:
         CODEX_AUTH_JSON: ${{ inputs.auth-json }}
         ENABLE_LINEAR_MCP: ${{ inputs.enable-linear-mcp }}
         LINEAR_API_KEY: ${{ inputs.linear-api-key }}
+        ENABLE_WORKSPACE_NETWORK: ${{ inputs.enable-workspace-network }}
       run: |
         set -euo pipefail
 
@@ -73,6 +78,15 @@ runs:
             printf 'command = "npx"\n'
             printf 'args = ["-y", "mcp-remote", "https://mcp.linear.app/mcp", "--header", "Authorization:Bearer %s"]\n' "$LINEAR_API_KEY"
             printf 'startup_timeout_sec = 30\n'
+          } >> "$CODEX_HOME/config.toml"
+        fi
+
+        if [ "$ENABLE_WORKSPACE_NETWORK" = "true" ]; then
+          # Dependency updates / git push / gh need the network from inside the
+          # workspace-write sandbox, which blocks it by default.
+          {
+            printf '\n[sandbox_workspace_write]\n'
+            printf 'network_access = true\n'
           } >> "$CODEX_HOME/config.toml"
         fi
 

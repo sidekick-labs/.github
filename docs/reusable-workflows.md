@@ -55,8 +55,9 @@ A run does the following:
 | `lint-commands` | string | no | `""` | Multiline shell — every line is a verification command (e.g. `bin/rubocop`, `npm run lint`). |
 | `test-commands` | string | no | `""` | Multiline shell — full test-suite verification commands. |
 | `gradle-test-command` | string | no | `./gradlew test` | KMP test command. |
-| `linear-fallback` | boolean | no | `false` | When true, Claude opens a Linear issue for risky/judgment-call items. Requires `linear-api-key` secret. |
-| `additional-allowed-tools` | string | no | `""` | Comma-separated entries appended to `--allowed-tools`. |
+| `linear-fallback` | boolean | no | `false` | When true, the agent opens a Linear issue for risky/judgment-call items. Requires `linear-api-key` secret. |
+| `engine` | string | no | `claude` | AI engine. `claude` uses `anthropics/claude-code-action` + `claude-code-oauth-token`. `codex` uses `openai/codex-action` + `CODEX_AUTH_JSON` (runs in a `workspace-write` sandbox with network enabled, reusing the same assembled prompt; Linear MCP via `config.toml`). See [codex-migration.md](codex-migration.md). |
+| `additional-allowed-tools` | string | no | `""` | Comma-separated entries appended to `--allowed-tools` (claude engine only). |
 | `todo-fixme-paths` | string | no | `.` | Space-separated paths scanned for TODO/FIXME. |
 | `todo-fixme-exclude` | string | no | (sensible defaults) | Space-separated globs excluded from the census. |
 | `timeout-minutes` | number | no | `45` | Job-level timeout. |
@@ -66,7 +67,8 @@ A run does the following:
 
 | Secret | Required | Description |
 |---|---|---|
-| `claude-code-oauth-token` | yes | OAuth token for `anthropics/claude-code-action`. |
+| `claude-code-oauth-token` | when `engine: claude` | OAuth token for `anthropics/claude-code-action`. |
+| `CODEX_AUTH_JSON` | when `engine: codex` | Codex subscription `auth.json` (org secret), supplied via `secrets: inherit`. See [codex-migration.md](codex-migration.md). |
 | `linear-api-key` | no | Required only when `linear-fallback: true`. |
 
 ### Behavior
