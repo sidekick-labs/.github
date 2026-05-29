@@ -23,8 +23,10 @@ production deploy workflows in `sidekick-web` and `sidekick-harness` (~130 lines
 
 # Gate the job's success immediately, BEFORE any success-only steps
 # (release tag, Sentry notify). The action itself always exits 0.
-- name: Fail if deploy did not reach ACTIVE
-  if: steps.do_deploy.outputs.phase != 'ACTIVE'
+# Gate on `outcome` rather than `phase` so the caller doesn't depend on the
+# exact success-phase string (insulated from DO phase renames).
+- name: Fail if deploy did not succeed
+  if: steps.do_deploy.outputs.outcome != 'success'
   run: |
     echo "::error::Deploy ended in phase '${{ steps.do_deploy.outputs.phase }}'"
     exit 1
@@ -60,5 +62,5 @@ steps skip on failure, `always()` steps still run.
 |--------|-------------|
 | `do_deploy_id` | DO deployment ID (empty if the update never produced one) |
 | `do_deploy_url` | Cloud console URL for the deployment |
-| `phase` | Terminal DO phase (`ACTIVE` on success) |
+| `phase` | `ACTIVE` on success; on failure `ERROR`/`CANCELED`/`SUPERSEDED`, `TIMEOUT`, or a sentinel (`UPDATE_FAILED`/`PARSE_FAILED`/`NO_DEPLOY_ID`/`INVALID_INPUT`) |
 | `outcome` | `success` when `phase == ACTIVE`, else `failure` |

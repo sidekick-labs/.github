@@ -49,7 +49,11 @@ outputs:
     description: Cloud console URL for the deployment (empty if no deploy id).
     value: ${{ steps.deploy.outputs.do_deploy_url }}
   phase:
-    description: Terminal DO phase (ACTIVE on success; ERROR/CANCELED/SUPERSEDED/UNKNOWN or a *_FAILED sentinel on failure).
+    description: >-
+      Outcome phase. ACTIVE on success; on failure one of ERROR / CANCELED /
+      SUPERSEDED (DO terminal phases), TIMEOUT (polling deadline hit before a
+      terminal phase), or a sentinel: UPDATE_FAILED / PARSE_FAILED /
+      NO_DEPLOY_ID / INVALID_INPUT.
     value: ${{ steps.deploy.outputs.phase }}
   outcome:
     description: "'success' when phase == ACTIVE, otherwise 'failure'. Convenience for the caller's gate step."
@@ -125,6 +129,15 @@ runs:
           emit outcome "failure"
           exit 0
         }
+
+        # Validate the numeric inputs before they reach arithmetic context.
+        # Under `set -e` a non-numeric value (e.g. "30m" or "") would make
+        # `$(( … + POLL_TIMEOUT ))` abort the step with an opaque message;
+        # fail fast with a clear sentinel instead so the caller's gate sees it.
+        if ! [[ "$POLL_TIMEOUT" =~ ^[0-9]+$ ]] || ! [[ "$POLL_INTERVAL" =~ ^[0-9]+$ ]]; then
+          echo "::error::poll_timeout_seconds / poll_interval_seconds must be integer seconds (got '$POLL_TIMEOUT' / '$POLL_INTERVAL')"
+          fail "INVALID_INPUT"
+        fi
 
         # ─── Phase 1: kick off the deploy and CAPTURE THE ID ─────────
         #
@@ -205,6 +218,12 @@ runs:
         # the job-level timeout.
         DEADLINE=$(( $(date +%s) + POLL_TIMEOUT ))
         PHASE="UNKNOWN"
+        # Assume timeout until a terminal phase clears it. Tracking *why* the
+        # loop exited (terminal phase vs deadline) is more reliable than
+        # re-checking the clock afterwards: a deploy that reaches ACTIVE in
+        # the last poll interval can leave `date +%s >= DEADLINE` true and
+        # would otherwise emit a spurious "timed out" warning on a success.
+        TIMED_OUT=1
         # Surface persistent get-deployment failures so we don't silently
         # spin for the full deadline on a wedged API / bad credentials.
         # Reset on every successful response so the warning only fires
@@ -216,9 +235,11 @@ runs:
           PHASE="${PHASE:-UNKNOWN}"
           case "$PHASE" in
             ACTIVE)
+              TIMED_OUT=0
               break
               ;;
             ERROR|CANCELED|SUPERSEDED)
+              TIMED_OUT=0
               break
               ;;
             UNKNOWN)
@@ -237,8 +258,13 @@ runs:
           esac
         done
 
-        if [ "$(date +%s)" -ge "$DEADLINE" ]; then
-          echo "::warning::Deployment $DEPLOY_ID timed out after ${POLL_TIMEOUT}s in phase $PHASE"
+        if [ "$TIMED_OUT" -eq 1 ]; then
+          # Emit an unambiguous TIMEOUT sentinel rather than whatever
+          # in-flight phase (DEPLOYING / PENDING_DEPLOY / UNKNOWN) happened
+          # to be last seen — so callers can detect a timeout without
+          # enumerating every non-terminal state.
+          echo "::warning::Deployment $DEPLOY_ID timed out after ${POLL_TIMEOUT}s (last seen phase: $PHASE)"
+          PHASE="TIMEOUT"
         fi
 
         if [ "$PHASE" = "ACTIVE" ]; then
