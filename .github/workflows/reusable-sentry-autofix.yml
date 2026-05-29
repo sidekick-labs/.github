@@ -624,6 +624,7 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.claude-code-oauth-token }}
           claude_args: |
+            --model claude-opus-4-8
             --allowed-tools Read,Grep,Glob,Write
             --max-turns 20
           prompt: |
@@ -809,6 +810,7 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.claude-code-oauth-token }}
           claude_args: |
+            --model claude-opus-4-8
             --allowed-tools Read,Edit,Grep,Glob${{ inputs.additional-allowed-tools != '' && format(',{0}', inputs.additional-allowed-tools) || '' }}
             --max-turns 15
           prompt: |
@@ -1084,6 +1086,7 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.claude-code-oauth-token }}
           claude_args: |
+            --model claude-opus-4-8
             --mcp-config ${{ env.LINEAR_MCP_CONFIG }}
             --allowed-tools Read,mcp__linear__list_teams,mcp__linear__save_issue
             --max-turns 8
