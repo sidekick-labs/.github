@@ -46,6 +46,11 @@ on:
         required: false
         type: string
         default: 'autofix'
+      engine:
+        description: 'AI engine: claude (default) uses anthropics/claude-code-action + CLAUDE_CODE_OAUTH_TOKEN; codex uses openai/codex-action + the CODEX_AUTH_JSON subscription credential. The gate / validation / commit logic is shared.'
+        required: false
+        type: string
+        default: 'claude'
       max-candidates:
         description: 'How many top Sentry issues to consider per run before dedup filtering. The triage step still picks only ONE issue per run.'
         required: false
@@ -125,8 +130,11 @@ on:
 
     secrets:
       claude-code-oauth-token:
-        description: 'CLAUDE_CODE_OAUTH_TOKEN for the anthropics action.'
-        required: true
+        description: 'CLAUDE_CODE_OAUTH_TOKEN for the anthropics action. Required when engine=claude (the default).'
+        required: false
+      CODEX_AUTH_JSON:
+        description: 'Codex subscription auth.json (org secret). Required when engine=codex. Supplied via secrets: inherit.'
+        required: false
       sentry-api-token:
         description: 'Read-scoped Sentry token (event:read + project:read). NOT the deploy-release write token.'
         required: true
@@ -148,6 +156,9 @@ env:
   # CLAUDE_MODEL Actions variable (resolved in the caller's context); the
   # literal is a safe fallback so an unset var can't yield an empty --model.
   CLAUDE_MODEL: "${{ vars.CLAUDE_MODEL || 'claude-opus-4-8' }}"
+  # Codex model. Empty lets codex-action pick its default; override org-wide
+  # via the CODEX_MODEL Actions variable. Only used when engine=codex.
+  CODEX_MODEL: "${{ vars.CODEX_MODEL || '' }}"
 
 jobs:
   sentry-autofix:
@@ -176,6 +187,7 @@ jobs:
         env:
           STACK: ${{ inputs.stack }}
           MODE: ${{ inputs.mode }}
+          ENGINE: ${{ inputs.engine }}
           SENTRY_ORG: ${{ inputs.sentry-org }}
           SENTRY_PROJECT: ${{ inputs.sentry-project }}
           MAX_CANDIDATES: ${{ inputs.max-candidates }}
@@ -190,6 +202,10 @@ jobs:
           case "$MODE" in
             autofix|triage-only) ;;
             *) echo "::error::Invalid mode: $MODE (expected autofix or triage-only)"; exit 1 ;;
+          esac
+          case "$ENGINE" in
+            claude|codex) ;;
+            *) echo "::error::Invalid engine: $ENGINE (expected claude or codex)"; exit 1 ;;
           esac
           # Slug allowlist: lower-case letters, digits, hyphens. Refuses
           # anything that could break out of a URL or shell quote.
@@ -221,15 +237,24 @@ jobs:
 
       - name: Validate required secrets
         env:
+          ENGINE: ${{ inputs.engine }}
           CLAUDE_TOKEN: ${{ secrets.claude-code-oauth-token }}
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
           SENTRY_TOKEN: ${{ secrets.sentry-api-token }}
           LINEAR_KEY: ${{ secrets.linear-api-key }}
           LINEAR_FALLBACK: ${{ inputs.linear-fallback }}
         run: |
           set -euo pipefail
-          if [ -z "${CLAUDE_TOKEN:-}" ]; then
-            echo "::error::claude-code-oauth-token secret is not set"
-            exit 1
+          if [ "$ENGINE" = "codex" ]; then
+            if [ -z "${CODEX_AUTH_JSON:-}" ]; then
+              echo "::error::engine=codex but CODEX_AUTH_JSON secret is not set"
+              exit 1
+            fi
+          else
+            if [ -z "${CLAUDE_TOKEN:-}" ]; then
+              echo "::error::claude-code-oauth-token secret is not set"
+              exit 1
+            fi
           fi
           if [ -z "${SENTRY_TOKEN:-}" ]; then
             echo "::error::sentry-api-token secret is not set"
@@ -331,6 +356,16 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # Lay down the Codex subscription credential for the triage + apply steps
+      # (engine=codex only). The Linear fallback re-runs this with the MCP
+      # enabled to get its own codex-home.
+      - name: Setup Codex auth
+        id: codex-auth
+        if: ${{ inputs.engine == 'codex' }}
+        uses: sidekick-labs/.github/.github/actions/setup-codex-auth@main
+        with:
+          auth-json: ${{ secrets.CODEX_AUTH_JSON }}
 
       # ----- stack setup (only when we may apply a fix) -----
 
@@ -625,7 +660,7 @@ jobs:
       # ----- triage -----
 
       - name: Triage with Claude Code
-        if: steps.fetch.outputs.candidate_count != '0'
+        if: steps.fetch.outputs.candidate_count != '0' && inputs.engine != 'codex'
         uses: anthropics/claude-code-action@787c5a0ce96a9a6cfb050ea0c8f4c05f2447c251 # v1
         with:
           claude_code_oauth_token: ${{ secrets.claude-code-oauth-token }}
@@ -691,6 +726,55 @@ jobs:
             - **"minor concern"** when the fix would require touching tests, schema, configuration files, or more than ~3 source files. Those need a human.
             - Your only allowed writes are `/tmp/triage.md` and `/tmp/triage.json`. Do NOT modify source files, do NOT run shell commands, do NOT call any GitHub or Sentry API.
             - Be terse. Bullets and short sentences only.
+
+      # Codex triage: read-only sandbox; the verdict is returned as structured
+      # output (enforced by output-schema) and written to /tmp/triage.json via
+      # output-file — the same file the gate below already reads. No /tmp
+      # writes by Codex itself (read-only), so the human-readable triage.md is
+      # skipped for codex; the summary step renders the JSON block instead.
+      - name: Triage with Codex
+        if: steps.fetch.outputs.candidate_count != '0' && inputs.engine == 'codex'
+        uses: openai/codex-action@e0fdf01220eb9a88167c4898839d273e3f2609d1 # v1.8
+        with:
+          codex-home: ${{ steps.codex-auth.outputs.codex-home }}
+          sandbox: read-only
+          model: ${{ env.CODEX_MODEL }}
+          output-file: /tmp/triage.json
+          output-schema: |
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["sentry_short_id", "sentry_permalink", "verdict", "confidence", "title", "suspect_files", "fix_summary"],
+              "properties": {
+                "sentry_short_id": { "type": "string" },
+                "sentry_permalink": { "type": "string" },
+                "verdict": { "type": "string", "enum": ["likely problem", "minor concern", "clean"] },
+                "confidence": { "type": "string", "enum": ["low", "medium", "high"] },
+                "title": { "type": "string" },
+                "suspect_files": { "type": "array", "items": { "type": "string" } },
+                "fix_summary": { "type": "string" }
+              }
+            }
+          prompt: |
+            You are a daily Sentry-sweep assistant for the `${{ inputs.sentry-project }}` project. The fetch step identified the top-priority unresolved Sentry issue with no existing auto-fix PR. Triage it and decide whether a minimal forward-fix is worth attempting.
+
+            ## Inputs (read these files; the sandbox is read-only)
+            - `/tmp/sentry-issues.json` — candidate issues, sorted by priority; the first element (`.[0]`) is the one to triage. Each has `shortId`, `title`, `level`, `count`, `firstSeen`, `permalink`, and `latestEvent` stack frames.
+            - `/tmp/sentry-issues.md` — human-readable version.
+            - The checkout is the repo's default-branch HEAD. Read/grep the source files at the cited stack frames to confirm what the code looks like now (line numbers may have drifted — relocate via the function name).
+
+            ## Decide
+            - **likely problem**: a bug in our code at the cited frames with an identifiable minimal fix.
+            - **minor concern**: real but non-trivial / needs design judgment / spans many files.
+            - **clean**: not actionable (third-party, expected, environmental, already-fixed).
+
+            ## Rules
+            - **"high" confidence ONLY** when you've read the source at the top in-app frame and the code clearly reproduces the error path. Otherwise "medium" or "low".
+            - **"clean"** for third-party errors, browser/network noise, and signal-dead old issues.
+            - **"minor concern"** when the fix would touch tests, schema, config, or more than ~3 source files.
+            - `suspect_files`: repo-relative paths that exist in the checkout, no `:LINE` suffixes, no duplicates. Fill ONLY when verdict = "likely problem"; otherwise `[]`.
+
+            Return ONLY the structured verdict (your final message must match the output schema exactly). Do not modify files or run commands.
 
       - name: Post triage to step summary
         if: always() && steps.fetch.outputs.candidate_count != '0'
@@ -811,7 +895,7 @@ jobs:
           echo "AUTOFIX_BRANCH=$BRANCH" >> "$GITHUB_ENV"
 
       - name: Apply auto-fix with Claude Code
-        if: steps.gate.outputs.should_run == 'true'
+        if: steps.gate.outputs.should_run == 'true' && inputs.engine != 'codex'
         uses: anthropics/claude-code-action@787c5a0ce96a9a6cfb050ea0c8f4c05f2447c251 # v1
         with:
           claude_code_oauth_token: ${{ secrets.claude-code-oauth-token }}
@@ -844,6 +928,35 @@ jobs:
             Use `Read`, `Grep`, `Edit`. Do NOT call shell commands. Do NOT modify `/tmp/*` files.
 
             When you're done (or have decided not to act), simply stop. The next workflow step inspects `git diff` directly.
+
+      # Codex apply: workspace-write so it can edit the suspect files in place.
+      # Edits land in the worktree; the shared Validate step below reads
+      # `git diff` (engine-agnostic) and the path-blocklist / line-cap gates it.
+      - name: Apply auto-fix with Codex
+        if: steps.gate.outputs.should_run == 'true' && inputs.engine == 'codex'
+        uses: openai/codex-action@e0fdf01220eb9a88167c4898839d273e3f2609d1 # v1.8
+        with:
+          codex-home: ${{ steps.codex-auth.outputs.codex-home }}
+          sandbox: workspace-write
+          model: ${{ env.CODEX_MODEL }}
+          prompt: |
+            A Sentry issue in `${{ inputs.sentry-project }}` was triaged as a high-confidence regression. Apply the minimal forward-fix.
+
+            ## Inputs (read these)
+            - `/tmp/triage.json` — your prior verdict. `suspect_files` names the files to start from; `fix_summary` describes the intended change; `sentry_short_id` / `sentry_permalink` identify the issue.
+            - `/tmp/sentry-issues.json` / `/tmp/sentry-issues.md` — full Sentry context (stack trace, latest event, in-app frames). The picked issue is `.[0]`.
+            - The checkout is the repo's default-branch HEAD. The output is a **draft PR** — a human reviews everything before it lands.
+
+            ## Task — the smallest change that resolves the issue
+            - **Start with the files in `suspect_files`.** Expand only when the fix genuinely needs it.
+            - **Hard limit: ${{ inputs.diff-line-cap }} changed lines total** (insertions + deletions). If the minimal fix exceeds this, do nothing.
+            - **Off-limits regardless of suspect_files**: `db/migrate/`, `.github/`, `config/credentials*`, `config/master.key`, lockfiles (`Gemfile.lock`, `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`). A downstream step rejects any diff touching these. The rest of `config/` is application code and is fixable.
+            - **No refactors, no doc updates.** Tests only when the failure is a test gap that let the bug land.
+            - **Only modify existing files.** If the fix genuinely needs a new file, do nothing.
+            - **Higher bar than a CI-failure fix**: this code is already in production. If the cause is anything other than a clear bug in source you can read, do nothing.
+            - If you'd be guessing, do nothing — the triage summary alone is enough value.
+
+            Edit files directly in the working tree. Do NOT modify `/tmp/*`, do NOT commit, push, or open a PR — the next workflow step inspects `git diff` and handles the commit. When done (or if declining), stop.
 
       - name: Validate auto-fix diff
         id: validate
@@ -1056,6 +1169,7 @@ jobs:
         # argv entirely. jq builds the JSON so a key with quotes or backslashes
         # can't break the file structure.
         if: >-
+          inputs.engine != 'codex' &&
           inputs.linear-fallback == true &&
           steps.fetch.outputs.candidate_count != '0' &&
           env.LINEAR_AVAILABLE == 'true' &&
@@ -1082,6 +1196,7 @@ jobs:
         #   - AND either: triage-only mode, OR autofix gate didn't pass, OR
         #     autofix didn't actually push a PR (validation rejected, etc.)
         if: >-
+          inputs.engine != 'codex' &&
           inputs.linear-fallback == true &&
           steps.fetch.outputs.candidate_count != '0' &&
           env.LINEAR_AVAILABLE == 'true' &&
@@ -1117,6 +1232,60 @@ jobs:
                - Do NOT set assignee, priority, or labels — leave for the human.
 
             Be terse. Use Read for the /tmp files, then the Linear MCP tools. No source-file edits, no shell commands.
+
+      # Codex Linear fallback: a second codex-home with the Linear MCP server
+      # wired into config.toml (the key is inlined there, never in argv).
+      - name: Setup Codex auth with Linear MCP
+        id: codex-auth-linear
+        if: >-
+          inputs.engine == 'codex' &&
+          inputs.linear-fallback == true &&
+          steps.fetch.outputs.candidate_count != '0' &&
+          env.LINEAR_AVAILABLE == 'true' &&
+          (env.EFFECTIVE_MODE == 'triage-only' ||
+           steps.gate.outputs.should_run != 'true' ||
+           steps.push.outputs.url == '')
+        uses: sidekick-labs/.github/.github/actions/setup-codex-auth@main
+        with:
+          auth-json: ${{ secrets.CODEX_AUTH_JSON }}
+          enable-linear-mcp: 'true'
+          linear-api-key: ${{ secrets.linear-api-key }}
+
+      - name: Open Linear issue (fallback) with Codex
+        # NOTE: read-only sandbox for the agent; the Linear MCP server runs as a
+        # codex-spawned subprocess and makes the network call. If live runs show
+        # the MCP call blocked by the sandbox, enable network access for this
+        # step's codex-home. Verify during end-to-end validation.
+        if: >-
+          inputs.engine == 'codex' &&
+          inputs.linear-fallback == true &&
+          steps.fetch.outputs.candidate_count != '0' &&
+          env.LINEAR_AVAILABLE == 'true' &&
+          (env.EFFECTIVE_MODE == 'triage-only' ||
+           steps.gate.outputs.should_run != 'true' ||
+           steps.push.outputs.url == '')
+        uses: openai/codex-action@e0fdf01220eb9a88167c4898839d273e3f2609d1 # v1.8
+        with:
+          codex-home: ${{ steps.codex-auth-linear.outputs.codex-home }}
+          sandbox: read-only
+          model: ${{ env.CODEX_MODEL }}
+          prompt: |
+            A Sentry-sweep triage for `${{ inputs.sentry-project }}` produced a verdict the autofix path did not handle (mode=triage-only, the gate didn't pass, or the apply produced no valid diff). Create a Linear issue so a human can pick it up.
+
+            ## Inputs (read these)
+            - `/tmp/triage.json` — the verdict (shortId, permalink, verdict, confidence, fix_summary, suspect_files).
+            - `/tmp/sentry-issues.json` — full Sentry context.
+
+            ## Task — use the Linear MCP tools
+            1. Read `/tmp/triage.json`.
+            2. List Linear teams and pick the one whose key/name best matches `${{ inputs.sentry-project }}` (e.g. `sidekick-web` → a team keyed `WEB`/`SW` or named "web"). If none clearly match, pick the first and say so in the body.
+            3. Check for duplicates: if an open Linear issue already has the Sentry shortId in its title, do nothing.
+            4. Otherwise create an issue:
+               - title: "Sentry: <shortId> — <issue title>" (≤100 chars)
+               - description: shortId, permalink, verdict, confidence, fix_summary.
+               - team: the one you picked. Do NOT set assignee, priority, or labels.
+
+            Be terse. Read the /tmp file, then use the Linear MCP tools. No source-file edits, no shell commands.
 
       # ----- summary -----
 
