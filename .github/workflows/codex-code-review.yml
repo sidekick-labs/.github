@@ -1,0 +1,145 @@
+name: Codex Code Review
+
+on:
+  workflow_call:
+
+# Cancel a superseded review when a PR is pushed again; combined with the
+# marker-based upsert below this keeps a single, current review comment.
+concurrency:
+  group: codex-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  codex_review:
+    name: Codex Code Review
+    if: github.event.pull_request.draft == false && github.event.pull_request.user.login != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      final_message: ${{ steps.run_codex.outputs.final-message }}
+    steps:
+      # Secrets aren't allowed in `if:` expressions, so route through env and
+      # short-circuit downstream steps when the credential is missing. Lets the
+      # workflow run on repos that haven't (yet) been wired up with the
+      # CODEX_AUTH_JSON secret without producing a hard failure.
+      - name: Check for Codex auth
+        id: token-check
+        env:
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+        run: |
+          if [ -z "${CODEX_AUTH_JSON:-}" ]; then
+            echo "::warning::CODEX_AUTH_JSON secret is not configured; skipping Codex review."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout PR merge ref
+        if: steps.token-check.outputs.skip != 'true'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Pre-fetch base and head refs
+        if: steps.token-check.outputs.skip != 'true'
+        env:
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          git fetch --no-tags origin "$PR_BASE_REF" "+refs/pull/$PR_NUMBER/head"
+
+      # Full org/repo/path@ref form (NOT ./) — this reusable workflow is called
+      # from other repos, so actions/checkout above has the CALLER repo in the
+      # workspace, not this one.
+      #
+      # @main is intentional during the parallel-trial phase (consumers also
+      # track @main). RELEASE CHECKLIST: when a reusable-workflow version is
+      # tagged, pin this ref to that release tag/SHA so a consumer pinning the
+      # workflow @v* gets a matching, immutable composite. See docs/codex-migration.md.
+      - name: Setup Codex auth
+        if: steps.token-check.outputs.skip != 'true'
+        id: codex-auth
+        uses: sidekick-labs/.github/.github/actions/setup-codex-auth@main
+        with:
+          auth-json: ${{ secrets.CODEX_AUTH_JSON }}
+
+      # read-only sandbox: this job runs against PR code, and with subscription
+      # auth the action does NOT drop sudo, so the sandbox is the only guardrail.
+      # The review is returned as final-message; the post_feedback job posts it.
+      - name: Run Codex review
+        if: steps.token-check.outputs.skip != 'true'
+        id: run_codex
+        uses: openai/codex-action@e0fdf01220eb9a88167c4898839d273e3f2609d1 # v1.8
+        with:
+          codex-home: ${{ steps.codex-auth.outputs.codex-home }}
+          sandbox: read-only
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            Review ONLY the changes introduced by this pull request. Inspect the
+            diff with:
+              git diff ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}
+
+            Provide feedback on:
+            - Code quality and best practices
+            - Potential bugs or issues
+            - Performance considerations
+            - Security concerns
+            - Test coverage
+
+            Use the repository's CLAUDE.md for guidance on style and conventions.
+            Be constructive, concise, and specific.
+
+            Do NOT post anything yourself — return your review as your final
+            message. A later workflow step posts it as the PR comment.
+
+            Pull request title and body:
+            ----
+            ${{ github.event.pull_request.title }}
+            ${{ github.event.pull_request.body }}
+
+  post_feedback:
+    name: Post Codex review
+    needs: codex_review
+    if: needs.codex_review.outputs.final_message != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+      issues: write
+    steps:
+      # Upsert a single marked comment (update if present, else create) so
+      # repeated pushes don't pile up review comments — matching the single
+      # editable comment the Claude action produced.
+      - name: Upsert Codex review comment
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          CODEX_FINAL_MESSAGE: ${{ needs.codex_review.outputs.final_message }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const marker = '<!-- codex-review -->';
+            // GitHub caps comment bodies at 65536 chars; truncate to stay under
+            // (createComment/updateComment 422 otherwise). Matches codex-agent.yml.
+            const msg = process.env.CODEX_FINAL_MESSAGE || '';
+            const max = 65000;
+            const text = msg.length > max ? `${msg.slice(0, max)}\n\n_…truncated…_` : msg;
+            const body = `${marker}\n${text}`;
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number, per_page: 100,
+            });
+            const existing = comments.find(
+              (c) => c.user.type === 'Bot' && c.body.includes(marker)
+            );
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }

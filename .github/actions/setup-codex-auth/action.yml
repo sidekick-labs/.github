@@ -1,0 +1,79 @@
+name: "Setup Codex Auth"
+description: >-
+  Lay down a ChatGPT/Codex-subscription auth.json (and an optional Linear MCP
+  config) into a job-local CODEX_HOME for openai/codex-action. Reader-only:
+  jobs that use this NEVER write the secret back — the codex-auth-refresh.yml
+  workflow is the single writer that keeps CODEX_AUTH_JSON fresh.
+
+inputs:
+  auth-json:
+    description: "Contents of the Codex subscription auth.json (org secret CODEX_AUTH_JSON)."
+    required: true
+  enable-linear-mcp:
+    description: "If 'true', write a Linear MCP server entry into config.toml."
+    required: false
+    default: "false"
+  linear-api-key:
+    description: "Linear API key, required when enable-linear-mcp is 'true'."
+    required: false
+    default: ""
+
+outputs:
+  codex-home:
+    description: "Path to the prepared CODEX_HOME directory (pass to openai/codex-action codex-home)."
+    value: ${{ steps.prepare.outputs.codex-home }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Prepare CODEX_HOME
+      id: prepare
+      shell: bash
+      env:
+        CODEX_AUTH_JSON: ${{ inputs.auth-json }}
+        ENABLE_LINEAR_MCP: ${{ inputs.enable-linear-mcp }}
+        LINEAR_API_KEY: ${{ inputs.linear-api-key }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "${CODEX_AUTH_JSON:-}" ]; then
+          echo "::error::CODEX_AUTH_JSON is empty — the CODEX_AUTH_JSON org secret is not configured for this repo." >&2
+          exit 1
+        fi
+
+        CODEX_HOME="${RUNNER_TEMP}/codex-home"
+        mkdir -p "$CODEX_HOME"
+        chmod 700 "$CODEX_HOME"
+
+        printf '%s' "$CODEX_AUTH_JSON" > "$CODEX_HOME/auth.json"
+        chmod 600 "$CODEX_HOME/auth.json"
+
+        # Fail loud (not at codex runtime) if the seed isn't a refreshable
+        # subscription credential. Never print the file contents.
+        if ! jq -e '.auth_mode == "chatgpt" and ((.tokens.refresh_token // "") != "")' \
+              "$CODEX_HOME/auth.json" >/dev/null 2>&1; then
+          echo "::error::auth.json is not a valid ChatGPT-subscription credential (expected auth_mode=chatgpt with a refresh_token). Re-seed via 'codex login' and update CODEX_AUTH_JSON." >&2
+          exit 1
+        fi
+
+        # Read credentials from the file we just wrote. 0600 to match auth.json
+        # (config.toml inlines LINEAR_API_KEY when the MCP is enabled below).
+        printf 'cli_auth_credentials_store = "file"\n' > "$CODEX_HOME/config.toml"
+        chmod 600 "$CODEX_HOME/config.toml"
+
+        if [ "$ENABLE_LINEAR_MCP" = "true" ]; then
+          if [ -z "${LINEAR_API_KEY:-}" ]; then
+            echo "::error::enable-linear-mcp is 'true' but linear-api-key is empty." >&2
+            exit 1
+          fi
+          # Inline the key (config.toml is never echoed). Passed as a printf
+          # arg, never in the format string, so it can't leak via set -x.
+          {
+            printf '\n[mcp_servers.linear]\n'
+            printf 'command = "npx"\n'
+            printf 'args = ["-y", "mcp-remote", "https://mcp.linear.app/mcp", "--header", "Authorization:Bearer %s"]\n' "$LINEAR_API_KEY"
+            printf 'startup_timeout_sec = 30\n'
+          } >> "$CODEX_HOME/config.toml"
+        fi
+
+        echo "codex-home=$CODEX_HOME" >> "$GITHUB_OUTPUT"

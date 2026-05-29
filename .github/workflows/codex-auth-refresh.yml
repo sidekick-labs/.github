@@ -1,0 +1,89 @@
+name: Codex Auth Refresh
+
+# Single writer for the CODEX_AUTH_JSON org secret.
+#
+# Codex refreshes a ChatGPT-subscription auth.json when it is older than ~8
+# days and rewrites the file in CODEX_HOME. On ephemeral runners that refresh
+# is lost unless we persist it. This workflow restores the secret, runs a
+# trivial codex command (which refreshes the tokens when due), and writes the
+# post-run auth.json back to the secret. Day-to-day Codex jobs are read-only
+# consumers via .github/actions/setup-codex-auth and must NEVER write back, so
+# this is the only place that races for the secret.
+#
+# Twice-weekly cadence keeps the session comfortably under the ~8-day staleness
+# window even if individual runs don't trip a refresh.
+
+on:
+  schedule:
+    - cron: "0 9 * * 1,4" # Mon & Thu 09:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: codex-auth-refresh
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    name: Refresh Codex subscription auth
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Guard required secrets
+        env:
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+          CODEX_AUTH_REFRESH_TOKEN: ${{ secrets.CODEX_AUTH_REFRESH_TOKEN }}
+        run: |
+          set -euo pipefail
+          missing=0
+          if [ -z "${CODEX_AUTH_JSON:-}" ]; then
+            echo "::error::CODEX_AUTH_JSON secret is not configured." >&2
+            missing=1
+          fi
+          if [ -z "${CODEX_AUTH_REFRESH_TOKEN:-}" ]; then
+            echo "::error::CODEX_AUTH_REFRESH_TOKEN secret (org secrets:write PAT) is not configured." >&2
+            missing=1
+          fi
+          [ "$missing" -eq 0 ]
+
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 1
+
+      - name: Setup Codex auth
+        id: codex-auth
+        uses: ./.github/actions/setup-codex-auth
+        with:
+          auth-json: ${{ secrets.CODEX_AUTH_JSON }}
+
+      - name: Touch Codex (forces token refresh when due)
+        uses: openai/codex-action@e0fdf01220eb9a88167c4898839d273e3f2609d1 # v1.8
+        with:
+          codex-home: ${{ steps.codex-auth.outputs.codex-home }}
+          sandbox: read-only
+          prompt: "Reply with the single word OK."
+
+      - name: Persist refreshed auth.json
+        env:
+          GH_TOKEN: ${{ secrets.CODEX_AUTH_REFRESH_TOKEN }}
+          CODEX_HOME: ${{ steps.codex-auth.outputs.codex-home }}
+        run: |
+          set -euo pipefail
+          AUTH_FILE="$CODEX_HOME/auth.json"
+          if [ ! -s "$AUTH_FILE" ]; then
+            echo "::error::auth.json missing after the Codex run; not updating the secret." >&2
+            exit 1
+          fi
+          # Sanity check the file before pushing it back.
+          jq -e '.auth_mode == "chatgpt" and ((.tokens.refresh_token // "") != "")' \
+            "$AUTH_FILE" >/dev/null
+          # Store the POST-RUN file (the refreshed tokens), not the original seed.
+          # --visibility all matches the org-wide scope of this shared credential.
+          gh secret set CODEX_AUTH_JSON \
+            --org sidekick-labs \
+            --visibility all \
+            < "$AUTH_FILE"
+          echo "CODEX_AUTH_JSON updated from refreshed auth.json."
