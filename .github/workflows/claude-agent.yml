@@ -21,3 +21,6 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           additional_permissions: |
             actions: read
+          # Pin the model so the interactive agent doesn't silently shift when
+          # the action's default changes. Keep in lockstep with claude-code-review.yml.
+          claude_args: '--model claude-opus-4-8'
