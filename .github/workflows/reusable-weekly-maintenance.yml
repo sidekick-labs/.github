@@ -169,6 +169,7 @@ jobs:
           STACK: ${{ inputs.stack }}
           STRATEGY: ${{ inputs.bundle-update-strategy }}
           ENGINE: ${{ inputs.engine }}
+          ADDITIONAL_ALLOWED_TOOLS: ${{ inputs.additional-allowed-tools }}
         run: |
           set -euo pipefail
           case "$STACK" in
@@ -183,6 +184,9 @@ jobs:
             claude|codex) ;;
             *) echo "::error::Invalid engine: $ENGINE (expected claude or codex)"; exit 1 ;;
           esac
+          if [ "$ENGINE" = "codex" ] && [ -n "${ADDITIONAL_ALLOWED_TOOLS:-}" ]; then
+            echo "::warning::additional-allowed-tools is ignored when engine=codex (the workspace-write sandbox governs tool access, not an allowlist)."
+          fi
 
       - name: Validate required secrets
         env:
@@ -602,7 +606,7 @@ jobs:
 
       - name: Weekly maintenance
         id: maintenance
-        if: inputs.engine != 'codex'
+        if: ${{ inputs.engine != 'codex' }}
         uses: anthropics/claude-code-action@787c5a0ce96a9a6cfb050ea0c8f4c05f2447c251 # v1
         timeout-minutes: ${{ inputs.claude-timeout-minutes }}
         env:
@@ -628,7 +632,7 @@ jobs:
       # comes from config.toml via setup-codex-auth rather than --mcp-config.
       - name: Setup Codex auth (weekly)
         id: codex-auth
-        if: inputs.engine == 'codex'
+        if: ${{ inputs.engine == 'codex' }}
         uses: sidekick-labs/.github/.github/actions/setup-codex-auth@main
         with:
           auth-json: ${{ secrets.CODEX_AUTH_JSON }}
@@ -638,7 +642,7 @@ jobs:
 
       - name: Weekly maintenance (Codex)
         id: maintenance-codex
-        if: inputs.engine == 'codex'
+        if: ${{ inputs.engine == 'codex' }}
         uses: openai/codex-action@e0fdf01220eb9a88167c4898839d273e3f2609d1 # v1.8
         timeout-minutes: ${{ inputs.claude-timeout-minutes }}
         env:
