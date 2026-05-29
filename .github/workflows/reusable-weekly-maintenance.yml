@@ -89,10 +89,15 @@ on:
         type: string
         default: './gradlew test'
       linear-fallback:
-        description: 'When true, Claude opens a Linear issue for risky/judgment-call items instead of dropping them.'
+        description: 'When true, the agent opens a Linear issue for risky/judgment-call items instead of dropping them.'
         required: false
         type: boolean
         default: false
+      engine:
+        description: 'AI engine: claude (default) uses anthropics/claude-code-action + CLAUDE_CODE_OAUTH_TOKEN; codex uses openai/codex-action + the CODEX_AUTH_JSON subscription credential. The assembled prompt, setup, and artifact steps are shared.'
+        required: false
+        type: string
+        default: 'claude'
       additional-allowed-tools:
         description: 'Comma-separated extra entries appended to claude_args --allowed-tools.'
         required: false
@@ -126,8 +131,11 @@ on:
 
     secrets:
       claude-code-oauth-token:
-        description: 'CLAUDE_CODE_OAUTH_TOKEN for the anthropics action.'
-        required: true
+        description: 'CLAUDE_CODE_OAUTH_TOKEN for the anthropics action. Required when engine=claude (the default).'
+        required: false
+      CODEX_AUTH_JSON:
+        description: 'Codex subscription auth.json (org secret). Required when engine=codex. Supplied via secrets: inherit.'
+        required: false
       linear-api-key:
         description: 'LINEAR_API_KEY for the Linear MCP server (only used when linear-fallback=true).'
         required: false
@@ -139,6 +147,9 @@ env:
   # CLAUDE_MODEL Actions variable (resolved in the caller's context); the
   # literal is a safe fallback so an unset var can't yield an empty --model.
   CLAUDE_MODEL: "${{ vars.CLAUDE_MODEL || 'claude-opus-4-8' }}"
+  # Codex model. Empty lets codex-action pick its default; override org-wide
+  # via the CODEX_MODEL Actions variable. Only used when engine=codex.
+  CODEX_MODEL: "${{ vars.CODEX_MODEL || '' }}"
 
 jobs:
   maintenance:
@@ -157,6 +168,8 @@ jobs:
         env:
           STACK: ${{ inputs.stack }}
           STRATEGY: ${{ inputs.bundle-update-strategy }}
+          ENGINE: ${{ inputs.engine }}
+          ADDITIONAL_ALLOWED_TOOLS: ${{ inputs.additional-allowed-tools }}
         run: |
           set -euo pipefail
           case "$STACK" in
@@ -167,17 +180,33 @@ jobs:
             lock-update|conservative|none) ;;
             *) echo "::error::Invalid bundle-update-strategy: $STRATEGY"; exit 1 ;;
           esac
+          case "$ENGINE" in
+            claude|codex) ;;
+            *) echo "::error::Invalid engine: $ENGINE (expected claude or codex)"; exit 1 ;;
+          esac
+          if [ "$ENGINE" = "codex" ] && [ -n "${ADDITIONAL_ALLOWED_TOOLS:-}" ]; then
+            echo "::warning::additional-allowed-tools is ignored when engine=codex (the workspace-write sandbox governs tool access, not an allowlist)."
+          fi
 
       - name: Validate required secrets
         env:
+          ENGINE: ${{ inputs.engine }}
           CLAUDE_TOKEN: ${{ secrets.claude-code-oauth-token }}
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
           LINEAR_KEY: ${{ secrets.linear-api-key }}
           LINEAR_FALLBACK: ${{ inputs.linear-fallback }}
         run: |
           set -euo pipefail
-          if [ -z "${CLAUDE_TOKEN:-}" ]; then
-            echo "::error::claude-code-oauth-token secret is not set"
-            exit 1
+          if [ "$ENGINE" = "codex" ]; then
+            if [ -z "${CODEX_AUTH_JSON:-}" ]; then
+              echo "::error::engine=codex but CODEX_AUTH_JSON secret is not set"
+              exit 1
+            fi
+          else
+            if [ -z "${CLAUDE_TOKEN:-}" ]; then
+              echo "::error::claude-code-oauth-token secret is not set"
+              exit 1
+            fi
           fi
           if [ "$LINEAR_FALLBACK" = "true" ] && [ -z "${LINEAR_KEY:-}" ]; then
             echo "::warning::linear-fallback enabled but linear-api-key is empty - Linear fallback will be unavailable"
@@ -326,7 +355,7 @@ jobs:
 
       # ----- assemble prompt + allowed-tools (shell is much easier than expressions) -----
 
-      - name: Assemble Claude prompt and MCP config
+      - name: Assemble maintenance prompt and MCP config
         id: build-prompt
         env:
           STACK: ${{ inputs.stack }}
@@ -577,6 +606,7 @@ jobs:
 
       - name: Weekly maintenance
         id: maintenance
+        if: ${{ inputs.engine != 'codex' }}
         uses: anthropics/claude-code-action@787c5a0ce96a9a6cfb050ea0c8f4c05f2447c251 # v1
         timeout-minutes: ${{ inputs.claude-timeout-minutes }}
         env:
@@ -594,6 +624,35 @@ jobs:
             --model ${{ env.CLAUDE_MODEL }}
             --mcp-config ${{ steps.build-prompt.outputs.mcp-config-path }}
             --allowed-tools "${{ steps.build-prompt.outputs.allowed-tools }}"
+
+      # Codex engine: a workspace-write sandbox with network enabled (dep
+      # updates, git push, and gh all need it). Reuses the SAME assembled prompt
+      # — it's engine-neutral task instructions plus the embedded commit/push/PR
+      # bash. No allowed-tools (the sandbox governs); Linear MCP, when enabled,
+      # comes from config.toml via setup-codex-auth rather than --mcp-config.
+      - name: Setup Codex auth (weekly)
+        id: codex-auth
+        if: ${{ inputs.engine == 'codex' }}
+        uses: sidekick-labs/.github/.github/actions/setup-codex-auth@main
+        with:
+          auth-json: ${{ secrets.CODEX_AUTH_JSON }}
+          enable-linear-mcp: ${{ inputs.linear-fallback }}
+          linear-api-key: ${{ secrets.linear-api-key }}
+          enable-workspace-network: 'true'
+
+      - name: Weekly maintenance (Codex)
+        id: maintenance-codex
+        if: ${{ inputs.engine == 'codex' }}
+        uses: openai/codex-action@e0fdf01220eb9a88167c4898839d273e3f2609d1 # v1.8
+        timeout-minutes: ${{ inputs.claude-timeout-minutes }}
+        env:
+          # gh (pr/api) needs a token; git push uses the checkout credential.
+          GH_TOKEN: ${{ github.token }}
+        with:
+          codex-home: ${{ steps.codex-auth.outputs.codex-home }}
+          sandbox: workspace-write
+          model: ${{ env.CODEX_MODEL }}
+          prompt: ${{ steps.build-prompt.outputs.prompt }}
 
       # ----- artifacts -----
 
