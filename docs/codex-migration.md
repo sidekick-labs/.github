@@ -123,6 +123,33 @@ immutable and matches the workflow version. Grep before tagging:
 grep -rn "setup-codex-auth@main" .github/workflows/
 ```
 
+## Security: the `@codex` agent and credential exposure
+
+`codex-agent.yml` runs Codex in `sandbox: workspace-write` against an
+**attacker-influenceable instruction** (whoever triggers the `@codex` mention
+controls the request body). Two facts compound:
+
+- With subscription auth there is **no API key**, so the action skips both the
+  proxy and `drop-sudo` — Codex runs as the (sudo-capable) default user.
+- `workspace-write` restricts *writes* to the workspace but does **not** restrict
+  *reads*, so `auth.json` in `CODEX_HOME` is filesystem-readable by the run. The
+  soft prompt line *"never include secrets"* is not a real defense against a
+  crafted request, and `final-message` is posted verbatim as a comment.
+
+**What actually bounds this:** `openai/codex-action` runs an unconditional
+*"Check repository write access"* step, so only actors with **write access** to
+the repo can trigger a run (these are private org repos — no untrusted fork
+PRs). Fork PRs can't be pushed to (`IS_FORK` guard), and the `issues` path only
+ever *opens a PR* that still needs human review. So the residual risk is a
+write-access collaborator exfiltrating the **shared Business-seat credential** —
+an escalation over their own repo access.
+
+**Hardening to consider before broad rollout:** restrict the agent to a smaller
+`allow-users` allowlist, and/or use the **API-key auth path for the agent
+specifically** (there the action drops sudo and isolates the key behind its
+proxy, so a prompt-injected read can't reach a plaintext credential). Tracked as
+a follow-up, not a phase-2 blocker.
+
 ## Remaining phases (tracked separately)
 
 - `codex-agent.yml` — the `@codex` mention responder (workspace-write +

@@ -33,6 +33,13 @@ on:
         description: "Release-bot GitHub App private key (pairs with release-bot-client-id)."
         required: false
 
+# Serialize concurrent @codex runs on the same issue/PR so two requests don't
+# both check out the head branch, commit, and force-PATCH the ref in a race.
+# Do NOT cancel-in-progress — a superseded run may be mid-commit.
+concurrency:
+  group: codex-agent-${{ github.event.issue.number || github.event.pull_request.number }}
+  cancel-in-progress: false
+
 jobs:
   codex:
     name: Codex Agent
