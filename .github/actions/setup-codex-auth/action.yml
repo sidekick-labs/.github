@@ -56,8 +56,10 @@ runs:
           exit 1
         fi
 
-        # Read credentials from the file we just wrote.
+        # Read credentials from the file we just wrote. 0600 to match auth.json
+        # (config.toml inlines LINEAR_API_KEY when the MCP is enabled below).
         printf 'cli_auth_credentials_store = "file"\n' > "$CODEX_HOME/config.toml"
+        chmod 600 "$CODEX_HOME/config.toml"
 
         if [ "$ENABLE_LINEAR_MCP" = "true" ]; then
           if [ -z "${LINEAR_API_KEY:-}" ]; then

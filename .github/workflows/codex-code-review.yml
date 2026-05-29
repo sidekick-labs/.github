@@ -48,7 +48,12 @@ jobs:
 
       # Full org/repo/path@ref form (NOT ./) — this reusable workflow is called
       # from other repos, so actions/checkout above has the CALLER repo in the
-      # workspace, not this one. Keep the ref aligned with the tag consumers pin.
+      # workspace, not this one.
+      #
+      # @main is intentional during the parallel-trial phase (consumers also
+      # track @main). RELEASE CHECKLIST: when a reusable-workflow version is
+      # tagged, pin this ref to that release tag/SHA so a consumer pinning the
+      # workflow @v* gets a matching, immutable composite. See docs/codex-migration.md.
       - name: Setup Codex auth
         if: steps.token-check.outputs.skip != 'true'
         id: codex-auth

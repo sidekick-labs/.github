@@ -74,6 +74,13 @@ Run `codex-auth-refresh.yml` via **workflow_dispatch**. Confirm the `codex` step
 prints `OK`, the job's persist step reports an update, and the `CODEX_AUTH_JSON`
 secret's `updated_at` advances.
 
+> **Monitor the refresher.** It is the single point of failure for the whole
+> Codex integration — if it silently stops, sessions go stale after ~8 days and
+> every Codex job fails org-wide. Rely on GitHub's default failed-scheduled-run
+> email at minimum, and note that scheduled workflows auto-disable after 60 days
+> of repo inactivity (the `.github` repo's other crons keep it active, but
+> re-enable it if GitHub ever disables it).
+
 ## Enabling Codex PR review on a repo
 
 [`codex-code-review.yml`](../.github/workflows/codex-code-review.yml) is a
@@ -93,6 +100,28 @@ jobs:
 
 The review runs read-only and returns its feedback as the Codex `final-message`;
 a second job posts that as the PR comment via `actions/github-script`.
+
+> **Treat AI-review output as untrusted on untrusted PRs.** The PR title/body
+> feed the review prompt and the model's reply is posted verbatim, so a hostile
+> PR can attempt to steer the comment (phishing links, suppressing findings).
+> Mitigations are in place — `read-only` sandbox, `persist-credentials: false`,
+> and the message passed via `env` (not interpolated into the `script:` body) —
+> but reviewers should not auto-trust the content. These are private org repos
+> with no untrusted fork PRs today; revisit if that changes.
+
+## Release checklist: pinning the composite ref
+
+The reusable workflows reference the [`setup-codex-auth`](../.github/actions/setup-codex-auth/action.yml)
+composite as `sidekick-labs/.github/.github/actions/setup-codex-auth@main`.
+`@main` is intentional during the parallel-trial phase, but it means a consumer
+pinning a reusable workflow `@v*` would still get the composite at `@main`,
+bypassing their pin. **When a reusable-workflow version is tagged, repin every
+`setup-codex-auth@main` reference to that release tag/SHA** so the composite is
+immutable and matches the workflow version. Grep before tagging:
+
+```bash
+grep -rn "setup-codex-auth@main" .github/workflows/
+```
 
 ## Remaining phases (tracked separately)
 
