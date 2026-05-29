@@ -3,6 +3,12 @@ name: Claude Code Agent
 on:
   workflow_call:
 
+env:
+  # Single source of truth for the Claude model across this repo's Claude
+  # workflows. Override org-wide via the CLAUDE_MODEL Actions variable; the
+  # literal is a safe fallback so an unset var can't yield an empty --model.
+  CLAUDE_MODEL: "${{ vars.CLAUDE_MODEL || 'claude-opus-4-8' }}"
+
 jobs:
   claude:
     name: Claude Code Agent
@@ -23,4 +29,4 @@ jobs:
             actions: read
           # Pin the model so the interactive agent doesn't silently shift when
           # the action's default changes. Keep in lockstep with claude-code-review.yml.
-          claude_args: '--model claude-opus-4-8'
+          claude_args: '--model ${{ env.CLAUDE_MODEL }}'

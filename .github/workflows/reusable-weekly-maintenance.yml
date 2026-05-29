@@ -134,6 +134,12 @@ on:
 
 permissions: {}
 
+env:
+  # Single source of truth for the Claude model. Override org-wide via the
+  # CLAUDE_MODEL Actions variable (resolved in the caller's context); the
+  # literal is a safe fallback so an unset var can't yield an empty --model.
+  CLAUDE_MODEL: "${{ vars.CLAUDE_MODEL || 'claude-opus-4-8' }}"
+
 jobs:
   maintenance:
     name: Weekly Maintenance (${{ inputs.stack }})
@@ -585,7 +591,7 @@ jobs:
           # spawn mcp-remote with an empty bearer.
           # See: https://linear.app/docs/mcp
           claude_args: >-
-            --model claude-opus-4-8
+            --model ${{ env.CLAUDE_MODEL }}
             --mcp-config ${{ steps.build-prompt.outputs.mcp-config-path }}
             --allowed-tools "${{ steps.build-prompt.outputs.allowed-tools }}"
 
