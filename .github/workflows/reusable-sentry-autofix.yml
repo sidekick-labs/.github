@@ -15,8 +15,9 @@ name: Reusable Sentry Autofix
 #      regression with named suspect files, runs a second Claude pass to apply
 #      a minimal fix, validates the diff (hard path blocklist + line cap),
 #      pushes a signed commit, and opens a draft PR.
-#   5. In `mode: triage-only`, or when the autofix gate doesn't pass, optionally
-#      opens a Linear issue with the triage summary (linear-fallback=true).
+#   5. In `mode: triage-only`, or when the autofix gate doesn't pass (or the
+#      apply produces no valid diff), files a deduplicated GitHub issue with the
+#      triage summary so the finding isn't silently dropped.
 #
 # Reuses the same safety model as `.github/actions/autofix/action.yml` in
 # sidekick-web: path blocklist (migrations, workflows, config/credentials*,
@@ -42,7 +43,7 @@ on:
         required: true
         type: string
       mode:
-        description: 'autofix (default) attempts a PR when triage is high-confidence; triage-only skips the apply step and only opens Linear issues.'
+        description: 'autofix (default) attempts a PR when triage is high-confidence; triage-only skips the apply step and only files a GitHub issue.'
         required: false
         type: string
         default: 'autofix'
@@ -76,6 +77,11 @@ on:
         required: false
         type: string
         default: 'lts/*'
+      jdk-version:
+        description: 'JDK version (kmp stack apply path).'
+        required: false
+        type: string
+        default: '17'
       lint-commands:
         description: 'Multiline shell commands run post-apply as part of diff validation (e.g. rubocop, eslint, tsc). Empty means no lint gate.'
         required: false
@@ -86,11 +92,6 @@ on:
         required: false
         type: string
         default: ''
-      linear-fallback:
-        description: 'When true, open a Linear issue for triage-only runs and for autofix-skipped (low-confidence / no suspect files / dedup) candidates. Requires linear-api-key secret.'
-        required: false
-        type: boolean
-        default: false
       diff-line-cap:
         description: 'Hard cap on total insertions+deletions in the apply step diff. Above this, the validate step rejects.'
         required: false
@@ -101,6 +102,19 @@ on:
         required: false
         type: number
         default: 30
+      followup-issue-repo:
+        description: >-
+          Where to file the GitHub-issue fallback for non-autofixable findings.
+          Empty (default) files in the caller repo via GITHUB_TOKEN (requires
+          Issues enabled there). Set to a cross-repo "owner/name" (e.g.
+          sidekick-labs/sre-brain, a central tracker) to file there instead —
+          this requires the release-bot App (release-bot-client-id +
+          release-bot-private-key) to be installed on that repo with issues:write,
+          since GITHUB_TOKEN cannot write cross-repo. When the cross-repo token
+          can't be minted, the would-be issue is captured in the run summary.
+        required: false
+        type: string
+        default: ''
       timeout-minutes:
         description: 'Job-level timeout.'
         required: false
@@ -138,9 +152,6 @@ on:
       sentry-api-token:
         description: 'Read-scoped Sentry token (event:read + project:read). NOT the deploy-release write token.'
         required: true
-      linear-api-key:
-        description: 'LINEAR_API_KEY for the linear-fallback path. Required only when linear-fallback=true.'
-        required: false
       release-bot-private-key:
         description: >-
           GitHub App private key (.pem contents) for the bot used to
@@ -167,13 +178,15 @@ jobs:
     timeout-minutes: ${{ inputs.timeout-minutes }}
 
     # contents:write for the auto-fix branch push; pull-requests:write for
-    # `gh pr create --draft`; id-token:write so claude-code-action can mint
-    # its OIDC token. The validate-before-push gate (path blocklist + line
-    # cap) is the actual containment for write scope, mirroring the
+    # `gh pr create --draft`; issues:write for the GitHub-issue fallback when
+    # the autofix path doesn't open a PR; id-token:write so claude-code-action
+    # can mint its OIDC token. The validate-before-push gate (path blocklist +
+    # line cap) is the actual containment for write scope, mirroring the
     # post-deploy-triage autofix composite's design.
     permissions:
       contents: write
       pull-requests: write
+      issues: write
       id-token: write
 
     env:
@@ -223,17 +236,12 @@ jobs:
               exit 1
             fi
           done
-          # KMP autofix isn't supported in v1 — Gradle build verification is
-          # too heavy for a daily sweep and Compose/Kotlin diffs are riskier
-          # to auto-apply than the Rails/Node patterns. Downgrade silently
-          # so a caller that sets stack=kmp but forgets mode=triage-only
-          # still gets useful daily output rather than a hard failure.
-          if [ "$STACK" = "kmp" ] && [ "$MODE" = "autofix" ]; then
-            echo "::warning::stack=kmp + mode=autofix not supported in v1 — forcing mode=triage-only"
-            echo "EFFECTIVE_MODE=triage-only" >> "$GITHUB_ENV"
-          else
-            echo "EFFECTIVE_MODE=$MODE" >> "$GITHUB_ENV"
-          fi
+          # EFFECTIVE_MODE mirrors MODE for every stack. KMP now has an apply
+          # path (JDK + Gradle toolchain set up below when autofix), so it is
+          # no longer force-downgraded to triage-only. Compose/Kotlin diffs are
+          # still bounded by the same path blocklist + diff-line cap + caller
+          # lint gate as the other stacks, and the PR is review-gated.
+          echo "EFFECTIVE_MODE=$MODE" >> "$GITHUB_ENV"
 
       - name: Validate required secrets
         env:
@@ -241,8 +249,6 @@ jobs:
           CLAUDE_TOKEN: ${{ secrets.claude-code-oauth-token }}
           CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
           SENTRY_TOKEN: ${{ secrets.sentry-api-token }}
-          LINEAR_KEY: ${{ secrets.linear-api-key }}
-          LINEAR_FALLBACK: ${{ inputs.linear-fallback }}
         run: |
           set -euo pipefail
           if [ "$ENGINE" = "codex" ]; then
@@ -259,14 +265,6 @@ jobs:
           if [ -z "${SENTRY_TOKEN:-}" ]; then
             echo "::error::sentry-api-token secret is not set"
             exit 1
-          fi
-          if [ "$LINEAR_FALLBACK" = "true" ] && [ -z "${LINEAR_KEY:-}" ]; then
-            echo "::warning::linear-fallback enabled but linear-api-key is empty - Linear fallback will be unavailable"
-            echo "LINEAR_AVAILABLE=false" >> "$GITHUB_ENV"
-          elif [ "$LINEAR_FALLBACK" = "true" ]; then
-            echo "LINEAR_AVAILABLE=true" >> "$GITHUB_ENV"
-          else
-            echo "LINEAR_AVAILABLE=false" >> "$GITHUB_ENV"
           fi
 
       - name: Determine bot token availability
@@ -358,8 +356,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       # Lay down the Codex subscription credential for the triage + apply steps
-      # (engine=codex only). The Linear fallback re-runs this with the MCP
-      # enabled to get its own codex-home.
+      # (engine=codex only).
       - name: Setup Codex auth
         id: codex-auth
         if: ${{ inputs.engine == 'codex' }}
@@ -397,6 +394,23 @@ jobs:
           else
             echo "::notice::No package-lock.json — skipping npm ci"
           fi
+
+      # KMP apply path: JDK + Gradle so the caller's lint-commands (e.g.
+      # `./gradlew ktlintCheck`) can run post-apply. Matches the toolchain
+      # set up by reusable-weekly-maintenance.yml. setup-java/setup-gradle
+      # are SHA-pinned to the same refs that workflow uses. Note: callers
+      # should keep KMP gates to lint only — a full Gradle test run is too
+      # slow for a daily/dispatched sweep and risks the job timeout.
+      - name: Set up JDK
+        if: ${{ env.EFFECTIVE_MODE == 'autofix' && inputs.stack == 'kmp' }}
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5
+        with:
+          distribution: 'zulu'
+          java-version: ${{ inputs.jdk-version }}
+
+      - name: Set up Gradle
+        if: ${{ env.EFFECTIVE_MODE == 'autofix' && inputs.stack == 'kmp' }}
+        uses: gradle/actions/setup-gradle@50e97c2cd7a37755bbfafc9c5b7cafaece252f6e # v6
 
       # ----- fetch Sentry issues + dedup -----
 
@@ -1161,134 +1175,162 @@ jobs:
           echo "url=$URL" >> "$GITHUB_OUTPUT"
           echo "Opened PR ($([ "$BOT_TOKEN_AVAILABLE" = "true" ] && echo "ready-for-review" || echo "draft")): $URL"
 
-      # ----- Linear fallback (triage-only, autofix-skipped, or autofix-failed) -----
+      # ----- GitHub-issue fallback (triage-only, autofix-skipped, or autofix-failed) -----
 
-      - name: Write Linear MCP config
-        # Materialise the MCP config file BEFORE invoking claude-code-action
-        # so the LINEAR_API_KEY never appears in --mcp-config's argv (visible
-        # in /proc/<pid>/cmdline and any tool that logs its own args). Reading
-        # the key from env and writing the file via a heredoc keeps it out of
-        # argv entirely. jq builds the JSON so a key with quotes or backslashes
-        # can't break the file structure.
+      # When the autofix path did NOT open a PR — triage-only mode, the gate
+      # didn't pass (low confidence / no suspect files / not actionable), or the
+      # apply produced no valid diff — file a deduplicated GitHub issue so the
+      # finding isn't silently dropped. Engine-agnostic (plain `gh`, no agent):
+      # the triage verdict in /tmp/triage.json is all it needs.
+      #
+      # Target is `followup-issue-repo` when set (a central tracker, written via
+      # a cross-repo release-bot token minted below), else the caller repo (via
+      # GITHUB_TOKEN). Either way it degrades gracefully — when the issue can't
+      # be created (Issues disabled, no cross-repo token), the would-be body is
+      # captured in the run summary, mirroring sre-brain/health-sweep.yml.
+
+      - name: Resolve follow-up tracker repo name
+        # create-github-app-token's `repositories:` wants the bare repo NAME
+        # (owner is set separately) — strip the "owner/" prefix here since
+        # Actions expressions can't split strings.
+        id: followup_repo
+        if: ${{ inputs.followup-issue-repo != '' }}
+        env:
+          FOLLOWUP_REPO: ${{ inputs.followup-issue-repo }}
+        run: echo "name=${FOLLOWUP_REPO##*/}" >> "$GITHUB_OUTPUT"
+
+      - name: Mint follow-up issue token (cross-repo tracker)
+        # Only when filing into a DIFFERENT repo than the caller and the bot
+        # creds are present. GITHUB_TOKEN can't write cross-repo, so a central
+        # tracker needs an App token scoped to it with issues:write. Separate
+        # from the PR-push mint (which is contents+pull-requests only) so this
+        # extra permission requirement never affects the PR flow.
+        # continue-on-error: a missing/under-scoped App degrades to the
+        # step-summary capture below rather than failing the run.
+        id: followup_token
         if: >-
-          inputs.engine != 'codex' &&
-          inputs.linear-fallback == true &&
           steps.fetch.outputs.candidate_count != '0' &&
-          env.LINEAR_AVAILABLE == 'true' &&
+          inputs.followup-issue-repo != '' &&
+          inputs.release-bot-client-id != '' &&
+          (env.EFFECTIVE_MODE == 'triage-only' ||
+           steps.gate.outputs.should_run != 'true' ||
+           steps.push.outputs.url == '')
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ inputs.release-bot-client-id }}
+          private-key: ${{ secrets.release-bot-private-key }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ steps.followup_repo.outputs.name }}
+          permission-issues: write
+
+      - name: Open follow-up GitHub issue
+        if: >-
+          steps.fetch.outputs.candidate_count != '0' &&
           (env.EFFECTIVE_MODE == 'triage-only' ||
            steps.gate.outputs.should_run != 'true' ||
            steps.push.outputs.url == '')
         env:
-          LINEAR_API_KEY: ${{ secrets.linear-api-key }}
+          # In-repo (GITHUB_TOKEN) when no tracker is configured; otherwise the
+          # cross-repo App token (empty if the mint failed → handled below).
+          FOLLOWUP_REPO: ${{ inputs.followup-issue-repo }}
+          TRACKER_TOKEN: ${{ steps.followup_token.outputs.token }}
+          GITHUB_TOKEN_FALLBACK: ${{ github.token }}
+          CALLER_REPO: ${{ github.repository }}
+          PROJECT: ${{ inputs.sentry-project }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          MCP_CFG="$RUNNER_TEMP/linear-mcp-config.json"
-          umask 077
-          jq -n --arg key "$LINEAR_API_KEY" \
-            '{mcpServers:{linear:{command:"npx",args:["-y","@linear/mcp-server"],env:{LINEAR_API_KEY:$key}}}}' \
-            > "$MCP_CFG"
-          chmod 600 "$MCP_CFG"
-          echo "LINEAR_MCP_CONFIG=$MCP_CFG" >> "$GITHUB_ENV"
+          if [ ! -s /tmp/triage.json ] || ! jq empty /tmp/triage.json 2>/dev/null; then
+            echo "No valid /tmp/triage.json — nothing to file."
+            exit 0
+          fi
 
-      - name: Open Linear issue (fallback)
-        # Conditions:
-        #   - linear-fallback explicitly enabled by caller
-        #   - we had a candidate
-        #   - linear key available
-        #   - AND either: triage-only mode, OR autofix gate didn't pass, OR
-        #     autofix didn't actually push a PR (validation rejected, etc.)
-        if: >-
-          inputs.engine != 'codex' &&
-          inputs.linear-fallback == true &&
-          steps.fetch.outputs.candidate_count != '0' &&
-          env.LINEAR_AVAILABLE == 'true' &&
-          (env.EFFECTIVE_MODE == 'triage-only' ||
-           steps.gate.outputs.should_run != 'true' ||
-           steps.push.outputs.url == '')
-        uses: anthropics/claude-code-action@bfad70d6a1b6a9a6716dda7303aa912d16ee9e79 # main@2.1.160 (thinking-block 400 fix; ahead of release v1.0.133 — see rarebit-one/rarebit-ops#119)
-        with:
-          claude_code_oauth_token: ${{ secrets.claude-code-oauth-token }}
-          claude_args: |
-            --model ${{ env.CLAUDE_MODEL }}
-            --mcp-config ${{ env.LINEAR_MCP_CONFIG }}
-            --allowed-tools Read,mcp__linear__list_teams,mcp__linear__save_issue
-            --max-turns 8
-          prompt: |
-            A Sentry-sweep triage just produced a verdict for `${{ inputs.sentry-project }}` that the autofix path did not handle (mode=triage-only, or the gate didn't pass, or the apply step produced no valid diff). Create a Linear issue so a human can pick it up.
+          IFS=$'\t' read -r SHORT_ID VERDICT CONFIDENCE < <(
+            jq -r '[.sentry_short_id // "", .verdict // "", .confidence // ""] | @tsv' /tmp/triage.json
+          )
+          TITLE=$(jq -r '.title // ""' /tmp/triage.json | head -c 100)
+          PERMALINK=$(jq -r '.sentry_permalink // ""' /tmp/triage.json)
+          FIX_SUMMARY=$(jq -r '.fix_summary // ""' /tmp/triage.json)
 
-            ## Inputs
+          # "clean" verdicts are non-actionable by design — don't file noise.
+          # A missing short_id means we can't dedup, so also skip.
+          if [ "$VERDICT" = "clean" ] || [ -z "$SHORT_ID" ]; then
+            echo "Verdict='$VERDICT' short_id='$SHORT_ID' — not filing an issue."
+            exit 0
+          fi
 
-            - **`/tmp/triage.json`** — your prior verdict.
-            - **`/tmp/triage.md`** — human-readable triage.
-            - **`/tmp/sentry-issues.json`** — full Sentry context.
+          # Resolve target repo + token. A configured tracker needs the minted
+          # cross-repo token; if that mint failed, fall through to capture.
+          if [ -n "$FOLLOWUP_REPO" ]; then
+            TARGET_REPO="$FOLLOWUP_REPO"
+            GH_TOKEN="$TRACKER_TOKEN"
+          else
+            TARGET_REPO="$CALLER_REPO"
+            GH_TOKEN="$GITHUB_TOKEN_FALLBACK"
+          fi
+          export GH_TOKEN
 
-            ## Your task
+          ISSUE_TITLE="Sentry: ${SHORT_ID} — ${TITLE}"
+          BODY_FILE="${RUNNER_TEMP:-/tmp}/followup-issue.md"
+          {
+            echo "A Sentry sweep of \`${PROJECT}\` triaged this issue but the autofix path did not open a PR (triage-only, gate not passed, or no valid minimal fix). Filing for human pick-up."
+            echo ""
+            echo "- **Project:** \`${PROJECT}\` (${CALLER_REPO})"
+            echo "- **Sentry issue:** [${SHORT_ID}](${PERMALINK})"
+            echo "- **Verdict:** ${VERDICT} (confidence: ${CONFIDENCE})"
+            if [ -n "$FIX_SUMMARY" ]; then echo "- **Suggested direction:** ${FIX_SUMMARY}"; fi
+            echo "- **Sweep run:** ${RUN_URL}"
+            echo ""
+            if [ -s /tmp/triage.md ]; then
+              echo "<details><summary>Triage detail</summary>"
+              echo ""
+              cat /tmp/triage.md
+              echo ""
+              echo "</details>"
+              echo ""
+            fi
+            echo "<!-- sentry-autofix-followup: ${SHORT_ID} -->"
+          } > "$BODY_FILE"
 
-            1. Read `/tmp/triage.json` and `/tmp/triage.md`.
-            2. Find the right Linear team via `mcp__linear__list_teams`. Pick the team whose key/name best matches `${{ inputs.sentry-project }}` (e.g. project `sidekick-web` → team with key `WEB`, `SW`, or name containing "web"). If multiple match, prefer the most specific. If none clearly match, pick the first team and note this in the issue body.
-            3. Before creating, check for duplicates: search for an open Linear issue whose title contains the Sentry shortId. If found, do nothing.
-            4. Otherwise call `mcp__linear__save_issue` with:
-               - `title`: "Sentry: <shortId> — <issue title>" (truncate to 100 chars)
-               - `description`: include shortId, permalink, verdict, confidence, fix_summary, and the full triage.md content.
-               - `team`: the team you picked.
-               - Do NOT set assignee, priority, or labels — leave for the human.
+          # If the target is a tracker but we have no token, the mint failed —
+          # capture and stop (can't write cross-repo with GITHUB_TOKEN).
+          if [ -n "$FOLLOWUP_REPO" ] && [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning::Could not mint a cross-repo token for ${TARGET_REPO} (release-bot App likely lacks issues:write there). Capturing the would-be issue in the run summary."
+            { echo "## Sentry follow-up (no cross-repo token for ${TARGET_REPO})"; echo ""; echo "**Would-be title:** ${ISSUE_TITLE}"; echo ""; cat "$BODY_FILE"; } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
 
-            Be terse. Use Read for the /tmp files, then the Linear MCP tools. No source-file edits, no shell commands.
+          # Dedup: skip if an open issue in the target already tracks this shortId.
+          EXISTING=$(gh issue list --repo "$TARGET_REPO" --state open \
+            --search "${SHORT_ID} in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+          if [ -n "$EXISTING" ]; then
+            echo "Open issue #${EXISTING} in ${TARGET_REPO} already tracks ${SHORT_ID} — skipping."
+            exit 0
+          fi
 
-      # Codex Linear fallback: a second codex-home with the Linear MCP server
-      # wired into config.toml (the key is inlined there, never in argv).
-      - name: Setup Codex auth with Linear MCP
-        id: codex-auth-linear
-        if: >-
-          inputs.engine == 'codex' &&
-          inputs.linear-fallback == true &&
-          steps.fetch.outputs.candidate_count != '0' &&
-          env.LINEAR_AVAILABLE == 'true' &&
-          (env.EFFECTIVE_MODE == 'triage-only' ||
-           steps.gate.outputs.should_run != 'true' ||
-           steps.push.outputs.url == '')
-        uses: sidekick-labs/.github/.github/actions/setup-codex-auth@main
-        with:
-          auth-json: ${{ secrets.CODEX_AUTH_JSON }}
-          enable-linear-mcp: 'true'
-          linear-api-key: ${{ secrets.linear-api-key }}
-          enable-workspace-network: 'true'
+          # Ensure the label exists (idempotent). Best-effort: a failure here
+          # (Issues off / perms) shouldn't abort — the create below handles it.
+          gh label create sentry-autofix --repo "$TARGET_REPO" --color FBCA04 \
+            --description "Filed by the Sentry autofix sweep" >/dev/null 2>&1 || true
 
-      - name: Open Linear issue (fallback) with Codex
-        # workspace-write + network_access=true (via the auth step) so the Linear
-        # MCP subprocess can reach the network — read-only has no network at all.
-        # Mirrors the weekly-maintenance codex path. The agent only reads /tmp and
-        # calls MCP tools; it doesn't write source.
-        if: >-
-          inputs.engine == 'codex' &&
-          inputs.linear-fallback == true &&
-          steps.fetch.outputs.candidate_count != '0' &&
-          env.LINEAR_AVAILABLE == 'true' &&
-          (env.EFFECTIVE_MODE == 'triage-only' ||
-           steps.gate.outputs.should_run != 'true' ||
-           steps.push.outputs.url == '')
-        uses: openai/codex-action@e0fdf01220eb9a88167c4898839d273e3f2609d1 # v1.8
-        with:
-          codex-home: ${{ steps.codex-auth-linear.outputs.codex-home }}
-          sandbox: workspace-write
-          model: ${{ env.CODEX_MODEL }}
-          prompt: |
-            A Sentry-sweep triage for `${{ inputs.sentry-project }}` produced a verdict the autofix path did not handle (mode=triage-only, the gate didn't pass, or the apply produced no valid diff). Create a Linear issue so a human can pick it up.
-
-            ## Inputs (read these)
-            - `/tmp/triage.json` — the verdict (shortId, permalink, verdict, confidence, fix_summary, suspect_files).
-            - `/tmp/sentry-issues.json` — full Sentry context.
-
-            ## Task — use the Linear MCP tools
-            1. Read `/tmp/triage.json`.
-            2. List Linear teams and pick the one whose key/name best matches `${{ inputs.sentry-project }}` (e.g. `sidekick-web` → a team keyed `WEB`/`SW` or named "web"). If none clearly match, pick the first and say so in the body.
-            3. Check for duplicates: if an open Linear issue already has the Sentry shortId in its title, do nothing.
-            4. Otherwise create an issue:
-               - title: "Sentry: <shortId> — <issue title>" (≤100 chars)
-               - description: shortId, permalink, verdict, confidence, fix_summary.
-               - team: the one you picked. Do NOT set assignee, priority, or labels.
-
-            Be terse. Read the /tmp file, then use the Linear MCP tools. No source-file edits, no shell commands.
+          if URL=$(gh issue create --repo "$TARGET_REPO" \
+            --title "$ISSUE_TITLE" \
+            --label sentry-autofix \
+            --body-file "$BODY_FILE" 2>"${RUNNER_TEMP:-/tmp}/issue-err.txt"); then
+            echo "Filed follow-up issue: $URL"
+            echo "FOLLOWUP_ISSUE_URL=$URL" >> "$GITHUB_ENV"
+          else
+            echo "::warning::Could not create a GitHub issue in ${TARGET_REPO} (Issues may be disabled, or the token lacks issues:write). Capturing the would-be issue in the run summary."
+            cat "${RUNNER_TEMP:-/tmp}/issue-err.txt" || true
+            {
+              echo "## Sentry follow-up (issue creation failed in ${TARGET_REPO})"
+              echo ""
+              echo "**Would-be title:** ${ISSUE_TITLE}"
+              echo ""
+              cat "$BODY_FILE"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       # ----- summary -----
 
@@ -1303,6 +1345,7 @@ jobs:
           APPLIED: ${{ steps.validate.outputs.applied }}
           PR_URL: ${{ steps.push.outputs.url }}
           DIFF_LINES: ${{ steps.validate.outputs.diff_lines }}
+          FOLLOWUP_ISSUE_URL: ${{ env.FOLLOWUP_ISSUE_URL }}
         run: |
           set -euo pipefail
           {
@@ -1318,6 +1361,9 @@ jobs:
               echo "- **Autofix applied:** no"
             fi
             if [ -n "${PR_URL:-}" ]; then
-              echo "- **Draft PR:** ${PR_URL}"
+              echo "- **PR:** ${PR_URL}"
+            fi
+            if [ -n "${FOLLOWUP_ISSUE_URL:-}" ]; then
+              echo "- **Follow-up issue:** ${FOLLOWUP_ISSUE_URL}"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
