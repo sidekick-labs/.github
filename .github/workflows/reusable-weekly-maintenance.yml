@@ -88,11 +88,6 @@ on:
         required: false
         type: string
         default: './gradlew test'
-      linear-fallback:
-        description: 'When true, the agent opens a Linear issue for risky/judgment-call items instead of dropping them.'
-        required: false
-        type: boolean
-        default: false
       engine:
         description: 'AI engine: claude (default) uses anthropics/claude-code-action + CLAUDE_CODE_OAUTH_TOKEN; codex uses openai/codex-action + the CODEX_AUTH_JSON subscription credential. The assembled prompt, setup, and artifact steps are shared.'
         required: false
@@ -135,9 +130,6 @@ on:
         required: false
       CODEX_AUTH_JSON:
         description: 'Codex subscription auth.json (org secret). Required when engine=codex. Supplied via secrets: inherit.'
-        required: false
-      linear-api-key:
-        description: 'LINEAR_API_KEY for the Linear MCP server (only used when linear-fallback=true).'
         required: false
 
 permissions: {}
@@ -193,8 +185,6 @@ jobs:
           ENGINE: ${{ inputs.engine }}
           CLAUDE_TOKEN: ${{ secrets.claude-code-oauth-token }}
           CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
-          LINEAR_KEY: ${{ secrets.linear-api-key }}
-          LINEAR_FALLBACK: ${{ inputs.linear-fallback }}
         run: |
           set -euo pipefail
           if [ "$ENGINE" = "codex" ]; then
@@ -207,9 +197,6 @@ jobs:
               echo "::error::claude-code-oauth-token secret is not set"
               exit 1
             fi
-          fi
-          if [ "$LINEAR_FALLBACK" = "true" ] && [ -z "${LINEAR_KEY:-}" ]; then
-            echo "::warning::linear-fallback enabled but linear-api-key is empty - Linear fallback will be unavailable"
           fi
 
       - name: Checkout repository
@@ -367,8 +354,6 @@ jobs:
           LINT_COMMANDS: ${{ inputs.lint-commands }}
           TEST_COMMANDS: ${{ inputs.test-commands }}
           GRADLE_TEST_COMMAND: ${{ inputs.gradle-test-command }}
-          LINEAR_FALLBACK: ${{ inputs.linear-fallback }}
-          LINEAR_API_KEY: ${{ secrets.linear-api-key }}
           ADDITIONAL_ALLOWED_TOOLS: ${{ inputs.additional-allowed-tools }}
           DEFAULT_BRANCH: ${{ steps.default-branch.outputs.branch }}
           REPO: ${{ github.repository }}
@@ -450,9 +435,6 @@ jobs:
               echo "- Open CodeQL alerts: ${CODEQL_ALERT_COUNT:-0} (full details in \`tmp/maintenance/codeql-alerts.json\`)."
               echo "- For each open alert: if it is genuinely actionable and a safe, minimal fix exists, apply it in this PR. Otherwise summarise it in the PR body (rule id, file:line, and why it's deferred — e.g. false positive / by design)."
               echo "- Do NOT dismiss code-scanning alerts — dismissal is a human decision."
-              if [ "$LINEAR_FALLBACK" = "true" ]; then
-                echo "- Route any finding that needs a judgment call or a larger change to the single Linear issue."
-              fi
             fi
             echo
             echo "## Verification (after updates, before PR)"
@@ -504,10 +486,7 @@ jobs:
             echo "- If \`git diff\` is empty after updates: output \"No dependency changes needed\" and summarise findings (TODO/FIXME, stale PRs, audit). No PR."
             echo "- If diff is non-empty AND every verification command actually ran and passed: open a signed PR via the steps below."
             echo "- If diff is non-empty AND any verification command failed OR could not run: do NOT open a PR; output the failure summary including which checks couldn't run and why."
-            if [ "$LINEAR_FALLBACK" = "true" ]; then
-              echo "- For risky judgment-call items (major bumps, code-changing fixes, design-decision TODOs): create ONE Linear issue summarising findings. Determine team/project/labels by querying Linear. Always include RUN_URL in the issue body."
-            fi
-            echo "- Do NOT create or reference GitHub Issues (these repos do not use them)."
+            echo "- For risky judgment-call items (major bumps, code-changing fixes, design-decision TODOs): summarise them in the PR body (or the run output when there's no PR) for a human to pick up. Do NOT create or reference GitHub Issues (these repos do not use them)."
             echo "- Always include RUN_URL in the PR body."
             echo
             echo "## PR creation (when there are changes AND verification passes)"
@@ -561,45 +540,13 @@ jobs:
           if [ -n "$ADDITIONAL_ALLOWED_TOOLS" ]; then
             TOOLS="$TOOLS,$ADDITIONAL_ALLOWED_TOOLS"
           fi
-          if [ "$LINEAR_FALLBACK" = "true" ]; then
-            TOOLS="$TOOLS,mcp__linear__*"
-          fi
 
-          # Build the MCP config file. Only declare the Linear server when
-          # linear-fallback is enabled, otherwise emit an empty config so the
-          # action does not try to spawn mcp-remote with an empty bearer.
-          # Written to a file rather than an action input because
-          # claude-code-action no longer accepts a top-level `mcp_config:` —
-          # the supported form is `claude_args: --mcp-config <path-or-json>`.
-          MCP_CONFIG_FILE=tmp/maintenance/mcp-config.json
-          if [ "$LINEAR_FALLBACK" = "true" ]; then
-            cat > "$MCP_CONFIG_FILE" <<EOF
-          {
-            "mcpServers": {
-              "linear": {
-                "command": "npx",
-                "args": [
-                  "-y",
-                  "mcp-remote",
-                  "https://mcp.linear.app/mcp",
-                  "--header",
-                  "Authorization:Bearer ${LINEAR_API_KEY:-}"
-                ]
-              }
-            }
-          }
-          EOF
-          else
-            echo '{"mcpServers":{}}' > "$MCP_CONFIG_FILE"
-          fi
-
-          # Emit prompt + tools + mcp config path as outputs.
+          # Emit prompt + tools as outputs.
           {
             echo 'prompt<<MAINT_PROMPT_EOF'
             cat "$PROMPT_FILE"
             echo 'MAINT_PROMPT_EOF'
             echo "allowed-tools=$TOOLS"
-            echo "mcp-config-path=$MCP_CONFIG_FILE"
           } >> "$GITHUB_OUTPUT"
 
       # ----- weekly maintenance -----
@@ -609,35 +556,24 @@ jobs:
         if: ${{ inputs.engine != 'codex' }}
         uses: anthropics/claude-code-action@bfad70d6a1b6a9a6716dda7303aa912d16ee9e79 # main@2.1.160 (thinking-block 400 fix; ahead of release v1.0.133 — see rarebit-one/rarebit-ops#119)
         timeout-minutes: ${{ inputs.claude-timeout-minutes }}
-        env:
-          LINEAR_API_KEY: ${{ secrets.linear-api-key }}
         with:
           claude_code_oauth_token: ${{ secrets.claude-code-oauth-token }}
           show_full_output: true
           prompt: ${{ steps.build-prompt.outputs.prompt }}
-          # MCP config is written to a file by the build-prompt step.
-          # When linear-fallback is true it declares the Linear remote MCP
-          # server; otherwise it's an empty config so the action does not
-          # spawn mcp-remote with an empty bearer.
-          # See: https://linear.app/docs/mcp
           claude_args: >-
             --model ${{ env.CLAUDE_MODEL }}
-            --mcp-config ${{ steps.build-prompt.outputs.mcp-config-path }}
             --allowed-tools "${{ steps.build-prompt.outputs.allowed-tools }}"
 
       # Codex engine: a workspace-write sandbox with network enabled (dep
       # updates, git push, and gh all need it). Reuses the SAME assembled prompt
       # — it's engine-neutral task instructions plus the embedded commit/push/PR
-      # bash. No allowed-tools (the sandbox governs); Linear MCP, when enabled,
-      # comes from config.toml via setup-codex-auth rather than --mcp-config.
+      # bash. No allowed-tools (the sandbox governs).
       - name: Setup Codex auth (weekly)
         id: codex-auth
         if: ${{ inputs.engine == 'codex' }}
         uses: sidekick-labs/.github/.github/actions/setup-codex-auth@main
         with:
           auth-json: ${{ secrets.CODEX_AUTH_JSON }}
-          enable-linear-mcp: ${{ inputs.linear-fallback }}
-          linear-api-key: ${{ secrets.linear-api-key }}
           enable-workspace-network: 'true'
 
       - name: Weekly maintenance (Codex)
@@ -661,12 +597,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: weekly-maintenance-${{ github.run_id }}
-          # Exclude mcp-config.json — when linear-fallback is true it
-          # contains a LINEAR_API_KEY bearer token, and artifacts have
-          # 90-day retention plus a wider visibility surface than a
-          # masked $GITHUB_OUTPUT value.
           path: |
             tmp/maintenance/
-            !tmp/maintenance/mcp-config.json
           if-no-files-found: ignore
           retention-days: 90
