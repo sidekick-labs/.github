@@ -1,0 +1,246 @@
+name: Reusable — Deploy to DO App Platform (staging)
+
+# Reusable (`workflow_call`) staging deploy for the DOCR + do-app-deploy model.
+# Builds the caller's image, pushes it to DOCR tagged at `deploy_sha`, patches
+# the staging App Platform appspec to that image via the shared do-app-deploy
+# composite action, and polls to ACTIVE. Tracks the rollout as a GitHub
+# Deployment and comments on the source PR when the deploy fails.
+#
+# Extracted from sidekick-inference's inline deploy-staging.yml (itself copied
+# from sidekick-harness). Repo-specific values are inputs so harness/web can
+# adopt it too. No Sentry by default — a caller that needs sourcemap upload (or
+# any build-time secret) passes it via the `build_secrets` input and gates the
+# upload inside its own Dockerfile/build config.
+#
+# The trigger (workflow_run on CI / workflow_dispatch) and the CI-success gate
+# live in the CALLER — a reusable workflow can only be entered via
+# workflow_call, so the caller resolves `deploy_sha` and passes it in.
+#
+# CALLER SETUP: a reusable workflow's GITHUB_TOKEN permissions can only be
+# NARROWED by this file, never elevated — so the calling job (or workflow) must
+# itself grant `deployments: write` and `pull-requests: write` (plus the
+# default `contents: read`). Without them the "Create GitHub Deployment" step
+# 403s and fails the deploy. Pass `secrets: inherit` (or DIGITALOCEAN_ACCESS_TOKEN
+# explicitly).
+#
+# VERSION PINNING (known boundary): the composite actions this workflow calls
+# (do-app-deploy, gh-deployment-start/-finish, deploy-failure-comment) are
+# referenced `@main`. A nested `uses: …@main` always resolves at main HEAD,
+# regardless of the ref a caller pinned THIS reusable to — so pinning the
+# reusable at a SHA reproduces the workflow wiring but NOT the composite step
+# logic, which tracks main. (`./` can't fix this: in a reusable workflow it
+# resolves against the caller's checkout, not this repo.) Hardening is a
+# deliberate post-merge pin of these refs to the merge SHA.
+
+on:
+  workflow_call:
+    inputs:
+      deploy_sha:
+        description: "Exact commit SHA to build and deploy (the SHA CI validated)."
+        required: true
+        type: string
+      image_repo:
+        description: "DOCR repository name, e.g. sidekick-inference."
+        required: true
+        type: string
+      app_id:
+        description: "DigitalOcean App Platform app ID for the staging app (caller's vars.DO_STAGING_APP_ID)."
+        required: true
+        type: string
+      app_url:
+        description: "Staging ingress URL, used for the GitHub Deployment environment link."
+        required: true
+        type: string
+      environment:
+        description: "GitHub Environment name to attach the deployment to."
+        required: false
+        type: string
+        default: staging
+      dockerfile:
+        description: "Path to the Dockerfile to build."
+        required: false
+        type: string
+        default: ./Dockerfile
+      context:
+        description: "Docker build context."
+        required: false
+        type: string
+        default: .
+      build_args:
+        description: "Docker build args (multiline KEY=VALUE). Do NOT pass secrets here — visible in `docker history`."
+        required: false
+        type: string
+        default: ""
+      build_secrets:
+        description: |
+          BuildKit secrets passed to the build (multiline KEY=VALUE). Mounted
+          only during build, never written to image layers or metadata.
+          Reference in the Dockerfile with `RUN --mount=type=secret,id=KEY ...`.
+        required: false
+        type: string
+        default: ""
+      registry:
+        description: "DOCR registry name."
+        required: false
+        type: string
+        default: sidekick-labs
+    secrets:
+      DIGITALOCEAN_ACCESS_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+  deployments: write
+  # Required for `gh pr comment` in the failure-notification step.
+  pull-requests: write
+
+jobs:
+  deploy:
+    name: Deploy to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    # Docker build (cold cache) ~20 min + DO deploy via the composite action's
+    # poll (≤30 min) + setup/status ~3 min ≈ 53 min worst case.
+    timeout-minutes: 60
+    environment: ${{ inputs.environment }}
+
+    env:
+      # Only the Summary step reads these from job env now; the deployment
+      # lifecycle, image, and environment values are passed to the composites
+      # as inputs.
+      DEPLOY_SHA: ${{ inputs.deploy_sha }}
+      APP_URL: ${{ inputs.app_url }}
+
+    steps:
+      - name: Checkout
+        id: checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          # Build the image from the exact SHA CI validated, not whatever is
+          # currently at the tip of the default branch.
+          ref: ${{ inputs.deploy_sha }}
+
+      - name: Install doctl
+        # Use the org-standard action (same SHA-pinned version as the
+        # production / promote reusables) instead of a hand-rolled tarball, so
+        # doctl provisioning is identical across all three files. It installs +
+        # auths doctl; auth persists under $HOME for the DOCR login and the
+        # do-app-deploy composite below.
+        uses: digitalocean/action-doctl@3cb3953159719656269e044e0e24ca16dd2a690f # v2.5.2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+      - name: Login to DOCR
+        # 1 hour — covers cold-cache builds which can exceed the 20 min default.
+        run: doctl registry login --expiry-seconds 3600
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Build and push app image
+        id: build_push
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          push: true
+          build-args: ${{ inputs.build_args }}
+          secrets: ${{ inputs.build_secrets }}
+          tags: |
+            registry.digitalocean.com/${{ inputs.registry }}/${{ inputs.image_repo }}:${{ inputs.deploy_sha }}
+          cache-from: type=registry,ref=registry.digitalocean.com/${{ inputs.registry }}/${{ inputs.image_repo }}:cache
+          cache-to: type=registry,ref=registry.digitalocean.com/${{ inputs.registry }}/${{ inputs.image_repo }}:cache,mode=max
+
+      - name: Create GitHub Deployment + mark in_progress
+        id: deployment
+        uses: sidekick-labs/.github/.github/actions/gh-deployment-start@main
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          environment: ${{ inputs.environment }}
+          sha: ${{ inputs.deploy_sha }}
+          production_environment: "false"
+          description: Staging deploy for ${{ inputs.deploy_sha }}
+
+      - name: Patch appspec & deploy to DigitalOcean
+        id: do_deploy
+        # Shared composite action: fetch live appspec, patch every component to
+        # the DOCR image at this SHA, doctl apps update, poll to a terminal
+        # phase. Always exits 0 and reports via outputs — the gate step below is
+        # what fails the job, keeping do_deploy_id available to the always()
+        # status steps. Referenced by explicit repo path (not `./`) so it
+        # resolves from THIS repo regardless of the caller's checkout.
+        uses: sidekick-labs/.github/.github/actions/do-app-deploy@main
+        with:
+          app_id: ${{ inputs.app_id }}
+          image_repo: ${{ inputs.image_repo }}
+          deploy_sha: ${{ inputs.deploy_sha }}
+
+      - name: Fail the job if the deploy did not succeed
+        # Gate on `outcome` rather than `phase` so we don't depend on the exact
+        # success-phase string (the action sets outcome=success only on ACTIVE).
+        if: steps.do_deploy.outputs.outcome != 'success'
+        run: |
+          echo "::error::Staging deploy did not succeed (phase '${{ steps.do_deploy.outputs.phase }}', expected ACTIVE)"
+          exit 1
+
+      - name: Post final deployment status
+        if: always() && steps.deployment.outputs.deployment_id != ''
+        uses: sidekick-labs/.github/.github/actions/gh-deployment-finish@main
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          deployment_id: ${{ steps.deployment.outputs.deployment_id }}
+          environment: ${{ inputs.environment }}
+          app_url: ${{ inputs.app_url }}
+          job_status: ${{ job.status }}
+          do_phase: ${{ steps.do_deploy.outputs.phase }}
+          do_deploy_id: ${{ steps.do_deploy.outputs.do_deploy_id }}
+          do_deploy_url: ${{ steps.do_deploy.outputs.do_deploy_url }}
+
+      - name: Classify failure stage
+        id: stage
+        if: failure()
+        env:
+          PHASE: ${{ steps.do_deploy.outputs.phase }}
+        run: |
+          # Walk the pipeline in order; first failed step names the stage.
+          if [ "${{ steps.checkout.outcome }}" = "failure" ]; then
+            STAGE="repository checkout"
+          elif [ "${{ steps.build_push.outcome }}" = "failure" ]; then
+            STAGE="image build or push to DOCR"
+          elif [ "${{ steps.deployment.outcome }}" = "failure" ]; then
+            STAGE="GitHub deployment API call"
+          elif [ "${{ steps.do_deploy.outcome }}" = "failure" ]; then
+            # do-app-deploy hard-fails only at the appspec fetch/patch stage;
+            # the deploy/poll phase exits 0 and reports via `phase` (next branch).
+            STAGE="appspec fetch/patch"
+          elif [ -n "$PHASE" ] && [ "$PHASE" != "ACTIVE" ]; then
+            STAGE="DigitalOcean deploy (phase: \`${PHASE}\`)"
+          else
+            STAGE="environment setup (doctl, buildx, registry login, …)"
+          fi
+          echo "stage=$STAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Comment on merged PR when deploy fails
+        if: failure()
+        uses: sidekick-labs/.github/.github/actions/deploy-failure-comment@main
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          sha: ${{ inputs.deploy_sha }}
+          title: Staging deploy failed
+          stage: ${{ steps.stage.outputs.stage }}
+          log_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Summary
+        if: always()
+        run: |
+          DO_URL="${{ steps.do_deploy.outputs.do_deploy_url }}"
+          {
+            echo "## Staging deploy"
+            echo ""
+            echo "- **SHA:** \`$DEPLOY_SHA\`"
+            echo "- **DO deployment:** \`${{ steps.do_deploy.outputs.do_deploy_id }}\`"
+            if [ -n "$DO_URL" ]; then
+              echo "- **DO deploy URL:** $DO_URL"
+            fi
+            echo "- **Final phase:** \`${{ steps.do_deploy.outputs.phase }}\`"
+            echo "- **Environment URL:** $APP_URL"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,330 @@
+name: Reusable — Promote to Production
+
+# Reusable (`workflow_call`) promote step for the DOCR + do-app-deploy model.
+# Validates the target SHA can safely deploy (on main, CI green, DOCR image
+# present), fast-forward pushes it to refs/heads/production, then **explicitly
+# dispatches** the caller's production deploy workflow.
+#
+# Why explicit dispatch instead of "push → CI → workflow_run"? The caller's
+# deploy-production workflow only has `workflow_dispatch`, and CI is scoped to
+# `[main]` only, so a push to production fires nothing implicitly. The chain is
+# explicit by design.
+#
+# The FF-push is authenticated by a GitHub App installation token
+# (`sidekick-release-bot`), NOT GITHUB_TOKEN — github-actions[bot] has no
+# stable identity for the production-ruleset bypass list, so we use an App that
+# IS on the bypass list. Extracted from sidekick-inference's inline
+# promote-production.yml (originally from sidekick-web PR #1023).
+#
+# CALLER SETUP (passed in as inputs/secrets):
+#   - vars.RELEASE_BOT_CLIENT_ID      → input  release_bot_client_id
+#   - secrets.RELEASE_BOT_PRIVATE_KEY → secret RELEASE_BOT_PRIVATE_KEY
+#   - vars.DO_PRODUCTION_APP_ID       → input  do_production_app_id
+#   Plus: the App installed on the caller repo + on the `production` ruleset
+#   bypass list, and the caller's production deploy workflow filename.
+#
+# DISPATCH CONTRACT: the deploy is dispatched with `--field ref=<sha>`, so the
+# caller's production deploy workflow (deploy_production_workflow) MUST live on
+# the default branch and expose a `workflow_dispatch` input named `ref`, then
+# forward it to the production reusable's `deploy_sha`. A mismatch fails the
+# dispatch AFTER the FF-push (production advanced, deploy never started).
+#
+# Also: a reusable workflow's GITHUB_TOKEN permissions can only be NARROWED
+# here, never elevated — the calling job/workflow must itself grant
+# `actions: write` (to dispatch the production deploy) and `pull-requests: write`
+# (plus `contents: read`). Without actions:write the FF-push succeeds but the
+# deploy is never dispatched (production silently stays on the old image).
+#
+# VERSION PINNING (known boundary): the composite actions this workflow calls
+# (docr-image-exists, deploy-failure-comment) are referenced `@main`, which
+# resolves at main HEAD regardless of the ref a caller pinned THIS reusable to.
+# Hardening is a deliberate post-merge pin of these refs to the merge SHA.
+
+on:
+  workflow_call:
+    inputs:
+      image_repo:
+        description: "DOCR repository name, e.g. sidekick-inference."
+        required: true
+        type: string
+      do_production_app_id:
+        description: "DigitalOcean production app ID (caller's vars.DO_PRODUCTION_APP_ID)."
+        required: true
+        type: string
+      release_bot_client_id:
+        description: "sidekick-release-bot GitHub App Client ID (caller's vars.RELEASE_BOT_CLIENT_ID). Public, not a secret."
+        required: true
+        type: string
+      target_ref:
+        description: "Commit SHA to promote (must be on main). Empty → caller's github.sha."
+        required: false
+        type: string
+        default: ""
+      dry_run:
+        description: "Validate everything but don't push to production or dispatch the deploy."
+        required: false
+        type: boolean
+        default: false
+      deploy_production_workflow:
+        description: "Filename of the caller's production deploy workflow to dispatch."
+        required: false
+        type: string
+        default: deploy-production.yml
+      ci_workflow_name:
+        description: "Name (the workflow's `name:`, not filename) of the CI run whose success gates promotion."
+        required: false
+        type: string
+        default: CI
+      environment:
+        description: "GitHub Environment that gates the release decision."
+        required: false
+        type: string
+        default: production
+      registry:
+        description: "DOCR registry name."
+        required: false
+        type: string
+        default: sidekick-labs
+    secrets:
+      DIGITALOCEAN_ACCESS_TOKEN:
+        required: true
+      RELEASE_BOT_PRIVATE_KEY:
+        required: true
+
+permissions:
+  # The FF-push to `production` does NOT use GITHUB_TOKEN (see the App-token
+  # step). contents: read here is just for read-side gh api calls.
+  contents: read
+  # actions: write so the final step can dispatch the production deploy
+  # workflow. Without this the dispatch returns 403 and production silently
+  # never deploys.
+  actions: write
+  # Allows the failure-notification step to comment on the source PR.
+  pull-requests: write
+
+jobs:
+  promote:
+    name: Promote to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    # Validation + push only — no image build, no DO rollout.
+    timeout-minutes: 15
+    # `environment` here so any GH Environment protection rules gate the human
+    # action of cutting a release — not the downstream DO rollout.
+    environment: ${{ inputs.environment }}
+
+    env:
+      DO_PRODUCTION_APP_ID: ${{ inputs.do_production_app_id }}
+      TARGET_SHA: ${{ inputs.target_ref || github.sha }}
+      # Used by the dry-run summary; the DOCR image check now takes image_repo /
+      # registry as composite inputs.
+      IMAGE_REPO: ${{ inputs.image_repo }}
+
+    steps:
+      - name: Mint GitHub App installation token
+        # The fast-forward push to `production` is rejected by branch protection
+        # unless the actor is on the ruleset's bypass list. The
+        # `sidekick-release-bot` GitHub App IS on that list, so we mint a
+        # short-lived installation token and use it for checkout + FF-push.
+        #
+        # Note: v3 of this action uses `client-id` (the App Client ID from
+        # General Settings), NOT the numeric App ID.
+        id: app_token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ inputs.release_bot_client_id }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          # Scope the token to the minimum it needs — pushing to production.
+          permission-contents: write
+
+      - name: Checkout (full history for ancestor check)
+        id: checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+          # App token (not GITHUB_TOKEN) so the credential helper this action
+          # installs is what `git push` uses below.
+          token: ${{ steps.app_token.outputs.token }}
+
+      - name: Resolve target SHA and verify it's on main
+        id: target
+        run: |
+          set -euo pipefail
+          # Ensure refs/remotes/origin/main exists regardless of which ref this
+          # workflow was dispatched from. actions/checkout only populates the
+          # tracking ref for the checked-out branch, so a dispatch from a tag or
+          # the production branch would otherwise leave origin/main absent and
+          # the ancestor check below would error ("not a valid object name")
+          # instead of gating cleanly.
+          git fetch --no-tags origin main:refs/remotes/origin/main
+
+          # TARGET_SHA is always non-empty: the env default resolves to
+          # github.sha when no ref is supplied. Normalise short → full SHA.
+          TARGET=$(git rev-parse "${TARGET_SHA}")
+
+          if ! git merge-base --is-ancestor "$TARGET" origin/main; then
+            echo "::error::$TARGET is not an ancestor of origin/main — refusing to promote"
+            exit 1
+          fi
+
+          echo "sha=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "short=${TARGET:0:7}" >> "$GITHUB_OUTPUT"
+          echo "Target SHA: $TARGET ($(git log -1 --format=%s "$TARGET"))"
+
+      - name: Verify CI passed on target SHA
+        id: ci_check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_WORKFLOW_NAME: ${{ inputs.ci_workflow_name }}
+        run: |
+          set -euo pipefail
+          TARGET="${{ steps.target.outputs.sha }}"
+          # `gh api --jq` runs jq but doesn't accept `--arg`, so pipe the raw
+          # JSON to standalone jq with the workflow name passed safely as a
+          # jq variable (the caller's CI workflow may not be named "CI").
+          # per_page=100 so the matching CI run can't fall off the default
+          # first page on a SHA with many workflow runs (re-runs, many workflows).
+          COUNT=$(gh api "repos/${{ github.repository }}/actions/runs?head_sha=${TARGET}&status=success&per_page=100" \
+            | jq --arg name "$CI_WORKFLOW_NAME" '[.workflow_runs[] | select(.name == $name)] | length')
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::No successful '${CI_WORKFLOW_NAME}' run found for ${TARGET:0:7} — has it completed on main?"
+            exit 1
+          fi
+          echo "'${CI_WORKFLOW_NAME}' passed on ${TARGET:0:7} ($COUNT successful run(s))"
+
+      - name: Install doctl
+        uses: digitalocean/action-doctl@3cb3953159719656269e044e0e24ca16dd2a690f # v2.5.2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+      - name: Verify image exists in DOCR
+        id: image_check
+        # Done here (not at deploy time) so we fail BEFORE FF-pushing to
+        # production — otherwise we'd advance production to a SHA the deploy
+        # can't roll out.
+        uses: sidekick-labs/.github/.github/actions/docr-image-exists@main
+        with:
+          image_repo: ${{ inputs.image_repo }}
+          tag: ${{ steps.target.outputs.sha }}
+          registry: ${{ inputs.registry }}
+
+      - name: Check production app id is configured
+        id: app_check
+        run: |
+          if [ -z "$DO_PRODUCTION_APP_ID" ]; then
+            echo "::error::do_production_app_id is empty — set vars.DO_PRODUCTION_APP_ID on the caller repo"
+            exit 1
+          fi
+          echo "Production app id: $DO_PRODUCTION_APP_ID"
+
+      - name: Dry-run summary
+        if: ${{ inputs.dry_run }}
+        run: |
+          {
+            echo "## Dry run — would promote ${{ steps.target.outputs.short }} to production"
+            echo
+            echo "- Target SHA: \`${{ steps.target.outputs.sha }}\`"
+            echo "- DOCR image: \`${IMAGE_REPO}:${{ steps.target.outputs.short }}\` ✓ exists"
+            echo "- CI status on target: ✓ passing"
+            echo "- App: \`$DO_PRODUCTION_APP_ID\`"
+            echo
+            echo "**Stopping before FF-push** (dry-run mode)."
+          } > "$GITHUB_STEP_SUMMARY"
+
+      - name: Fast-forward production → target SHA
+        id: ff_push
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          TARGET="${{ steps.target.outputs.sha }}"
+          # Detect re-promote of an already-deployed SHA so the next step can
+          # skip the redundant dispatch (~10-15 min DO re-apply). The plain
+          # push itself is a no-op when production already points at TARGET.
+          # Best-effort fetch first so the no-op detection is reliable even when
+          # checkout didn't populate the tracking ref; tolerated-missing on the
+          # first-ever release (production branch doesn't exist yet).
+          git fetch --no-tags origin production:refs/remotes/origin/production 2>/dev/null || true
+          PROD_SHA=$(git rev-parse refs/remotes/origin/production 2>/dev/null || echo "")
+          if [ -n "$PROD_SHA" ] && [ "$PROD_SHA" = "$TARGET" ]; then
+            echo "already_at_target=true" >> "$GITHUB_OUTPUT"
+            echo "production already at ${TARGET:0:7} — push will be a no-op, dispatch will be skipped"
+          else
+            echo "already_at_target=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Plain (non-`+`) push: refuses unless a true fast-forward. Branch
+          # protection + the release-bot bypass preserve linear promotion
+          # history. First-release case: this creates refs/heads/production.
+          git push origin "${TARGET}:refs/heads/production"
+
+      - name: Dispatch production deploy
+        # The caller's deploy-production workflow only has workflow_dispatch,
+        # and CI is scoped to [main], so nothing fires it implicitly — this is
+        # the chain. GITHUB_TOKEN with actions: write is enough to dispatch.
+        # Gated on already_at_target to avoid a redundant DO re-apply.
+        id: dispatch_deploy
+        if: ${{ !inputs.dry_run && success() && steps.ff_push.outputs.already_at_target != 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ steps.target.outputs.sha }}
+          DEPLOY_WORKFLOW: ${{ inputs.deploy_production_workflow }}
+        run: |
+          set -euo pipefail
+          gh workflow run "$DEPLOY_WORKFLOW" --field ref="$SHA"
+          echo "Dispatched $DEPLOY_WORKFLOW for ${SHA:0:7}"
+
+      - name: Summary
+        if: ${{ !inputs.dry_run && success() }}
+        env:
+          DEPLOY_RUNS_URL: ${{ github.server_url }}/${{ github.repository }}/actions/workflows/${{ inputs.deploy_production_workflow }}
+          ALREADY_AT_TARGET: ${{ steps.ff_push.outputs.already_at_target }}
+        run: |
+          {
+            echo "## ✅ Promoted \`${{ steps.target.outputs.short }}\` to production"
+            echo
+            echo "- SHA: \`${{ steps.target.outputs.sha }}\`"
+            if [ "$ALREADY_AT_TARGET" = "true" ]; then
+              echo "- Production branch was **already at this SHA** — push was a no-op."
+              echo "- Production deploy was **not** dispatched (would have been a redundant re-apply)."
+            else
+              echo "- Production branch advanced."
+              echo "- Production deploy dispatched — watch the rollout there."
+              echo
+              echo "[Production deploy runs →]($DEPLOY_RUNS_URL)"
+            fi
+          } > "$GITHUB_STEP_SUMMARY"
+
+      - name: Classify failure stage
+        id: stage
+        if: failure()
+        run: |
+          if [ "${{ steps.app_token.outcome }}" = "failure" ]; then
+            STAGE="GitHub App token mint (release_bot_client_id / RELEASE_BOT_PRIVATE_KEY missing/invalid, or App not installed)"
+          elif [ "${{ steps.checkout.outcome }}" = "failure" ]; then
+            STAGE="repository checkout"
+          elif [ "${{ steps.target.outcome }}" = "failure" ]; then
+            STAGE="target SHA resolution / ancestor check"
+          elif [ "${{ steps.ci_check.outcome }}" = "failure" ]; then
+            STAGE="CI gate (no successful CI run on target SHA)"
+          elif [ "${{ steps.image_check.outcome }}" = "failure" ]; then
+            STAGE="DOCR image-existence check (staging deploy missing for this SHA?)"
+          elif [ "${{ steps.app_check.outcome }}" = "failure" ]; then
+            STAGE="production app id check (do_production_app_id unset?)"
+          elif [ "${{ steps.ff_push.outcome }}" = "failure" ]; then
+            STAGE="fast-forward push to production branch (non-FF history, or release-bot App missing from production ruleset bypass list?)"
+          elif [ "${{ steps.dispatch_deploy.outcome }}" = "failure" ]; then
+            STAGE="dispatching production deploy (production branch advanced but deploy never started — manual dispatch may be needed)"
+          else
+            STAGE="environment setup (doctl install, registry auth, …)"
+          fi
+          echo "stage=$STAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Comment on merged PR when promote fails
+        if: failure()
+        uses: sidekick-labs/.github/.github/actions/deploy-failure-comment@main
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          sha: ${{ steps.target.outputs.sha }}
+          title: Production PROMOTE failed
+          stage: ${{ steps.stage.outputs.stage }}
+          log_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          footer: "Production has NOT been updated. The promote step is what writes to refs/heads/production; nothing downstream of it has run."

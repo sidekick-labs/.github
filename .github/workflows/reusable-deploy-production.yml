@@ -1,0 +1,177 @@
+name: Reusable — Deploy to DO App Platform (production)
+
+# Reusable (`workflow_call`) production deploy for the DOCR + do-app-deploy
+# model. Reuses the image staging already built + pushed to DOCR for this SHA
+# (no rebuild), patches the production app's appspec to that image via the
+# shared do-app-deploy composite action, and polls to ACTIVE.
+#
+# Dispatched by the caller's promote flow — never on its own. The caller keeps
+# the `workflow_dispatch` trigger and passes the target SHA in as `deploy_sha`.
+#
+# Extracted from sidekick-inference's inline deploy-production.yml. No Sentry.
+#
+# CALLER SETUP: a reusable workflow's GITHUB_TOKEN permissions can only be
+# NARROWED here, never elevated — the calling job/workflow must itself grant
+# `deployments: write` and `pull-requests: write` (plus `contents: read`), or
+# the "Create GitHub Deployment" step 403s and fails the deploy.
+#
+# VERSION PINNING (known boundary): the composite actions this workflow calls
+# (docr-image-exists, gh-deployment-start/-finish, do-app-deploy,
+# deploy-failure-comment) are referenced `@main`. A nested `uses: …@main`
+# resolves at main HEAD regardless of the ref a caller pinned THIS reusable to,
+# so a caller's SHA pin reproduces the wiring but not the composite step logic.
+# Hardening is a deliberate post-merge pin of these refs to the merge SHA.
+
+on:
+  workflow_call:
+    inputs:
+      deploy_sha:
+        description: "Commit SHA to deploy (image must already exist in DOCR from staging)."
+        required: true
+        type: string
+      image_repo:
+        description: "DOCR repository name, e.g. sidekick-inference."
+        required: true
+        type: string
+      app_id:
+        description: "DigitalOcean App Platform app ID for the production app (caller's vars.DO_PRODUCTION_APP_ID)."
+        required: true
+        type: string
+      app_url:
+        description: "Production ingress URL, used for the GitHub Deployment environment link."
+        required: true
+        type: string
+      environment:
+        description: "GitHub Environment name to attach the deployment to."
+        required: false
+        type: string
+        default: production
+      registry:
+        description: "DOCR registry name."
+        required: false
+        type: string
+        default: sidekick-labs
+    secrets:
+      DIGITALOCEAN_ACCESS_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+  deployments: write
+  # Required for `gh pr comment` in the failure-notification step.
+  pull-requests: write
+
+jobs:
+  deploy:
+    name: Deploy to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    # DO deploy via the composite action's poll (≤30 min) + setup/status ~3 min.
+    timeout-minutes: 45
+    environment: ${{ inputs.environment }}
+
+    env:
+      # Only the Summary step reads these from job env now; the deployment
+      # lifecycle, image, and environment values are passed to the composites
+      # as inputs.
+      DEPLOY_SHA: ${{ inputs.deploy_sha }}
+      APP_URL: ${{ inputs.app_url }}
+
+    steps:
+      - name: Install doctl
+        uses: digitalocean/action-doctl@3cb3953159719656269e044e0e24ca16dd2a690f # v2.5.2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+      - name: Verify image exists in DOCR
+        id: image_check
+        # Production reuses the image staging built for this SHA — confirm it
+        # exists before touching the live app.
+        uses: sidekick-labs/.github/.github/actions/docr-image-exists@main
+        with:
+          image_repo: ${{ inputs.image_repo }}
+          tag: ${{ inputs.deploy_sha }}
+          registry: ${{ inputs.registry }}
+
+      - name: Create GitHub Deployment + mark in_progress
+        id: deployment
+        uses: sidekick-labs/.github/.github/actions/gh-deployment-start@main
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          environment: ${{ inputs.environment }}
+          sha: ${{ inputs.deploy_sha }}
+          production_environment: "true"
+          description: Production deploy for ${{ inputs.deploy_sha }}
+
+      - name: Patch appspec & deploy to DigitalOcean
+        id: do_deploy
+        # Shared composite action — referenced by explicit repo path (not `./`)
+        # so it resolves from THIS repo regardless of the caller's checkout.
+        uses: sidekick-labs/.github/.github/actions/do-app-deploy@main
+        with:
+          app_id: ${{ inputs.app_id }}
+          image_repo: ${{ inputs.image_repo }}
+          deploy_sha: ${{ inputs.deploy_sha }}
+
+      - name: Fail the job if the deploy did not succeed
+        if: steps.do_deploy.outputs.outcome != 'success'
+        run: |
+          echo "::error::Production deploy did not succeed (phase '${{ steps.do_deploy.outputs.phase }}', expected ACTIVE)"
+          exit 1
+
+      - name: Post final deployment status
+        if: always() && steps.deployment.outputs.deployment_id != ''
+        uses: sidekick-labs/.github/.github/actions/gh-deployment-finish@main
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          deployment_id: ${{ steps.deployment.outputs.deployment_id }}
+          environment: ${{ inputs.environment }}
+          app_url: ${{ inputs.app_url }}
+          job_status: ${{ job.status }}
+          do_phase: ${{ steps.do_deploy.outputs.phase }}
+          do_deploy_id: ${{ steps.do_deploy.outputs.do_deploy_id }}
+          do_deploy_url: ${{ steps.do_deploy.outputs.do_deploy_url }}
+
+      - name: Classify failure stage
+        id: stage
+        if: failure()
+        env:
+          PHASE: ${{ steps.do_deploy.outputs.phase }}
+        run: |
+          if [ "${{ steps.image_check.outcome }}" = "failure" ]; then
+            STAGE="DOCR image-existence check (staging deploy missing for this SHA?)"
+          elif [ "${{ steps.deployment.outcome }}" = "failure" ]; then
+            STAGE="GitHub deployment API call"
+          elif [ "${{ steps.do_deploy.outcome }}" = "failure" ]; then
+            STAGE="appspec fetch/patch"
+          elif [ -n "$PHASE" ] && [ "$PHASE" != "ACTIVE" ]; then
+            STAGE="DigitalOcean deploy (phase: \`${PHASE}\`)"
+          else
+            STAGE="environment setup (doctl, registry auth, …)"
+          fi
+          echo "stage=$STAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Comment on merged PR when deploy fails
+        if: failure()
+        uses: sidekick-labs/.github/.github/actions/deploy-failure-comment@main
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          sha: ${{ inputs.deploy_sha }}
+          title: Production deploy failed
+          stage: ${{ steps.stage.outputs.stage }}
+          log_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Summary
+        if: always()
+        run: |
+          DO_URL="${{ steps.do_deploy.outputs.do_deploy_url }}"
+          {
+            echo "## Production deploy"
+            echo ""
+            echo "- **SHA:** \`$DEPLOY_SHA\`"
+            echo "- **DO deployment:** \`${{ steps.do_deploy.outputs.do_deploy_id }}\`"
+            if [ -n "$DO_URL" ]; then
+              echo "- **DO deploy URL:** $DO_URL"
+            fi
+            echo "- **Final phase:** \`${{ steps.do_deploy.outputs.phase }}\`"
+            echo "- **Environment URL:** $APP_URL"
+          } >> "$GITHUB_STEP_SUMMARY"

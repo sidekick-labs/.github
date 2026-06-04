@@ -1,0 +1,69 @@
+name: Comment deploy failure on PR
+description: >-
+  Find the PR that introduced a commit SHA and post a failure comment on it.
+  No-op when no PR is found (direct push to main, or a hand-picked dispatch
+  ref). Extracted from the "Comment on merged PR when … fails" steps across the
+  deploy and promote reusables — the per-workflow stage-detection ladder stays
+  in the caller (it reads that workflow's own step outcomes) and the computed
+  `stage` string is passed in here.
+
+inputs:
+  github_token:
+    description: "Token with `pull-requests: write` on the target repo."
+    required: true
+  sha:
+    description: Commit SHA whose PR should receive the comment.
+    required: true
+  title:
+    description: Bold headline, e.g. "Staging deploy failed".
+    required: true
+  stage:
+    description: Human-readable stage that failed (computed by the caller).
+    required: true
+  log_url:
+    description: Link to the failed run.
+    required: true
+  footer:
+    description: Optional extra paragraph appended after the run link.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Comment on merged PR
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        SHA: ${{ inputs.sha }}
+        TITLE: ${{ inputs.title }}
+        STAGE: ${{ inputs.stage }}
+        LOG_URL: ${{ inputs.log_url }}
+        FOOTER: ${{ inputs.footer }}
+      run: |
+        SHORT_SHA="${SHA:0:7}"
+        # Find the PR that introduced this SHA (squash/merge/rebase all resolve
+        # here). Errors are swallowed → treated as "no PR", since this is a
+        # best-effort notification and must never fail the deploy further.
+        PR=$(gh api "repos/${{ github.repository }}/commits/${SHA:-HEAD}/pulls" --jq '.[0].number // empty' 2>/dev/null || echo "")
+        if [ -z "$PR" ]; then
+          echo "No PR found for ${SHORT_SHA:-target} — skipping comment (stage: $STAGE)"
+          exit 0
+        fi
+
+        # Avoid a heredoc: YAML block-scalar indentation would render as a
+        # markdown code block. Build the comment line by line.
+        {
+          echo "🚨 **${TITLE}** for \`${SHORT_SHA}\`"
+          echo
+          echo "**Failed at:** ${STAGE}"
+          echo
+          echo "[View failed run](${LOG_URL})"
+          if [ -n "$FOOTER" ]; then
+            echo
+            echo "$FOOTER"
+          fi
+        } > /tmp/comment.md
+
+        gh pr comment "$PR" --body-file /tmp/comment.md
+        echo "Commented on PR #$PR (stage: $STAGE)"

@@ -1,0 +1,89 @@
+name: Start GitHub Deployment
+description: >-
+  Create a GitHub Deployment for a commit SHA and immediately mark it
+  in_progress. Extracted from the "Create GitHub Deployment" + "Mark deployment
+  in_progress" steps duplicated across the staging and production deploy
+  reusables. Returns the deployment id for the matching gh-deployment-finish
+  step to post a terminal status against.
+
+  `github.repository`/`github.run_id`/`github.server_url` resolve to the
+  workflow run's repo (the app repo when invoked from a reusable workflow), so
+  the deployment is created on the right repository automatically. The token is
+  passed in (composite actions can't read `secrets.*`).
+
+inputs:
+  github_token:
+    description: "Token with `deployments: write` on the target repo (usually secrets.GITHUB_TOKEN)."
+    required: true
+  environment:
+    description: GitHub Environment name (e.g. staging / production).
+    required: true
+  sha:
+    description: Commit SHA to deploy.
+    required: true
+  production_environment:
+    description: '"true" for production environments, "false" otherwise. Parsed as a JSON boolean.'
+    required: false
+    default: "false"
+  description:
+    description: Human-readable deployment description.
+    required: false
+    default: ""
+  log_url:
+    description: Log URL for the in_progress status. Defaults to this workflow run.
+    required: false
+    default: ""
+
+outputs:
+  deployment_id:
+    description: The created GitHub Deployment id.
+    value: ${{ steps.create.outputs.deployment_id }}
+
+runs:
+  using: composite
+  steps:
+    - name: Create GitHub Deployment
+      id: create
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        ENVIRONMENT: ${{ inputs.environment }}
+        SHA: ${{ inputs.sha }}
+        PROD_ENV: ${{ inputs.production_environment }}
+        DESCRIPTION: ${{ inputs.description }}
+      run: |
+        set -euo pipefail
+        DESC="${DESCRIPTION:-Deploy for $SHA}"
+        # `required_contexts` must be a JSON array and `production_environment`
+        # a JSON boolean, so build the body with jq and pipe it to gh.
+        BODY=$(jq -n \
+          --arg ref "$SHA" \
+          --arg env "$ENVIRONMENT" \
+          --argjson prod "$PROD_ENV" \
+          --arg desc "$DESC" \
+          '{ref: $ref, environment: $env, production_environment: $prod, auto_merge: false, required_contexts: [], description: $desc}')
+
+        DEPLOY_ID=$(echo "$BODY" | gh api repos/${{ github.repository }}/deployments \
+          --method POST --input - --jq '.id')
+
+        if [ -z "$DEPLOY_ID" ] || [ "$DEPLOY_ID" = "null" ]; then
+          echo "::error::Failed to create GitHub deployment"
+          exit 1
+        fi
+        echo "deployment_id=$DEPLOY_ID" >> "$GITHUB_OUTPUT"
+        echo "Created GitHub Deployment $DEPLOY_ID"
+
+    - name: Mark deployment in_progress
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        ENVIRONMENT: ${{ inputs.environment }}
+        LOG_URL: ${{ inputs.log_url }}
+      run: |
+        set -euo pipefail
+        RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        gh api "repos/${{ github.repository }}/deployments/${{ steps.create.outputs.deployment_id }}/statuses" \
+          -f state="in_progress" \
+          -f environment="$ENVIRONMENT" \
+          -f description="Deploy started" \
+          -f log_url="${LOG_URL:-$RUN_URL}"
