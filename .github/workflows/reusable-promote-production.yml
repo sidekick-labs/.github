@@ -181,7 +181,9 @@ jobs:
           # `gh api --jq` runs jq but doesn't accept `--arg`, so pipe the raw
           # JSON to standalone jq with the workflow name passed safely as a
           # jq variable (the caller's CI workflow may not be named "CI").
-          COUNT=$(gh api "repos/${{ github.repository }}/actions/runs?head_sha=${TARGET}&status=success" \
+          # per_page=100 so the matching CI run can't fall off the default
+          # first page on a SHA with many workflow runs (re-runs, many workflows).
+          COUNT=$(gh api "repos/${{ github.repository }}/actions/runs?head_sha=${TARGET}&status=success&per_page=100" \
             | jq --arg name "$CI_WORKFLOW_NAME" '[.workflow_runs[] | select(.name == $name)] | length')
           if [ "$COUNT" -eq 0 ]; then
             echo "::error::No successful '${CI_WORKFLOW_NAME}' run found for ${TARGET:0:7} — has it completed on main?"

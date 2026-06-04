@@ -29,8 +29,19 @@ runs:
         REGISTRY: ${{ inputs.registry }}
       run: |
         set -euo pipefail
-        if ! doctl registry repository list-tags "$IMAGE_REPO" \
-              --registry "$REGISTRY" --output json \
+        # doctl list-tags auto-paginates (PaginateResp), so this returns ALL
+        # tags, not just the first page.
+        #
+        # Separate the registry call from the tag check so a DOCR/auth failure
+        # doesn't masquerade as "tag absent". Both still fail closed (exit 1) —
+        # we never deploy a SHA we can't positively confirm — but the logs name
+        # the real cause.
+        if ! TAGS_JSON=$(doctl registry repository list-tags "$IMAGE_REPO" \
+              --registry "$REGISTRY" --output json); then
+          echo "::error::Could not list tags for ${IMAGE_REPO} in DOCR (registry unreachable or auth failed)"
+          exit 1
+        fi
+        if ! echo "$TAGS_JSON" \
             | jq -e --arg tag "$TAG" '[.[] | select(.tag == $tag)] | length > 0' >/dev/null; then
           echo "::error::Image ${IMAGE_REPO}:${TAG:0:7} not found in DOCR — staging deploy must run first"
           exit 1
