@@ -15,12 +15,12 @@ name: Reusable — Deploy to DO App Platform (production)
 # `deployments: write` and `pull-requests: write` (plus `contents: read`), or
 # the "Create GitHub Deployment" step 403s and fails the deploy.
 #
-# VERSION PINNING (known boundary): the composite actions this workflow calls
-# (docr-image-exists, gh-deployment-start/-finish, do-app-deploy,
-# deploy-failure-comment) are referenced `@main`. A nested `uses: …@main`
-# resolves at main HEAD regardless of the ref a caller pinned THIS reusable to,
-# so a caller's SHA pin reproduces the wiring but not the composite step logic.
-# Hardening is a deliberate post-merge pin of these refs to the merge SHA.
+# VERSION PINNING: the composite actions this workflow calls (docr-image-exists,
+# gh-deployment-start/-finish, do-app-deploy, deploy-failure-comment) are pinned
+# to a commit SHA on this repo's `main`, bumped deliberately via PR. A nested
+# `uses: …@main` would resolve at main HEAD regardless of the ref a caller pinned
+# THIS reusable to, so a caller's SHA pin would reproduce the wiring but not the
+# composite step logic. Bump these pins in lockstep when the actions change.
 
 on:
   workflow_call:
@@ -86,7 +86,7 @@ jobs:
         id: image_check
         # Production reuses the image staging built for this SHA — confirm it
         # exists before touching the live app.
-        uses: sidekick-labs/.github/.github/actions/docr-image-exists@main
+        uses: sidekick-labs/.github/.github/actions/docr-image-exists@17fd99baeb58a821622ee8b7013dc7b7add807d5 # 17fd99b — pinned, bump via PR
         with:
           image_repo: ${{ inputs.image_repo }}
           tag: ${{ inputs.deploy_sha }}
@@ -94,7 +94,7 @@ jobs:
 
       - name: Create GitHub Deployment + mark in_progress
         id: deployment
-        uses: sidekick-labs/.github/.github/actions/gh-deployment-start@main
+        uses: sidekick-labs/.github/.github/actions/gh-deployment-start@17fd99baeb58a821622ee8b7013dc7b7add807d5 # 17fd99b — pinned, bump via PR
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           environment: ${{ inputs.environment }}
@@ -106,7 +106,7 @@ jobs:
         id: do_deploy
         # Shared composite action — referenced by explicit repo path (not `./`)
         # so it resolves from THIS repo regardless of the caller's checkout.
-        uses: sidekick-labs/.github/.github/actions/do-app-deploy@main
+        uses: sidekick-labs/.github/.github/actions/do-app-deploy@17fd99baeb58a821622ee8b7013dc7b7add807d5 # 17fd99b — pinned, bump via PR
         with:
           app_id: ${{ inputs.app_id }}
           image_repo: ${{ inputs.image_repo }}
@@ -120,7 +120,7 @@ jobs:
 
       - name: Post final deployment status
         if: always() && steps.deployment.outputs.deployment_id != ''
-        uses: sidekick-labs/.github/.github/actions/gh-deployment-finish@main
+        uses: sidekick-labs/.github/.github/actions/gh-deployment-finish@17fd99baeb58a821622ee8b7013dc7b7add807d5 # 17fd99b — pinned, bump via PR
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           deployment_id: ${{ steps.deployment.outputs.deployment_id }}
@@ -152,7 +152,7 @@ jobs:
 
       - name: Comment on merged PR when deploy fails
         if: failure()
-        uses: sidekick-labs/.github/.github/actions/deploy-failure-comment@main
+        uses: sidekick-labs/.github/.github/actions/deploy-failure-comment@17fd99baeb58a821622ee8b7013dc7b7add807d5 # 17fd99b — pinned, bump via PR
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           sha: ${{ inputs.deploy_sha }}
