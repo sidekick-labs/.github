@@ -14,6 +14,13 @@ name: Reusable — Deploy to DO App Platform (production)
 # NARROWED here, never elevated — the calling job/workflow must itself grant
 # `deployments: write` and `pull-requests: write` (plus `contents: read`), or
 # the "Create GitHub Deployment" step 403s and fails the deploy.
+#
+# VERSION PINNING (known boundary): the composite actions this workflow calls
+# (docr-image-exists, gh-deployment-start/-finish, do-app-deploy,
+# deploy-failure-comment) are referenced `@main`. A nested `uses: …@main`
+# resolves at main HEAD regardless of the ref a caller pinned THIS reusable to,
+# so a caller's SHA pin reproduces the wiring but not the composite step logic.
+# Hardening is a deliberate post-merge pin of these refs to the merge SHA.
 
 on:
   workflow_call:
@@ -51,7 +58,6 @@ on:
 permissions:
   contents: read
   deployments: write
-  actions: read
   # Required for `gh pr comment` in the failure-notification step.
   pull-requests: write
 

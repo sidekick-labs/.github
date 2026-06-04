@@ -23,11 +23,22 @@ name: Reusable — Promote to Production
 #   Plus: the App installed on the caller repo + on the `production` ruleset
 #   bypass list, and the caller's production deploy workflow filename.
 #
+# DISPATCH CONTRACT: the deploy is dispatched with `--field ref=<sha>`, so the
+# caller's production deploy workflow (deploy_production_workflow) MUST live on
+# the default branch and expose a `workflow_dispatch` input named `ref`, then
+# forward it to the production reusable's `deploy_sha`. A mismatch fails the
+# dispatch AFTER the FF-push (production advanced, deploy never started).
+#
 # Also: a reusable workflow's GITHUB_TOKEN permissions can only be NARROWED
 # here, never elevated — the calling job/workflow must itself grant
 # `actions: write` (to dispatch the production deploy) and `pull-requests: write`
 # (plus `contents: read`). Without actions:write the FF-push succeeds but the
 # deploy is never dispatched (production silently stays on the old image).
+#
+# VERSION PINNING (known boundary): the composite actions this workflow calls
+# (docr-image-exists, deploy-failure-comment) are referenced `@main`, which
+# resolves at main HEAD regardless of the ref a caller pinned THIS reusable to.
+# Hardening is a deliberate post-merge pin of these refs to the merge SHA.
 
 on:
   workflow_call:
@@ -138,6 +149,14 @@ jobs:
         id: target
         run: |
           set -euo pipefail
+          # Ensure refs/remotes/origin/main exists regardless of which ref this
+          # workflow was dispatched from. actions/checkout only populates the
+          # tracking ref for the checked-out branch, so a dispatch from a tag or
+          # the production branch would otherwise leave origin/main absent and
+          # the ancestor check below would error ("not a valid object name")
+          # instead of gating cleanly.
+          git fetch --no-tags origin main:refs/remotes/origin/main
+
           # TARGET_SHA is always non-empty: the env default resolves to
           # github.sha when no ref is supplied. Normalise short → full SHA.
           TARGET=$(git rev-parse "${TARGET_SHA}")
@@ -218,6 +237,10 @@ jobs:
           # Detect re-promote of an already-deployed SHA so the next step can
           # skip the redundant dispatch (~10-15 min DO re-apply). The plain
           # push itself is a no-op when production already points at TARGET.
+          # Best-effort fetch first so the no-op detection is reliable even when
+          # checkout didn't populate the tracking ref; tolerated-missing on the
+          # first-ever release (production branch doesn't exist yet).
+          git fetch --no-tags origin production:refs/remotes/origin/production 2>/dev/null || true
           PROD_SHA=$(git rev-parse refs/remotes/origin/production 2>/dev/null || echo "")
           if [ -n "$PROD_SHA" ] && [ "$PROD_SHA" = "$TARGET" ]; then
             echo "already_at_target=true" >> "$GITHUB_OUTPUT"

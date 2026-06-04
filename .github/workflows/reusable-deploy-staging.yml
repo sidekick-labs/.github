@@ -22,6 +22,15 @@ name: Reusable — Deploy to DO App Platform (staging)
 # default `contents: read`). Without them the "Create GitHub Deployment" step
 # 403s and fails the deploy. Pass `secrets: inherit` (or DIGITALOCEAN_ACCESS_TOKEN
 # explicitly).
+#
+# VERSION PINNING (known boundary): the composite actions this workflow calls
+# (do-app-deploy, gh-deployment-start/-finish, deploy-failure-comment) are
+# referenced `@main`. A nested `uses: …@main` always resolves at main HEAD,
+# regardless of the ref a caller pinned THIS reusable to — so pinning the
+# reusable at a SHA reproduces the workflow wiring but NOT the composite step
+# logic, which tracks main. (`./` can't fix this: in a reusable workflow it
+# resolves against the caller's checkout, not this repo.) Hardening is a
+# deliberate post-merge pin of these refs to the merge SHA.
 
 on:
   workflow_call:
@@ -82,7 +91,6 @@ on:
 permissions:
   contents: read
   deployments: write
-  actions: read
   # Required for `gh pr comment` in the failure-notification step.
   pull-requests: write
 
