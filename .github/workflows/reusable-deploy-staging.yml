@@ -96,9 +96,11 @@ jobs:
     environment: ${{ inputs.environment }}
 
     env:
+      # Only the Summary step reads these from job env now; the deployment
+      # lifecycle, image, and environment values are passed to the composites
+      # as inputs.
       DEPLOY_SHA: ${{ inputs.deploy_sha }}
       APP_URL: ${{ inputs.app_url }}
-      ENVIRONMENT: ${{ inputs.environment }}
 
     steps:
       - name: Checkout
@@ -140,44 +142,15 @@ jobs:
           cache-from: type=registry,ref=registry.digitalocean.com/${{ inputs.registry }}/${{ inputs.image_repo }}:cache
           cache-to: type=registry,ref=registry.digitalocean.com/${{ inputs.registry }}/${{ inputs.image_repo }}:cache,mode=max
 
-      - name: Create GitHub Deployment
+      - name: Create GitHub Deployment + mark in_progress
         id: deployment
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          # `required_contexts` must be a JSON array, not a string, so we
-          # build the request body as JSON and pipe it to `gh api --input -`.
-          BODY=$(jq -n \
-            --arg ref "$DEPLOY_SHA" \
-            --arg env "$ENVIRONMENT" \
-            --arg desc "Staging deploy for $DEPLOY_SHA" \
-            '{ref: $ref, environment: $env, production_environment: false, auto_merge: false, required_contexts: [], description: $desc}')
-
-          DEPLOY_ID=$(echo "$BODY" | gh api repos/${{ github.repository }}/deployments \
-            --method POST \
-            --input - \
-            --jq '.id')
-
-          if [ -z "$DEPLOY_ID" ] || [ "$DEPLOY_ID" = "null" ]; then
-            echo "::error::Failed to create GitHub deployment"
-            exit 1
-          fi
-
-          echo "deployment_id=$DEPLOY_ID" >> "$GITHUB_OUTPUT"
-          echo "Created GitHub Deployment $DEPLOY_ID"
-
-      - name: Mark deployment in_progress
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          gh api "repos/${{ github.repository }}/deployments/${{ steps.deployment.outputs.deployment_id }}/statuses" \
-            -f state="in_progress" \
-            -f environment="$ENVIRONMENT" \
-            -f description="Deploy started" \
-            -f log_url="$RUN_URL"
+        uses: sidekick-labs/.github/.github/actions/gh-deployment-start@main
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          environment: ${{ inputs.environment }}
+          sha: ${{ inputs.deploy_sha }}
+          production_environment: "false"
+          description: Staging deploy for ${{ inputs.deploy_sha }}
 
       - name: Patch appspec & deploy to DigitalOcean
         id: do_deploy
@@ -203,51 +176,24 @@ jobs:
 
       - name: Post final deployment status
         if: always() && steps.deployment.outputs.deployment_id != ''
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          JOB_STATUS="${{ job.status }}"
-          DO_PHASE="${{ steps.do_deploy.outputs.phase }}"
-          DO_DEPLOY_ID="${{ steps.do_deploy.outputs.do_deploy_id }}"
-          DO_URL="${{ steps.do_deploy.outputs.do_deploy_url }}"
-          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          # Prefer the DO deployment URL — one click closer to the deploy logs.
-          LOG_URL="${DO_URL:-$RUN_URL}"
+        uses: sidekick-labs/.github/.github/actions/gh-deployment-finish@main
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          deployment_id: ${{ steps.deployment.outputs.deployment_id }}
+          environment: ${{ inputs.environment }}
+          app_url: ${{ inputs.app_url }}
+          job_status: ${{ job.status }}
+          do_phase: ${{ steps.do_deploy.outputs.phase }}
+          do_deploy_id: ${{ steps.do_deploy.outputs.do_deploy_id }}
+          do_deploy_url: ${{ steps.do_deploy.outputs.do_deploy_url }}
 
-          if [ "$JOB_STATUS" = "success" ]; then
-            STATE="success"
-            DESC="Deployed to ${ENVIRONMENT} (phase=${DO_PHASE:-N/A}, deployment $DO_DEPLOY_ID)"
-          elif [ "$JOB_STATUS" = "cancelled" ]; then
-            STATE="error"
-            DESC="Deploy workflow cancelled"
-          else
-            STATE="failure"
-            DESC="Deploy workflow failed (phase=${DO_PHASE:-N/A}, deployment $DO_DEPLOY_ID)"
-          fi
-
-          # environment_url is set unconditionally — DO auto-rolls back failed
-          # deploys, so the URL still points at a working (previous) version.
-          gh api "repos/${{ github.repository }}/deployments/${{ steps.deployment.outputs.deployment_id }}/statuses" \
-            -f state="$STATE" \
-            -f environment="$ENVIRONMENT" \
-            -f description="$DESC" \
-            -f environment_url="$APP_URL" \
-            -f log_url="$LOG_URL"
-
-          echo "Posted final deployment status: $STATE"
-
-      - name: Comment on merged PR when deploy fails
+      - name: Classify failure stage
+        id: stage
         if: failure()
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PHASE: ${{ steps.do_deploy.outputs.phase }}
         run: |
-          SHA="$DEPLOY_SHA"
-          LOG_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          PHASE="${{ steps.do_deploy.outputs.phase }}"
-          SHORT_SHA="${SHA:0:7}"
-
-          # Identify which stage failed by walking the pipeline in order.
+          # Walk the pipeline in order; first failed step names the stage.
           if [ "${{ steps.checkout.outcome }}" = "failure" ]; then
             STAGE="repository checkout"
           elif [ "${{ steps.build_push.outcome }}" = "failure" ]; then
@@ -255,34 +201,25 @@ jobs:
           elif [ "${{ steps.deployment.outcome }}" = "failure" ]; then
             STAGE="GitHub deployment API call"
           elif [ "${{ steps.do_deploy.outcome }}" = "failure" ]; then
-            # The do-app-deploy composite action hard-fails only at the
-            # appspec fetch/patch stage. The deploy/poll phase always exits 0
-            # and reports via the `phase` output, handled by the next branch.
+            # do-app-deploy hard-fails only at the appspec fetch/patch stage;
+            # the deploy/poll phase exits 0 and reports via `phase` (next branch).
             STAGE="appspec fetch/patch"
           elif [ -n "$PHASE" ] && [ "$PHASE" != "ACTIVE" ]; then
             STAGE="DigitalOcean deploy (phase: \`${PHASE}\`)"
           else
             STAGE="environment setup (doctl, buildx, registry login, …)"
           fi
+          echo "stage=$STAGE" >> "$GITHUB_OUTPUT"
 
-          # Find the PR that introduced this SHA. Skipped when no PR exists.
-          PR=$(gh api "repos/${{ github.repository }}/commits/${SHA}/pulls" --jq '.[0].number // empty')
-
-          if [ -z "$PR" ]; then
-            echo "No PR found for $SHA — skipping comment (stage: $STAGE)"
-            exit 0
-          fi
-
-          {
-            echo "🚨 **Staging deploy failed** for \`${SHORT_SHA}\`"
-            echo
-            echo "**Failed at:** ${STAGE}"
-            echo
-            echo "[View failed run](${LOG_URL})"
-          } > /tmp/comment.md
-
-          gh pr comment "$PR" --body-file /tmp/comment.md
-          echo "Commented on PR #$PR (stage: $STAGE)"
+      - name: Comment on merged PR when deploy fails
+        if: failure()
+        uses: sidekick-labs/.github/.github/actions/deploy-failure-comment@main
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          sha: ${{ inputs.deploy_sha }}
+          title: Staging deploy failed
+          stage: ${{ steps.stage.outputs.stage }}
+          log_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
       - name: Summary
         if: always()

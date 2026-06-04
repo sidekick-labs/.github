@@ -1,0 +1,38 @@
+name: Verify DOCR image exists
+description: >-
+  Fail if the given image:tag is not present in DigitalOcean Container Registry.
+  Extracted from the "Verify image exists in DOCR" step duplicated in the
+  production deploy reusable and the promote reusable. Requires `doctl` to be
+  installed and authenticated earlier in the job (e.g. via
+  digitalocean/action-doctl).
+
+inputs:
+  image_repo:
+    description: DOCR repository name, e.g. sidekick-inference.
+    required: true
+  tag:
+    description: Image tag to check for (usually the commit SHA).
+    required: true
+  registry:
+    description: DOCR registry name.
+    required: false
+    default: sidekick-labs
+
+runs:
+  using: composite
+  steps:
+    - name: Verify image exists in DOCR
+      shell: bash
+      env:
+        IMAGE_REPO: ${{ inputs.image_repo }}
+        TAG: ${{ inputs.tag }}
+        REGISTRY: ${{ inputs.registry }}
+      run: |
+        set -euo pipefail
+        if ! doctl registry repository list-tags "$IMAGE_REPO" \
+              --registry "$REGISTRY" --output json \
+            | jq -e --arg tag "$TAG" '[.[] | select(.tag == $tag)] | length > 0' >/dev/null; then
+          echo "::error::Image ${IMAGE_REPO}:${TAG:0:7} not found in DOCR — staging deploy must run first"
+          exit 1
+        fi
+        echo "Confirmed ${IMAGE_REPO}:${TAG:0:7} present in DOCR"

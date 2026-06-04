@@ -1,0 +1,78 @@
+name: Finish GitHub Deployment
+description: >-
+  Post the terminal status of a GitHub Deployment from the job's outcome.
+  Extracted from the always()-scoped "Post final deployment status" step
+  duplicated across the staging and production deploy reusables. Call this from
+  an `if: always() && <deployment_id> != ''` step so the deployment timeline
+  reflects success, failure, or cancellation.
+
+  environment_url is always set — DigitalOcean auto-rolls back failed deploys,
+  so the URL still points at a working (previous) version even on failure.
+
+inputs:
+  github_token:
+    description: "Token with `deployments: write` on the target repo."
+    required: true
+  deployment_id:
+    description: The GitHub Deployment id from gh-deployment-start.
+    required: true
+  environment:
+    description: GitHub Environment name.
+    required: true
+  app_url:
+    description: Environment URL to attach to the status.
+    required: true
+  job_status:
+    description: The calling job's status (`${{ job.status }}`) — success / failure / cancelled.
+    required: true
+  do_phase:
+    description: Final DigitalOcean deploy phase, for the description.
+    required: false
+    default: ""
+  do_deploy_id:
+    description: DigitalOcean deployment id, for the description.
+    required: false
+    default: ""
+  do_deploy_url:
+    description: DigitalOcean deployment URL — preferred as the status log_url when present.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Post final deployment status
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        ENVIRONMENT: ${{ inputs.environment }}
+        APP_URL: ${{ inputs.app_url }}
+        JOB_STATUS: ${{ inputs.job_status }}
+        DO_PHASE: ${{ inputs.do_phase }}
+        DO_DEPLOY_ID: ${{ inputs.do_deploy_id }}
+        DO_URL: ${{ inputs.do_deploy_url }}
+      run: |
+        set -euo pipefail
+        RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        # Prefer the DO deployment URL — one click closer to the deploy logs.
+        LOG_URL="${DO_URL:-$RUN_URL}"
+
+        if [ "$JOB_STATUS" = "success" ]; then
+          STATE="success"
+          DESC="Deployed to ${ENVIRONMENT} (phase=${DO_PHASE:-N/A}, deployment ${DO_DEPLOY_ID})"
+        elif [ "$JOB_STATUS" = "cancelled" ]; then
+          STATE="error"
+          DESC="Deploy workflow cancelled"
+        else
+          STATE="failure"
+          DESC="Deploy workflow failed (phase=${DO_PHASE:-N/A}, deployment ${DO_DEPLOY_ID})"
+        fi
+
+        gh api "repos/${{ github.repository }}/deployments/${{ inputs.deployment_id }}/statuses" \
+          -f state="$STATE" \
+          -f environment="$ENVIRONMENT" \
+          -f description="$DESC" \
+          -f environment_url="$APP_URL" \
+          -f log_url="$LOG_URL"
+
+        echo "Posted final deployment status: $STATE"

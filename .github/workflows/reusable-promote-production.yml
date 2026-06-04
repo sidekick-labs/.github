@@ -104,8 +104,9 @@ jobs:
     env:
       DO_PRODUCTION_APP_ID: ${{ inputs.do_production_app_id }}
       TARGET_SHA: ${{ inputs.target_ref || github.sha }}
+      # Used by the dry-run summary; the DOCR image check now takes image_repo /
+      # registry as composite inputs.
       IMAGE_REPO: ${{ inputs.image_repo }}
-      REGISTRY: ${{ inputs.registry }}
 
     steps:
       - name: Mint GitHub App installation token
@@ -179,16 +180,11 @@ jobs:
         # Done here (not at deploy time) so we fail BEFORE FF-pushing to
         # production — otherwise we'd advance production to a SHA the deploy
         # can't roll out.
-        run: |
-          set -euo pipefail
-          TAG="${{ steps.target.outputs.sha }}"
-          if ! doctl registry repository list-tags "$IMAGE_REPO" \
-                --registry "$REGISTRY" --output json \
-              | jq -e --arg tag "$TAG" '[.[] | select(.tag == $tag)] | length > 0' >/dev/null; then
-            echo "::error::Image ${IMAGE_REPO}:${TAG:0:7} not found in DOCR — staging deploy must run first"
-            exit 1
-          fi
-          echo "Confirmed ${IMAGE_REPO}:${TAG:0:7} present in DOCR"
+        uses: sidekick-labs/.github/.github/actions/docr-image-exists@main
+        with:
+          image_repo: ${{ inputs.image_repo }}
+          tag: ${{ steps.target.outputs.sha }}
+          registry: ${{ inputs.registry }}
 
       - name: Check production app id is configured
         id: app_check
@@ -272,16 +268,10 @@ jobs:
             fi
           } > "$GITHUB_STEP_SUMMARY"
 
-      - name: Comment on merged PR when promote fails
+      - name: Classify failure stage
+        id: stage
         if: failure()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -euo pipefail
-          SHA="${{ steps.target.outputs.sha }}"
-          LOG_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          SHORT_SHA="${SHA:0:7}"
-
           if [ "${{ steps.app_token.outcome }}" = "failure" ]; then
             STAGE="GitHub App token mint (release_bot_client_id / RELEASE_BOT_PRIVATE_KEY missing/invalid, or App not installed)"
           elif [ "${{ steps.checkout.outcome }}" = "failure" ]; then
@@ -301,22 +291,15 @@ jobs:
           else
             STAGE="environment setup (doctl install, registry auth, …)"
           fi
+          echo "stage=$STAGE" >> "$GITHUB_OUTPUT"
 
-          PR=$(gh api "repos/${{ github.repository }}/commits/${SHA:-HEAD}/pulls" --jq '.[0].number // empty' 2>/dev/null || echo "")
-          if [ -z "$PR" ]; then
-            echo "No PR found for ${SHORT_SHA:-target} — skipping comment (stage: $STAGE)"
-            exit 0
-          fi
-
-          {
-            echo "🚨 **Production PROMOTE failed** for \`${SHORT_SHA}\`"
-            echo
-            echo "**Failed at:** ${STAGE}"
-            echo
-            echo "[View failed workflow run](${LOG_URL})"
-            echo
-            echo "Production has NOT been updated. The promote step is what writes to refs/heads/production; nothing downstream of it has run."
-          } > /tmp/comment.md
-
-          gh pr comment "$PR" --body-file /tmp/comment.md
-          echo "Commented on PR #$PR (stage: $STAGE)"
+      - name: Comment on merged PR when promote fails
+        if: failure()
+        uses: sidekick-labs/.github/.github/actions/deploy-failure-comment@main
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          sha: ${{ steps.target.outputs.sha }}
+          title: Production PROMOTE failed
+          stage: ${{ steps.stage.outputs.stage }}
+          log_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          footer: "Production has NOT been updated. The promote step is what writes to refs/heads/production; nothing downstream of it has run."
