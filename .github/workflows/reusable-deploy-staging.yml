@@ -152,7 +152,7 @@ jobs:
 
       - name: Create GitHub Deployment + mark in_progress
         id: deployment
-        uses: sidekick-labs/.github/.github/actions/gh-deployment-start@17fd99baeb58a821622ee8b7013dc7b7add807d5 # 17fd99b — pinned, bump via PR
+        uses: sidekick-labs/.github/.github/actions/gh-deployment-start@9701a0e9a066002d1053bfe4667509472ae943e6 # 9701a0e — pinned, bump via PR
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           environment: ${{ inputs.environment }}
@@ -168,7 +168,7 @@ jobs:
         # what fails the job, keeping do_deploy_id available to the always()
         # status steps. Referenced by explicit repo path (not `./`) so it
         # resolves from THIS repo regardless of the caller's checkout.
-        uses: sidekick-labs/.github/.github/actions/do-app-deploy@17fd99baeb58a821622ee8b7013dc7b7add807d5 # 17fd99b — pinned, bump via PR
+        uses: sidekick-labs/.github/.github/actions/do-app-deploy@9701a0e9a066002d1053bfe4667509472ae943e6 # 9701a0e — pinned, bump via PR
         with:
           app_id: ${{ inputs.app_id }}
           image_repo: ${{ inputs.image_repo }}
@@ -184,7 +184,7 @@ jobs:
 
       - name: Post final deployment status
         if: always() && steps.deployment.outputs.deployment_id != ''
-        uses: sidekick-labs/.github/.github/actions/gh-deployment-finish@17fd99baeb58a821622ee8b7013dc7b7add807d5 # 17fd99b — pinned, bump via PR
+        uses: sidekick-labs/.github/.github/actions/gh-deployment-finish@9701a0e9a066002d1053bfe4667509472ae943e6 # 9701a0e — pinned, bump via PR
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           deployment_id: ${{ steps.deployment.outputs.deployment_id }}
@@ -221,7 +221,7 @@ jobs:
 
       - name: Comment on merged PR when deploy fails
         if: failure()
-        uses: sidekick-labs/.github/.github/actions/deploy-failure-comment@17fd99baeb58a821622ee8b7013dc7b7add807d5 # 17fd99b — pinned, bump via PR
+        uses: sidekick-labs/.github/.github/actions/deploy-failure-comment@9701a0e9a066002d1053bfe4667509472ae943e6 # 9701a0e — pinned, bump via PR
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           sha: ${{ inputs.deploy_sha }}
