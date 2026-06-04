@@ -8,12 +8,20 @@ name: Reusable — Deploy to DO App Platform (staging)
 #
 # Extracted from sidekick-inference's inline deploy-staging.yml (itself copied
 # from sidekick-harness). Repo-specific values are inputs so harness/web can
-# adopt it too. No Sentry — callers that want sourcemap upload pass build_args
-# / build secrets through their own build, or we add an input later.
+# adopt it too. No Sentry by default — a caller that needs sourcemap upload (or
+# any build-time secret) passes it via the `build_secrets` input and gates the
+# upload inside its own Dockerfile/build config.
 #
 # The trigger (workflow_run on CI / workflow_dispatch) and the CI-success gate
 # live in the CALLER — a reusable workflow can only be entered via
 # workflow_call, so the caller resolves `deploy_sha` and passes it in.
+#
+# CALLER SETUP: a reusable workflow's GITHUB_TOKEN permissions can only be
+# NARROWED by this file, never elevated — so the calling job (or workflow) must
+# itself grant `deployments: write` and `pull-requests: write` (plus the
+# default `contents: read`). Without them the "Create GitHub Deployment" step
+# 403s and fails the deploy. Pass `secrets: inherit` (or DIGITALOCEAN_ACCESS_TOKEN
+# explicitly).
 
 on:
   workflow_call:
@@ -50,7 +58,15 @@ on:
         type: string
         default: .
       build_args:
-        description: "Docker build args (multiline KEY=VALUE). Do NOT pass secrets here."
+        description: "Docker build args (multiline KEY=VALUE). Do NOT pass secrets here — visible in `docker history`."
+        required: false
+        type: string
+        default: ""
+      build_secrets:
+        description: |
+          BuildKit secrets passed to the build (multiline KEY=VALUE). Mounted
+          only during build, never written to image layers or metadata.
+          Reference in the Dockerfile with `RUN --mount=type=secret,id=KEY ...`.
         required: false
         type: string
         default: ""
@@ -94,24 +110,14 @@ jobs:
           ref: ${{ inputs.deploy_sha }}
 
       - name: Install doctl
-        run: |
-          DOCTL_VERSION=1.115.0
-          # Pinned SHA-256 of doctl-1.115.0-linux-amd64.tar.gz, taken from
-          # https://github.com/digitalocean/doctl/releases/download/v1.115.0/doctl-1.115.0-checksums.sha256
-          DOCTL_SHA256=2f45043698dbb28b8e27c213ab1999a457210d49202650d3f21168642e0489b5
-          TARBALL="doctl-${DOCTL_VERSION}-linux-amd64.tar.gz"
-
-          wget -q "https://github.com/digitalocean/doctl/releases/download/v${DOCTL_VERSION}/${TARBALL}"
-          echo "${DOCTL_SHA256}  ${TARBALL}" | sha256sum -c -
-          tar xzf "$TARBALL"
-          sudo mv doctl /usr/local/bin/
-          rm -f "$TARBALL"
-          doctl version
-
-      - name: Authenticate doctl
-        env:
-          DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
-        run: doctl auth init --access-token "$DIGITALOCEAN_ACCESS_TOKEN" >/dev/null
+        # Use the org-standard action (same SHA-pinned version as the
+        # production / promote reusables) instead of a hand-rolled tarball, so
+        # doctl provisioning is identical across all three files. It installs +
+        # auths doctl; auth persists under $HOME for the DOCR login and the
+        # do-app-deploy composite below.
+        uses: digitalocean/action-doctl@3cb3953159719656269e044e0e24ca16dd2a690f # v2.5.2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
 
       - name: Login to DOCR
         # 1 hour — covers cold-cache builds which can exceed the 20 min default.
@@ -128,6 +134,7 @@ jobs:
           file: ${{ inputs.dockerfile }}
           push: true
           build-args: ${{ inputs.build_args }}
+          secrets: ${{ inputs.build_secrets }}
           tags: |
             registry.digitalocean.com/${{ inputs.registry }}/${{ inputs.image_repo }}:${{ inputs.deploy_sha }}
           cache-from: type=registry,ref=registry.digitalocean.com/${{ inputs.registry }}/${{ inputs.image_repo }}:cache

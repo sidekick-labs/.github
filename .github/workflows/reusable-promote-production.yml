@@ -22,6 +22,12 @@ name: Reusable — Promote to Production
 #   - vars.DO_PRODUCTION_APP_ID       → input  do_production_app_id
 #   Plus: the App installed on the caller repo + on the `production` ruleset
 #   bypass list, and the caller's production deploy workflow filename.
+#
+# Also: a reusable workflow's GITHUB_TOKEN permissions can only be NARROWED
+# here, never elevated — the calling job/workflow must itself grant
+# `actions: write` (to dispatch the production deploy) and `pull-requests: write`
+# (plus `contents: read`). Without actions:write the FF-push succeeds but the
+# deploy is never dispatched (production silently stays on the old image).
 
 on:
   workflow_call:
@@ -53,6 +59,11 @@ on:
         required: false
         type: string
         default: deploy-production.yml
+      ci_workflow_name:
+        description: "Name (the workflow's `name:`, not filename) of the CI run whose success gates promotion."
+        required: false
+        type: string
+        default: CI
       environment:
         description: "GitHub Environment that gates the release decision."
         required: false
@@ -143,16 +154,20 @@ jobs:
         id: ci_check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_WORKFLOW_NAME: ${{ inputs.ci_workflow_name }}
         run: |
           set -euo pipefail
           TARGET="${{ steps.target.outputs.sha }}"
+          # `gh api --jq` runs jq but doesn't accept `--arg`, so pipe the raw
+          # JSON to standalone jq with the workflow name passed safely as a
+          # jq variable (the caller's CI workflow may not be named "CI").
           COUNT=$(gh api "repos/${{ github.repository }}/actions/runs?head_sha=${TARGET}&status=success" \
-            --jq '[.workflow_runs[] | select(.name == "CI")] | length')
+            | jq --arg name "$CI_WORKFLOW_NAME" '[.workflow_runs[] | select(.name == $name)] | length')
           if [ "$COUNT" -eq 0 ]; then
-            echo "::error::No successful CI run found for ${TARGET:0:7} — has main CI completed?"
+            echo "::error::No successful '${CI_WORKFLOW_NAME}' run found for ${TARGET:0:7} — has it completed on main?"
             exit 1
           fi
-          echo "CI passed on ${TARGET:0:7} ($COUNT successful run(s))"
+          echo "'${CI_WORKFLOW_NAME}' passed on ${TARGET:0:7} ($COUNT successful run(s))"
 
       - name: Install doctl
         uses: digitalocean/action-doctl@3cb3953159719656269e044e0e24ca16dd2a690f # v2.5.2
