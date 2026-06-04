@@ -10,7 +10,7 @@ name: Codex Agent
 # CAN edit when asked), always post the final message as a reply comment, and —
 # when the request produced changes and release-bot credentials are present —
 # push a signed commit (PR head branch) or open a PR (issue), reusing the
-# signed-commit-via-API pattern from reusable-sentry-autofix.yml.
+# signed-commit-via-API pattern from sre-brain's sentry-autofix-engine.yml.
 
 on:
   workflow_call:
@@ -219,7 +219,7 @@ jobs:
           output-file: ${{ runner.temp }}/codex-out.md
 
       # Commit changes (if any) before composing the comment, so the comment can
-      # link the result. Signed-commit-via-API mirrors reusable-sentry-autofix.yml.
+      # link the result. Signed-commit-via-API mirrors sre-brain's sentry-autofix-engine.yml.
       - name: Apply changes (commit / open PR)
         id: apply
         if: steps.token-check.outputs.skip != 'true'
