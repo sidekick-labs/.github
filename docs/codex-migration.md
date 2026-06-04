@@ -154,8 +154,10 @@ a follow-up, not a phase-2 blocker.
 
 - `codex-agent.yml` — the `@codex` mention responder (workspace-write +
   signed-commit-via-API + comment), with per-repo `codex.yml` wrappers.
-- `engine: codex` branch in `reusable-sentry-autofix.yml` and
-  `reusable-weekly-maintenance.yml` (Linear MCP via `config.toml`, structured
-  triage via `output-schema`, dependency updates as shell steps).
+- `engine: codex` branch in `reusable-weekly-maintenance.yml` (structured
+  triage via `output-schema`, dependency updates as shell steps). NOTE: the
+  sentry-autofix engine moved to `sre-brain/sentry-autofix-engine.yml`
+  (one-workflow-per-org, claude-only — the codex branch was deliberately
+  dropped there; re-add in sre-brain if/when the codex migration resumes).
 - Per-repo wrapper rollout, then removal of the Claude workflows and the
   `CLAUDE_CODE_OAUTH_TOKEN` secret.
