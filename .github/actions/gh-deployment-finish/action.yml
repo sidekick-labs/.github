@@ -23,7 +23,7 @@ inputs:
     description: Environment URL to attach to the status.
     required: true
   job_status:
-    description: The calling job's status (`${{ job.status }}`) — success / failure / cancelled.
+    description: The calling job's status (pass `job.status` from the workflow) — success / failure / cancelled.
     required: true
   do_phase:
     description: Final DigitalOcean deploy phase, for the description.
