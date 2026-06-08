@@ -132,6 +132,7 @@ jobs:
           owner: sidekick-labs
           permission-contents: write
           permission-pull-requests: write
+          permission-issues: write   # open/refresh the ci-audit judgment issues in the sre-brain tracker
           permission-actions: read
           permission-metadata: read
 
