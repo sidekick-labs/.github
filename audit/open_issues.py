@@ -3,8 +3,10 @@
 Open/refresh GitHub issues for the actions-audit's judgment-call findings.
 
 The judgment sink (flakes, slow-failing workflows, burners) is a CENTRAL GitHub
-tracker in sidekick-labs/.github (v1 decision) — NOT the audited source repos,
-and NOT Linear (retired). One labelled `ci-audit` issue per finding.
+tracker in sidekick-labs/sre-brain — the infra/CI-health brain that already owns
+health sweeps + weekly retros, so CI-inefficiency findings belong with it. NOT
+the audited source repos, and NOT Linear (retired). One `ci-audit` issue/finding.
+(`.github` was the first pick but has Issues disabled — sre-brain is the home.)
 
 Idempotency mirrors the auto-PR loop's branch-existence dedup: every issue body
 ends with a hidden marker `<!-- actions-audit:<rec_id> -->`. Before creating, we
@@ -27,10 +29,10 @@ import os
 import subprocess
 import sys
 
-# Central judgment tracker (v1). Per-repo routing is the alternative: file in the
-# audited repo (sidekick-release-bot has org-wide issues:write) — switchable by
-# changing this one constant + the issue title.
-TRACKER_REPO = os.environ.get("AUDIT_TRACKER_REPO", "sidekick-labs/.github")
+# Central judgment tracker = sre-brain (infra/CI-health). Per-repo routing is the
+# alternative: file in the audited repo (sidekick-release-bot has org-wide
+# issues:write) — switchable via the AUDIT_TRACKER_REPO env or this default.
+TRACKER_REPO = os.environ.get("AUDIT_TRACKER_REPO", "sidekick-labs/sre-brain")
 LABEL = "ci-audit"
 
 
