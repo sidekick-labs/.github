@@ -9,9 +9,10 @@ name: Weekly Actions Audit
 # (claude | codex), a validate-secrets gate, actions/cache for week-over-week
 # deltas, SHA-pinned third-party actions, and signed PRs.
 #
-# Build-order status (docs/weekly-actions-audit-automation-plan.md): this is
-# steps 2-4 — workflow_dispatch ONLY, no cron. A human runs a single-repo dry-run
-# and reviews the generated PR before cron is enabled (steps 5-6, a later change).
+# Build-order status (docs/weekly-actions-audit-automation-plan.md): this is the
+# go-live — the weekly Monday cron is enabled (steps 5-6). It triggers on a
+# schedule AND workflow_dispatch. The dispatch dry-run path remains for ad-hoc
+# single-repo validation.
 #
 # Auto-PR scope is intentionally narrow: the ONLY auto-PR-able pattern for now is
 # adding a missing top-level `concurrency:` block to a workflow with a >=10%
@@ -21,6 +22,8 @@ name: Weekly Actions Audit
 # Nothing here merges (workspace rule #7).
 
 on:
+  schedule:
+    - cron: '0 1 * * 1'   # Mon 01:00 UTC = 09:00 SGT
   workflow_dispatch:
     inputs:
       engine:
