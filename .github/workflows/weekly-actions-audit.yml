@@ -365,12 +365,12 @@ jobs:
       - name: Post Slack digest
         if: ${{ always() }}
         env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          # TODO: #octo-internal channel id — fill in once known. If the webhook
-          # is a channel-bound Incoming Webhook, the channel is implied and this
-          # is informational only. If using a bot token + chat.postMessage later,
-          # set this to the #octo-internal channel id.
-          OCTO_INTERNAL_CHANNEL: '' # TODO: #octo-internal channel id
+          # Bot-token path (chat.postMessage) — reuses the org SLACK_BOT_TOKEN the
+          # brains post with, rather than a per-channel Incoming Webhook. Requires
+          # the "Sidekick Brains" bot invited to the (private) #octo-internal and
+          # .github added to SLACK_BOT_TOKEN's selected-repo scope.
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          OCTO_INTERNAL_CHANNEL: C0B81ERAXCP   # #octo-internal (private)
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           AUTO_COUNT: ${{ steps.recs.outputs.auto_count }}
           JUDG_COUNT: ${{ steps.recs.outputs.judgment_count }}
@@ -380,8 +380,8 @@ jobs:
           DRY_RUN: ${{ inputs.dry-run }}
         run: |
           set -euo pipefail
-          if [ -z "${SLACK_WEBHOOK_URL:-}" ]; then
-            echo "::warning::SLACK_WEBHOOK_URL not set — skipping Slack digest (run summary still has the report)."
+          if [ -z "${SLACK_BOT_TOKEN:-}" ] || [ -z "${OCTO_INTERNAL_CHANNEL:-}" ]; then
+            echo "::warning::SLACK_BOT_TOKEN or OCTO_INTERNAL_CHANNEL not set — skipping Slack digest (run summary still has the report)."
             exit 0
           fi
           OPENED_FILE="$GITHUB_WORKSPACE/tmp/audit/opened-prs.txt"
@@ -395,7 +395,16 @@ jobs:
           TEXT=$(printf ':broom: *Weekly Actions Audit* (%s)\n*Run:* %s\nAuto-PR-able findings: %s · False positives skipped: %s · Judgment-call -> GitHub ci-audit: %s\n*PRs opened:* %s · *ci-audit issues created:* %s\n\n*Opened PRs:*\n%s' \
             "$MODE" "$RUN_URL" "${AUTO_COUNT:-0}" "${FP_COUNT:-0}" "${JUDG_COUNT:-0}" "${PR_COUNT:-0}" "${ISSUE_COUNT:-0}" "$PR_LINKS")
 
-          curl -fsS -X POST "$SLACK_WEBHOOK_URL" \
-            -H 'Content-Type: application/json' \
-            -d "$(jq -n --arg t "$TEXT" '{text:$t}')" \
-            && echo "Posted Slack digest." || echo "::warning::Slack post failed."
+          # chat.postMessage returns HTTP 200 even on logical errors (e.g.
+          # not_in_channel) — so don't rely on curl -f; parse `.ok`.
+          RESP=$(curl -fsS -X POST https://slack.com/api/chat.postMessage \
+            -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+            -H 'Content-type: application/json; charset=utf-8' \
+            -d "$(jq -n --arg c "$OCTO_INTERNAL_CHANNEL" --arg t "$TEXT" \
+                  '{channel:$c, text:$t, unfurl_links:false, unfurl_media:false}')") \
+            || { echo "::warning::Slack request failed (network/HTTP)."; exit 0; }
+          if [ "$(printf '%s' "$RESP" | jq -r '.ok')" = "true" ]; then
+            echo "Posted Slack digest to $OCTO_INTERNAL_CHANNEL."
+          else
+            echo "::warning::Slack post failed: $(printf '%s' "$RESP" | jq -r '.error // "unknown"')"
+          fi
