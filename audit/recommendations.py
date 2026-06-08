@@ -9,13 +9,17 @@ Reads the findings JSON from audit.py and produces two lists:
                `concurrency:` block to a workflow whose cancel rate is >=10% with
                >=3 cancels (the audit's Lens-4 threshold).
   - judgment:  everything else with signal (flake root-cause, slow-failing
-               workflows, burners) -> routed to the Linear fallback, exactly like
-               reusable-weekly-maintenance's `linear-fallback` mechanism. NOT a
+               workflows, burners) -> routed to a central GitHub-issue tracker in
+               sidekick-labs/.github (the judgment sink; Linear is retired). NOT a
                committed markdown report.
 
-Each auto-PR rec carries a STABLE rec id = short hash(repo, workflow file, change
-type) so the workflow can name the branch `actions-audit/<rec-id>` and stay
-idempotent across weeks (skip if the branch or an open PR with that head exists).
+Each rec (auto-PR AND judgment) carries a STABLE rec id = short hash(repo,
+workflow file, change-type/category). For auto-PR recs the workflow names the
+branch `actions-audit/<rec-id>` and stays idempotent across weeks (skip if the
+branch or an open PR with that head exists). For judgment recs the workflow
+embeds a hidden `<!-- actions-audit:<rec-id> -->` marker in the GitHub issue body
+and searches for it before creating, so re-runs refresh rather than stack
+duplicates — the same idempotency idea applied to issues.
 
 Cheap pre-check (Skill Rule #1): for a `concurrency` rec we fetch the workflow's
 raw YAML via `gh api` and, if a top-level `concurrency:` key is already present,
@@ -56,7 +60,10 @@ _TOP_LEVEL_CONCURRENCY = re.compile(r"(?m)^concurrency\s*:")
 
 
 def rec_id(repo: str, workflow_file: str, change_type: str) -> str:
-    """Stable short id for idempotent branch naming: actions-audit/<rec-id>."""
+    """Stable short id for idempotency. For auto-PR recs `change_type` is the
+    change kind (e.g. add-concurrency) and names the branch actions-audit/<rec-id>;
+    for judgment recs it is the finding `category`, and the id is embedded as the
+    `<!-- actions-audit:<rec-id> -->` issue marker for dedup."""
     h = hashlib.sha256(f"{repo}\0{workflow_file}\0{change_type}".encode()).hexdigest()
     return h[:12]
 
@@ -118,8 +125,8 @@ def partition(data: dict) -> dict:
             # Cheap pre-check (Skill Rule #1): if the YAML already has a
             # top-level concurrency block, this is a false positive — drop it.
             if not wf_path:
-                # Can't locate the file (e.g. run.path was empty) -> route to
-                # Linear for a human rather than blindly opening a PR.
+                # Can't locate the file (e.g. run.path was empty) -> route to a
+                # judgment GitHub issue for a human rather than blindly opening a PR.
                 judgment.append({
                     "repo": repo,
                     "workflow_name": name,
@@ -140,7 +147,7 @@ def partition(data: dict) -> dict:
                 continue
             auto_pr.append(rec)
 
-        # ---- Judgment-call signal -> Linear fallback (not a committed report).
+        # ---- Judgment-call signal -> GitHub-issue tracker (not a committed report).
         if w.get("flake_count", 0) > 0:
             judgment.append({
                 "repo": repo,
@@ -192,6 +199,15 @@ def partition(data: dict) -> dict:
                 "p95_minutes": w.get("p95_minutes", 0),
             },
         })
+
+    # Stamp every judgment rec with a STABLE rec_id = hash(repo, workflow_file,
+    # category) — the same hashing scheme/helper as auto-PR recs, with the
+    # finding `category` as the change-type component. The workflow embeds this id
+    # as a hidden `<!-- actions-audit:<rec-id> -->` marker in the GitHub issue and
+    # dedups on it across runs (refresh, don't stack). Stamped here (one place)
+    # rather than at each of the judgment append sites.
+    for j in judgment:
+        j["rec_id"] = rec_id(j["repo"], j.get("workflow_file", ""), j["category"])
 
     return {
         "generated_at": data.get("generated_at"),

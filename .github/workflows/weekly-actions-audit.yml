@@ -16,8 +16,9 @@ name: Weekly Actions Audit
 # Auto-PR scope is intentionally narrow: the ONLY auto-PR-able pattern for now is
 # adding a missing top-level `concurrency:` block to a workflow with a >=10%
 # cancel rate (>=3 cancels). Everything else (flake root-causes, slow-failing
-# workflows, burners) is routed to a Linear issue (the Linear fallback), never a
-# committed markdown report. Nothing here merges (workspace rule #7).
+# workflows, burners) is routed to a deduped GitHub issue in the central
+# sidekick-labs/.github `ci-audit` tracker, never a committed markdown report.
+# Nothing here merges (workspace rule #7).
 
 on:
   workflow_dispatch:
@@ -40,7 +41,7 @@ on:
         type: string
         default: '7'
       dry-run:
-        description: 'When true, run the audit + partition and post the digest, but do NOT open PRs or Linear issues. Use for the first single-repo validation.'
+        description: 'When true, run the audit + partition and post the digest, but do NOT open PRs or GitHub ci-audit issues. Use for the first single-repo validation.'
         required: false
         type: boolean
         default: false
@@ -181,7 +182,7 @@ jobs:
           {
             echo "## Recommendations partition"
             echo "- Auto-PR-able (concurrency): $AUTO_COUNT"
-            echo "- Judgment-call (-> Linear): $JUDG_COUNT"
+            echo "- Judgment-call (-> GitHub ci-audit issues): $JUDG_COUNT"
             echo "- False positives (already fixed): $FP_COUNT"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -321,62 +322,28 @@ jobs:
         if: ${{ steps.recs.outputs.auto_count != '0' && inputs.dry-run != true && inputs.engine != 'codex' }}
         run: npm install -g @anthropic-ai/claude-code
 
-      # ----- Linear fallback: open a Linear issue per judgment-call finding -----
+      # ----- judgment sink: open/refresh a GitHub ci-audit issue per finding -----
       #
-      # Mirrors weekly-maintenance's `linear-fallback` intent: judgment-call items
-      # (flakes, slow failures, burners) become Linear issues, NOT committed
-      # markdown. Degrades gracefully if LINEAR_API_KEY / team key are unset.
+      # Judgment-call items (flakes, slow failures, burners) become deduped GitHub
+      # issues in the CENTRAL sidekick-labs/.github `ci-audit` tracker (v1
+      # decision — NOT the audited source repos), NOT committed markdown, NOT
+      # Linear (retired). Idempotency mirrors the auto-PR branch-existence dedup:
+      # each issue body carries a hidden `<!-- actions-audit:<rec_id> -->` marker;
+      # open_issues.py searches for it before creating and skips if present.
+      # Uses the minted release-bot token (issues:write org-wide).
 
-      - name: Open Linear issues for judgment-call findings
-        id: linear
+      - name: Open/refresh GitHub issues for judgment-call findings
+        id: issues
         if: ${{ steps.recs.outputs.judgment_count != '0' && inputs.dry-run != true }}
         env:
-          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
-          LINEAR_TEAM_KEY: ${{ vars.ACTIONS_AUDIT_LINEAR_TEAM_KEY }}
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
           RECS_FILE: ${{ github.workspace }}/tmp/audit/recommendations.json
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          if [ -z "${LINEAR_API_KEY:-}" ] || [ -z "${LINEAR_TEAM_KEY:-}" ]; then
-            echo "::warning::LINEAR_API_KEY or ACTIONS_AUDIT_LINEAR_TEAM_KEY not set — skipping Linear fallback. Judgment-call findings are in the run artifacts/summary."
-            echo "issue_count=0" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # Resolve the Linear team id from its key.
-          TEAM_ID=$(curl -fsS -X POST https://api.linear.app/graphql \
-            -H "Authorization: $LINEAR_API_KEY" -H "Content-Type: application/json" \
-            -d "$(jq -n --arg k "$LINEAR_TEAM_KEY" '{query:"query($k:String!){teams(filter:{key:{eq:$k}}){nodes{id}}}", variables:{k:$k}}')" \
-            | jq -r '.data.teams.nodes[0].id // ""')
-          if [ -z "$TEAM_ID" ]; then
-            echo "::warning::could not resolve Linear team for key $LINEAR_TEAM_KEY — skipping"
-            echo "issue_count=0" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-
-          COUNT=$(jq '.judgment | length' "$RECS_FILE")
-          CREATED=0
-          for i in $(seq 0 $((COUNT - 1))); do
-            J=$(jq -c ".judgment[$i]" "$RECS_FILE")
-            REPO=$(jq -r '.repo' <<<"$J")
-            WF=$(jq -r '.workflow_name' <<<"$J")
-            CAT=$(jq -r '.category' <<<"$J")
-            NOTE=$(jq -r '.note' <<<"$J")
-            TITLE="[actions-audit] $REPO · $WF · $CAT"
-            BODY=$(printf '**Repo:** %s\n**Workflow:** %s (`%s`)\n**Category:** %s\n\n%s\n\nFrom the weekly actions-audit: %s' \
-              "$REPO" "$WF" "$(jq -r '.workflow_file' <<<"$J")" "$CAT" "$NOTE" "$RUN_URL")
-            RESP=$(curl -fsS -X POST https://api.linear.app/graphql \
-              -H "Authorization: $LINEAR_API_KEY" -H "Content-Type: application/json" \
-              -d "$(jq -n --arg t "$TITLE" --arg b "$BODY" --arg tm "$TEAM_ID" \
-                '{query:"mutation($t:String!,$b:String!,$tm:String!){issueCreate(input:{title:$t,description:$b,teamId:$tm}){success}}", variables:{t:$t,b:$b,tm:$tm}}')" \
-              || echo '{}')
-            if [ "$(jq -r '.data.issueCreate.success // false' <<<"$RESP")" = "true" ]; then
-              CREATED=$((CREATED + 1))
-            else
-              echo "::warning::Linear issueCreate failed for $TITLE"
-            fi
-          done
-          echo "issue_count=$CREATED" >> "$GITHUB_OUTPUT"
-          echo "Created $CREATED Linear issue(s)." >> "$GITHUB_STEP_SUMMARY"
+          ISSUE_COUNT=$(python3 audit/open_issues.py "$RECS_FILE" --run-url "$RUN_URL")
+          echo "issue_count=$ISSUE_COUNT" >> "$GITHUB_OUTPUT"
+          echo "Created $ISSUE_COUNT GitHub ci-audit issue(s) (existing skipped)." >> "$GITHUB_STEP_SUMMARY"
 
       # ----- artifacts -----
 
@@ -405,7 +372,7 @@ jobs:
           JUDG_COUNT: ${{ steps.recs.outputs.judgment_count }}
           FP_COUNT: ${{ steps.recs.outputs.fp_count }}
           PR_COUNT: ${{ steps.autopr.outputs.pr_count }}
-          LINEAR_COUNT: ${{ steps.linear.outputs.issue_count }}
+          ISSUE_COUNT: ${{ steps.issues.outputs.issue_count }}
           DRY_RUN: ${{ inputs.dry-run }}
         run: |
           set -euo pipefail
@@ -419,10 +386,10 @@ jobs:
             PR_LINKS=$(sed 's/^/• /' "$OPENED_FILE")
           fi
           MODE="live"
-          [ "${DRY_RUN:-false}" = "true" ] && MODE="DRY-RUN (no PRs/Linear)"
+          [ "${DRY_RUN:-false}" = "true" ] && MODE="DRY-RUN (no PRs/issues)"
 
-          TEXT=$(printf ':broom: *Weekly Actions Audit* (%s)\n*Run:* %s\nAuto-PR-able findings: %s · False positives skipped: %s · Judgment-call -> Linear: %s\n*PRs opened:* %s · *Linear issues:* %s\n\n*Opened PRs:*\n%s' \
-            "$MODE" "$RUN_URL" "${AUTO_COUNT:-0}" "${FP_COUNT:-0}" "${JUDG_COUNT:-0}" "${PR_COUNT:-0}" "${LINEAR_COUNT:-0}" "$PR_LINKS")
+          TEXT=$(printf ':broom: *Weekly Actions Audit* (%s)\n*Run:* %s\nAuto-PR-able findings: %s · False positives skipped: %s · Judgment-call -> GitHub ci-audit: %s\n*PRs opened:* %s · *ci-audit issues created:* %s\n\n*Opened PRs:*\n%s' \
+            "$MODE" "$RUN_URL" "${AUTO_COUNT:-0}" "${FP_COUNT:-0}" "${JUDG_COUNT:-0}" "${PR_COUNT:-0}" "${ISSUE_COUNT:-0}" "$PR_LINKS")
 
           curl -fsS -X POST "$SLACK_WEBHOOK_URL" \
             -H 'Content-Type: application/json' \
