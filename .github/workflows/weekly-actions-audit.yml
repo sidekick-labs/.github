@@ -91,14 +91,18 @@ jobs:
         run: |
           set -euo pipefail
           # Engine creds (never ANTHROPIC_API_KEY for the claude engine).
+          # Use `[ -n ] || { … }`, not `[ -z ] && { … }`: under `set -e` a `[ -z ]`
+          # test that PASSES (secret present) returns 1 as the branch's last command
+          # and would abort the step even though every secret is set.
           if [ "$ENGINE" = "codex" ]; then
-            [ -z "${CODEX_AUTH_JSON:-}" ] && { echo "::error::engine=codex but CODEX_AUTH_JSON secret is not set"; exit 1; }
+            [ -n "${CODEX_AUTH_JSON:-}" ] || { echo "::error::engine=codex but CODEX_AUTH_JSON secret is not set"; exit 1; }
           else
-            [ -z "${CLAUDE_TOKEN:-}" ] && { echo "::error::engine=claude but CLAUDE_CODE_OAUTH_TOKEN secret is not set"; exit 1; }
+            [ -n "${CLAUDE_TOKEN:-}" ] || { echo "::error::engine=claude but CLAUDE_CODE_OAUTH_TOKEN secret is not set"; exit 1; }
           fi
           # Cross-repo App credentials (sidekick-release-bot) are required to open PRs.
-          [ -z "${APP_ID:-}" ] && { echo "::error::vars.SIDEKICK_RELEASE_BOT_APP_ID is not set"; exit 1; }
-          [ -z "${APP_PRIVATE_KEY:-}" ] && { echo "::error::secrets.SIDEKICK_RELEASE_BOT_PRIVATE_KEY is not set"; exit 1; }
+          [ -n "${APP_ID:-}" ] || { echo "::error::vars.SIDEKICK_RELEASE_BOT_APP_ID is not set"; exit 1; }
+          [ -n "${APP_PRIVATE_KEY:-}" ] || { echo "::error::secrets.SIDEKICK_RELEASE_BOT_PRIVATE_KEY is not set"; exit 1; }
+          echo "required secrets present"
 
       - name: Checkout .github (audit scripts + workflow)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
