@@ -554,7 +554,7 @@ jobs:
       - name: Weekly maintenance
         id: maintenance
         if: ${{ inputs.engine != 'codex' }}
-        uses: anthropics/claude-code-action@bfad70d6a1b6a9a6716dda7303aa912d16ee9e79 # main@2.1.160 (thinking-block 400 fix; ahead of release v1.0.133 — see rarebit-one/rarebit-ops#119)
+        uses: anthropics/claude-code-action@fbda2eb1bdc90d319b8d853f5deb53bca199a7c1 # main@2.1.160 (thinking-block 400 fix; ahead of release v1.0.133 — see rarebit-one/rarebit-ops#119)
         timeout-minutes: ${{ inputs.claude-timeout-minutes }}
         with:
           claude_code_oauth_token: ${{ secrets.claude-code-oauth-token }}
