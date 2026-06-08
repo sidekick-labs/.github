@@ -18,7 +18,7 @@ name: Weekly Actions Audit
 # adding a missing top-level `concurrency:` block to a workflow with a >=10%
 # cancel rate (>=3 cancels). Everything else (flake root-causes, slow-failing
 # workflows, burners) is routed to a deduped GitHub issue in the central
-# sidekick-labs/.github `ci-audit` tracker, never a committed markdown report.
+# sidekick-labs/sre-brain `ci-audit` tracker, never a committed markdown report.
 # Nothing here merges (workspace rule #7).
 
 on:
@@ -328,9 +328,9 @@ jobs:
       # ----- judgment sink: open/refresh a GitHub ci-audit issue per finding -----
       #
       # Judgment-call items (flakes, slow failures, burners) become deduped GitHub
-      # issues in the CENTRAL sidekick-labs/.github `ci-audit` tracker (v1
-      # decision — NOT the audited source repos), NOT committed markdown, NOT
-      # Linear (retired). Idempotency mirrors the auto-PR branch-existence dedup:
+      # issues in the CENTRAL sidekick-labs/sre-brain `ci-audit` tracker (the
+      # infra/CI-health brain — NOT the audited source repos), NOT committed
+      # markdown, NOT Linear (retired). Idempotency mirrors the auto-PR dedup:
       # each issue body carries a hidden `<!-- actions-audit:<rec_id> -->` marker;
       # open_issues.py searches for it before creating and skips if present.
       # Uses the minted release-bot token (issues:write org-wide).
