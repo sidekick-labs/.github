@@ -8,9 +8,10 @@ name: Reusable — Deploy to DO App Platform (staging)
 #
 # Extracted from sidekick-inference's inline deploy-staging.yml (itself copied
 # from sidekick-harness). Repo-specific values are inputs so harness/web can
-# adopt it too. No Sentry by default — a caller that needs sourcemap upload (or
-# any build-time secret) passes it via the `build_secrets` input and gates the
-# upload inside its own Dockerfile/build config.
+# adopt it too. Product-agnostic: non-secret build args go via `build_args`,
+# and an optional single build-time SECRET is wired generically through
+# `build_secret_id` (the BuildKit secret id) + the `BUILD_SECRET_VALUE` secret
+# (e.g. a sourcemap-upload token). No tool-specific names baked in here.
 #
 # The trigger (workflow_run on CI / workflow_dispatch) and the CI-success gate
 # live in the CALLER — a reusable workflow can only be entered via
@@ -79,6 +80,29 @@ on:
         required: false
         type: string
         default: ""
+      build_secret_id:
+        description: |
+          Optional BuildKit secret id to mount during the build (e.g. a
+          sourcemap-upload token id). Its VALUE comes from the BUILD_SECRET_VALUE
+          secret — secrets can't travel through the with: inputs. Empty → no
+          extra secret is mounted. Note: if this id IS set but
+          BUILD_SECRET_VALUE is empty, BuildKit mounts an empty-valued secret
+          (not skipped) — a Dockerfile that hard-requires the content sees an
+          empty mount rather than a missing one. Single-line values only
+          (id=value form); use `build_secrets` for multi-line (PEM-style).
+        required: false
+        type: string
+        default: ""
+      enable_triage:
+        description: |
+          When true, persist the DO deployment ID and upload it as a
+          `triage-context` artifact (`do-deployment-id.txt`) so a downstream
+          post-deploy-triage workflow (workflow_run on this workflow's name)
+          can pinpoint the exact deployment. Off by default — callers without a
+          triage workflow leave it unset.
+        required: false
+        type: boolean
+        default: false
       registry:
         description: "DOCR registry name."
         required: false
@@ -87,6 +111,14 @@ on:
     secrets:
       DIGITALOCEAN_ACCESS_TOKEN:
         required: true
+      BUILD_SECRET_VALUE:
+        description: |
+          Optional value for the BuildKit secret named by `build_secret_id`
+          (e.g. a sourcemap-upload token). Secrets can't travel through the
+          with: inputs, so callers map their own secret here, e.g.
+          `BUILD_SECRET_VALUE: secrets.SENTRY_SOURCEMAP_TOKEN`. Unset →
+          no extra secret is mounted.
+        required: false
 
 permissions:
   contents: read
@@ -144,7 +176,14 @@ jobs:
           file: ${{ inputs.dockerfile }}
           push: true
           build-args: ${{ inputs.build_args }}
-          secrets: ${{ inputs.build_secrets }}
+          # Caller-supplied non-secret build secrets, plus an optional named
+          # build secret wired from the reusable's `secrets:` block (secrets
+          # can't flow through the with: inputs). The ternary omits the line
+          # entirely when no build_secret_id is set, so other callers are
+          # unaffected. Blank lines are harmless — BuildKit skips them.
+          secrets: |
+            ${{ inputs.build_secrets }}
+            ${{ inputs.build_secret_id != '' && format('{0}={1}', inputs.build_secret_id, secrets.BUILD_SECRET_VALUE) || '' }}
           tags: |
             registry.digitalocean.com/${{ inputs.registry }}/${{ inputs.image_repo }}:${{ inputs.deploy_sha }}
           cache-from: type=registry,ref=registry.digitalocean.com/${{ inputs.registry }}/${{ inputs.image_repo }}:cache
@@ -181,6 +220,36 @@ jobs:
         run: |
           echo "::error::Staging deploy did not succeed (phase '${{ steps.do_deploy.outputs.phase }}', expected ACTIVE)"
           exit 1
+
+      - name: Persist DO deployment ID for post-deploy triage
+        # Hand the exact DO deployment ID to a downstream post-deploy-triage
+        # workflow_run via an artifact. Without this, on failure the triage
+        # workflow has to guess which DO deployment is ours — DO auto-rolls back
+        # failed deploys by promoting a new ACTIVE deployment, hiding our ERROR'd
+        # one behind the rollback in `list-deployments`. Always runs (even after
+        # the gate above exits non-zero) so failure-path triage still gets the ID.
+        # Gated on enable_triage so callers without a triage workflow skip it.
+        if: ${{ always() && inputs.enable_triage && steps.do_deploy.outputs.do_deploy_id != '' }}
+        env:
+          DO_DEPLOY_ID: ${{ steps.do_deploy.outputs.do_deploy_id }}
+        run: |
+          mkdir -p /tmp/triage-context
+          printf '%s' "$DO_DEPLOY_ID" > /tmp/triage-context/do-deployment-id.txt
+
+      - name: Upload triage context
+        if: ${{ always() && inputs.enable_triage && steps.do_deploy.outputs.do_deploy_id != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: triage-context
+          path: /tmp/triage-context/
+          # The artifact is only consumed by post-deploy-triage, which fires a
+          # few minutes after the deploy completes. 1 day buffers triage re-runs.
+          retention-days: 1
+          if-no-files-found: warn
+          # On re-run of the same workflow run, the upload would otherwise fail
+          # with "an artifact with this name already exists" — let the rerun
+          # replace it so the latest attempt's deployment ID wins.
+          overwrite: true
 
       - name: Post final deployment status
         if: always() && steps.deployment.outputs.deployment_id != ''
@@ -231,16 +300,19 @@ jobs:
 
       - name: Summary
         if: always()
+        env:
+          DO_DEPLOY_ID: ${{ steps.do_deploy.outputs.do_deploy_id }}
+          DO_DEPLOY_URL: ${{ steps.do_deploy.outputs.do_deploy_url }}
+          DO_PHASE: ${{ steps.do_deploy.outputs.phase }}
         run: |
-          DO_URL="${{ steps.do_deploy.outputs.do_deploy_url }}"
           {
             echo "## Staging deploy"
             echo ""
             echo "- **SHA:** \`$DEPLOY_SHA\`"
-            echo "- **DO deployment:** \`${{ steps.do_deploy.outputs.do_deploy_id }}\`"
-            if [ -n "$DO_URL" ]; then
-              echo "- **DO deploy URL:** $DO_URL"
+            echo "- **DO deployment:** \`$DO_DEPLOY_ID\`"
+            if [ -n "$DO_DEPLOY_URL" ]; then
+              echo "- **DO deploy URL:** $DO_DEPLOY_URL"
             fi
-            echo "- **Final phase:** \`${{ steps.do_deploy.outputs.phase }}\`"
+            echo "- **Final phase:** \`$DO_PHASE\`"
             echo "- **Environment URL:** $APP_URL"
           } >> "$GITHUB_STEP_SUMMARY"

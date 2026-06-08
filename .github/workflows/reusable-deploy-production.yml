@@ -51,12 +51,47 @@ on:
         required: false
         type: string
         default: sidekick-labs
+      enable_triage:
+        description: |
+          When true, persist the DO deployment ID and upload it as a
+          `triage-context` artifact so a downstream post-deploy-triage workflow
+          can pinpoint the exact deployment. Off by default.
+        required: false
+        type: boolean
+        default: false
+      create_release:
+        description: |
+          When true, cut a `vYYYY.MM.DD.N` tag + GitHub Release at the deployed
+          SHA on a successful (ACTIVE) deploy. Requires the caller to grant
+          `contents: write`. Off by default.
+        required: false
+        type: boolean
+        default: false
+      notify_sentry:
+        description: |
+          When true, register a Sentry deploy against the release for this SHA
+          (scoped to the production environment) on a successful deploy. No-ops
+          if SENTRY_AUTH_TOKEN is unset. Off by default.
+        required: false
+        type: boolean
+        default: false
+      sentry_org:
+        description: "Sentry organization slug for the deploy notification (only used when notify_sentry=true)."
+        required: false
+        type: string
+        default: sidekick-labs
     secrets:
       DIGITALOCEAN_ACCESS_TOKEN:
         required: true
+      SENTRY_AUTH_TOKEN:
+        description: "Org token with project:releases:write — only needed when notify_sentry=true."
+        required: false
 
 permissions:
-  contents: read
+  # contents: write so create_release can cut a tag + GitHub Release. The
+  # caller's own permissions still cap this — a caller that grants only
+  # contents: read (and doesn't set create_release) is unaffected.
+  contents: write
   deployments: write
   # Required for `gh pr comment` in the failure-notification step.
   pull-requests: write
@@ -77,6 +112,22 @@ jobs:
       APP_URL: ${{ inputs.app_url }}
 
     steps:
+      - name: Resolve deploy SHA
+        # Expand a short SHA / branch / tag to the full 40-char commit SHA. The
+        # DOCR image is tagged with the full SHA (by staging), and the gh/DO
+        # lookups below must match it. Checkout-free via the API. Overrides
+        # DEPLOY_SHA in $GITHUB_ENV so every later step (image check, deploy,
+        # release, Sentry, summary) uses the resolved value. The normal promote
+        # flow already passes a full SHA (no-op here); this restores
+        # short-ref/branch support for manual dispatches.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          SHA=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${DEPLOY_SHA}" --jq '.sha')
+          echo "DEPLOY_SHA=$SHA" >> "$GITHUB_ENV"
+          echo "Resolved ${DEPLOY_SHA} → ${SHA}"
+
       - name: Install doctl
         uses: digitalocean/action-doctl@3cb3953159719656269e044e0e24ca16dd2a690f # v2.5.2
         with:
@@ -89,7 +140,7 @@ jobs:
         uses: sidekick-labs/.github/.github/actions/docr-image-exists@9701a0e9a066002d1053bfe4667509472ae943e6 # 9701a0e — pinned, bump via PR
         with:
           image_repo: ${{ inputs.image_repo }}
-          tag: ${{ inputs.deploy_sha }}
+          tag: ${{ env.DEPLOY_SHA }}
           registry: ${{ inputs.registry }}
 
       - name: Create GitHub Deployment + mark in_progress
@@ -98,9 +149,9 @@ jobs:
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           environment: ${{ inputs.environment }}
-          sha: ${{ inputs.deploy_sha }}
+          sha: ${{ env.DEPLOY_SHA }}
           production_environment: "true"
-          description: Production deploy for ${{ inputs.deploy_sha }}
+          description: Production deploy for ${{ env.DEPLOY_SHA }}
 
       - name: Patch appspec & deploy to DigitalOcean
         id: do_deploy
@@ -110,13 +161,36 @@ jobs:
         with:
           app_id: ${{ inputs.app_id }}
           image_repo: ${{ inputs.image_repo }}
-          deploy_sha: ${{ inputs.deploy_sha }}
+          deploy_sha: ${{ env.DEPLOY_SHA }}
 
       - name: Fail the job if the deploy did not succeed
         if: steps.do_deploy.outputs.outcome != 'success'
         run: |
           echo "::error::Production deploy did not succeed (phase '${{ steps.do_deploy.outputs.phase }}', expected ACTIVE)"
           exit 1
+
+      - name: Persist DO deployment ID for post-deploy triage
+        # See the staging reusable for rationale. Hands the exact DO deployment
+        # ID to a downstream post-deploy-triage workflow_run via an artifact.
+        # Always runs so failure-path triage still gets the ID. Gated on enable_triage.
+        if: ${{ always() && inputs.enable_triage && steps.do_deploy.outputs.do_deploy_id != '' }}
+        env:
+          DO_DEPLOY_ID: ${{ steps.do_deploy.outputs.do_deploy_id }}
+        run: |
+          mkdir -p /tmp/triage-context
+          printf '%s' "$DO_DEPLOY_ID" > /tmp/triage-context/do-deployment-id.txt
+
+      - name: Upload triage context
+        # Artifact name matches the staging reusable so post-deploy-triage's
+        # download works without a per-env branch.
+        if: ${{ always() && inputs.enable_triage && steps.do_deploy.outputs.do_deploy_id != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: triage-context
+          path: /tmp/triage-context/
+          retention-days: 1
+          if-no-files-found: warn
+          overwrite: true
 
       - name: Post final deployment status
         if: always() && steps.deployment.outputs.deployment_id != ''
@@ -130,6 +204,85 @@ jobs:
           do_phase: ${{ steps.do_deploy.outputs.phase }}
           do_deploy_id: ${{ steps.do_deploy.outputs.do_deploy_id }}
           do_deploy_url: ${{ steps.do_deploy.outputs.do_deploy_url }}
+
+      - name: Cut release tag and GitHub Release
+        # Creates a `vYYYY.MM.DD.N` tag at the deployed SHA + a matching GitHub
+        # Release with auto-generated notes (N counts same-day collisions). Uses
+        # server-side `gh release view` for the collision probe so no checkout is
+        # needed. continue-on-error so a metadata hiccup doesn't fail a deploy
+        # that already reached ACTIVE. Requires the caller to grant contents: write.
+        id: release
+        if: ${{ inputs.create_release && steps.do_deploy.outputs.phase == 'ACTIVE' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          DATE=$(date -u +%Y.%m.%d)
+          N=1
+          # Probe both Releases AND tags: a dangling tag (a prior run cut the tag
+          # but its Release step failed) would pass the Release probe and then
+          # collide on `gh release create`. Skip past either.
+          while gh release view "v${DATE}.${N}" >/dev/null 2>&1 \
+             || gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/v${DATE}.${N}" >/dev/null 2>&1; do
+            N=$((N+1))
+          done
+          TAG="v${DATE}.${N}"
+          # Anchor auto-notes to the previous release so the first-ever release
+          # doesn't walk back to the repo root.
+          PREV_TAG=$(gh release list --limit 1 --json tagName --jq '.[0].tagName // ""')
+          if [ -n "$PREV_TAG" ]; then
+            gh release create "$TAG" \
+              --target "$DEPLOY_SHA" \
+              --title "$TAG" \
+              --generate-notes \
+              --notes-start-tag "$PREV_TAG" \
+              --latest
+          else
+            gh release create "$TAG" \
+              --target "$DEPLOY_SHA" \
+              --title "$TAG" \
+              --notes "First production release. Created automatically at SHA \`${DEPLOY_SHA}\`." \
+              --latest
+          fi
+          echo "version=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Created release $TAG at ${DEPLOY_SHA:0:7}"
+
+      - name: Notify Sentry of deploy
+        # Registers a deploy against the Sentry release for this SHA, scoped to
+        # the production environment. The release itself is created upstream
+        # (the caller's sentry-release.yml on push, or a build-time Sentry
+        # plugin). No-ops cleanly if SENTRY_AUTH_TOKEN is unset. continue-on-error
+        # so a Sentry hiccup never fails a live deploy.
+        if: ${{ inputs.notify_sentry && steps.do_deploy.outputs.phase == 'ACTIVE' }}
+        continue-on-error: true
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: ${{ inputs.sentry_org }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SENTRY_AUTH_TOKEN:-}" ]; then
+            echo "::notice::SENTRY_AUTH_TOKEN not set — skipping Sentry deploy notification"
+            exit 0
+          fi
+          NAME="${VERSION:-${DEPLOY_SHA:0:7}}"
+          echo "Registering Sentry deploy: org=${SENTRY_ORG} release=${DEPLOY_SHA} env=production name=${NAME}"
+          # Capture the HTTP status (no --fail, so the error body is preserved)
+          # and surface non-2xx as a ::warning:: instead of an invisible swallow.
+          # The common failure is 404: no Sentry *release* exists for this SHA
+          # (the upstream release version must equal the full commit SHA).
+          HTTP=$(curl --silent --show-error -o /tmp/sentry-deploy.json -w '%{http_code}' \
+            "https://sentry.io/api/0/organizations/${SENTRY_ORG}/releases/${DEPLOY_SHA}/deploys/" \
+            -H "Authorization: Bearer ${SENTRY_AUTH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"environment\":\"production\",\"name\":\"${NAME}\"}")
+          if [ "$HTTP" -ge 200 ] && [ "$HTTP" -lt 300 ]; then
+            jq -r '"Sentry deploy: " + (.id // "?") + " — " + (.url // "n/a")' /tmp/sentry-deploy.json 2>/dev/null || true
+          else
+            echo "::warning::Sentry deploy notification failed (HTTP ${HTTP}) for release ${DEPLOY_SHA}. Likely no matching Sentry release (version != full SHA). Response:"
+            cat /tmp/sentry-deploy.json 2>/dev/null || true
+          fi
 
       - name: Classify failure stage
         id: stage
@@ -155,23 +308,26 @@ jobs:
         uses: sidekick-labs/.github/.github/actions/deploy-failure-comment@9701a0e9a066002d1053bfe4667509472ae943e6 # 9701a0e — pinned, bump via PR
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          sha: ${{ inputs.deploy_sha }}
+          sha: ${{ env.DEPLOY_SHA }}
           title: Production deploy failed
           stage: ${{ steps.stage.outputs.stage }}
           log_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
       - name: Summary
         if: always()
+        env:
+          DO_DEPLOY_ID: ${{ steps.do_deploy.outputs.do_deploy_id }}
+          DO_DEPLOY_URL: ${{ steps.do_deploy.outputs.do_deploy_url }}
+          DO_PHASE: ${{ steps.do_deploy.outputs.phase }}
         run: |
-          DO_URL="${{ steps.do_deploy.outputs.do_deploy_url }}"
           {
             echo "## Production deploy"
             echo ""
             echo "- **SHA:** \`$DEPLOY_SHA\`"
-            echo "- **DO deployment:** \`${{ steps.do_deploy.outputs.do_deploy_id }}\`"
-            if [ -n "$DO_URL" ]; then
-              echo "- **DO deploy URL:** $DO_URL"
+            echo "- **DO deployment:** \`$DO_DEPLOY_ID\`"
+            if [ -n "$DO_DEPLOY_URL" ]; then
+              echo "- **DO deploy URL:** $DO_DEPLOY_URL"
             fi
-            echo "- **Final phase:** \`${{ steps.do_deploy.outputs.phase }}\`"
+            echo "- **Final phase:** \`$DO_PHASE\`"
             echo "- **Environment URL:** $APP_URL"
           } >> "$GITHUB_STEP_SUMMARY"
