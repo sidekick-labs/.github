@@ -202,7 +202,7 @@ jobs:
         # Done here (not at deploy time) so we fail BEFORE FF-pushing to
         # production — otherwise we'd advance production to a SHA the deploy
         # can't roll out.
-        uses: sidekick-labs/.github/.github/actions/docr-image-exists@9701a0e9a066002d1053bfe4667509472ae943e6 # 9701a0e — pinned, bump via PR
+        uses: sidekick-labs/.github/.github/actions/docr-image-exists@848067fcc24fb22ba28fd2dfdac493b515f7ca3b # 9701a0e — pinned, bump via PR
         with:
           image_repo: ${{ inputs.image_repo }}
           tag: ${{ steps.target.outputs.sha }}
@@ -321,7 +321,7 @@ jobs:
 
       - name: Comment on merged PR when promote fails
         if: failure()
-        uses: sidekick-labs/.github/.github/actions/deploy-failure-comment@9701a0e9a066002d1053bfe4667509472ae943e6 # 9701a0e — pinned, bump via PR
+        uses: sidekick-labs/.github/.github/actions/deploy-failure-comment@848067fcc24fb22ba28fd2dfdac493b515f7ca3b # 9701a0e — pinned, bump via PR
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           sha: ${{ steps.target.outputs.sha }}
