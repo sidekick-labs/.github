@@ -102,6 +102,9 @@ on:
       SLACK_BOT_TOKEN:
         description: "Slack bot token (xoxb-…) with chat:write — only needed when slack_channel is set."
         required: false
+      claude-code-oauth-token:
+        description: "CLAUDE_CODE_OAUTH_TOKEN — only used for the AI release-summary step; absent → that step soft-skips and the root falls back to the linked PR list."
+        required: false
 
 permissions:
   # The FF-push to `production` does NOT use GITHUB_TOKEN (see the App-token
@@ -271,51 +274,103 @@ jobs:
           # history. First-release case: this creates refs/heads/production.
           git push origin "${TARGET}:refs/heads/production"
 
+      - name: Gather release PRs
+        # Resolve the commit range PROD_SHA..TARGET into PR-linked Slack bullets
+        # (link the PR when the squash commit maps to one; commit link as
+        # fallback) plus an LLM input file for the summary step below. Only when
+        # a thread will actually be opened.
+        id: gather_prs
+        if: ${{ !inputs.dry_run && success() && steps.ff_push.outputs.already_at_target != 'true' && inputs.slack_channel != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SERVER: ${{ github.server_url }}
+          TARGET: ${{ steps.target.outputs.sha }}
+          PROD_SHA: ${{ steps.ff_push.outputs.prod_sha }}
+        run: |
+          set -uo pipefail
+          if [ -n "$PROD_SHA" ] && git rev-parse --verify "$PROD_SHA" >/dev/null 2>&1; then
+            SHAS=$(git log --no-merges --format='%H' "${PROD_SHA}..${TARGET}" 2>/dev/null)
+            echo "first_note=" >> "$GITHUB_OUTPUT"
+          else
+            SHAS=$(git log --no-merges --format='%H' -n 15 "${TARGET}" 2>/dev/null)
+            echo "first_note= _(first production release)_" >> "$GITHUB_OUTPUT"
+          fi
+          : > /tmp/release-bullets.txt   # Slack mrkdwn, one linked line per PR/commit
+          : > /tmp/release-prs.txt       # LLM input: PR title + body excerpt
+          COUNT=0; MAX=15
+          while IFS= read -r sha; do
+            [ -z "$sha" ] && continue
+            COUNT=$((COUNT+1))
+            [ "$COUNT" -gt "$MAX" ] && continue
+            PR=$(gh api "repos/${REPO}/commits/${sha}/pulls" \
+              --jq '.[0] | "\(.number)\t\(.title)\t\(.html_url)\t\(.body // "")"' 2>/dev/null || true)
+            if [ -n "$PR" ] && [ "$PR" != "null" ]; then
+              NUM=$(printf '%s' "$PR" | cut -f1)
+              TITLE=$(printf '%s' "$PR" | cut -f2)
+              URL=$(printf '%s' "$PR" | cut -f3)
+              BODY=$(printf '%s' "$PR" | cut -f4 | tr '\n' ' ' | cut -c1-300)
+              printf '• <%s|#%s> %s\n' "$URL" "$NUM" "$TITLE" >> /tmp/release-bullets.txt
+              printf -- '- #%s %s — %s\n' "$NUM" "$TITLE" "$BODY" >> /tmp/release-prs.txt
+            else
+              SUBJ=$(git log -1 --no-merges --format='%s' "$sha" 2>/dev/null)
+              printf '• <%s/%s/commit/%s|%s> %s\n' "$SERVER" "$REPO" "$sha" "${sha:0:7}" "$SUBJ" >> /tmp/release-bullets.txt
+              printf -- '- %s %s\n' "${sha:0:7}" "$SUBJ" >> /tmp/release-prs.txt
+            fi
+          done <<< "$SHAS"
+          if [ "$COUNT" -gt "$MAX" ]; then
+            printf '• …and %s more\n' "$((COUNT - MAX))" >> /tmp/release-bullets.txt
+          fi
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "Gathered $COUNT change(s) for the release root"
+
+      - name: AI release summary
+        # Best-effort human "what's shipping" blurb. continue-on-error + the
+        # compose step's file check mean a missing token / failure / timeout
+        # falls back to the linked PR list — never blocks the release. No
+        # id-token granted: if the action needs OIDC it fails at runtime and is
+        # caught here, rather than a permissions startup_failure.
+        id: ai_summary
+        if: ${{ !inputs.dry_run && success() && steps.ff_push.outputs.already_at_target != 'true' && inputs.slack_channel != '' }}
+        continue-on-error: true
+        uses: anthropics/claude-code-action@593d7a5c4e0073569f74772c2b7b64c30ec14707 # main@2.1.160
+        with:
+          claude_code_oauth_token: ${{ secrets.claude-code-oauth-token }}
+          claude_args: >-
+            --model ${{ vars.CLAUDE_MODEL || 'claude-opus-4-8' }}
+            --allowed-tools Read,Write
+          prompt: |
+            /tmp/release-prs.txt lists the PRs/commits in this production release of `${{ inputs.image_repo }}`. Read it, then WRITE a concise "what's shipping" summary to /tmp/release-summary.md.
+
+            Rules:
+            - 2-4 short bullets or 2-3 sentences; under 80 words total.
+            - Slack mrkdwn only: *single-asterisk bold*, `backticks` for identifiers. NEVER **double-asterisk** or `#` headings.
+            - Describe operator/user-facing impact and themes in plain language. Do NOT restate PR titles verbatim and do NOT include PR numbers or links (listed separately).
+            - No preamble, no closing line, no headings. If intent is unclear, write one neutral sentence.
+            - Only write /tmp/release-summary.md. Do not run shell commands or modify anything else.
+
       - name: Compose release thread root
-        # The "what's being promoted" message: target SHA + the commit range
-        # since the old production tip. Only when Slack is configured and a real
-        # deploy will be dispatched (not dry-run / no-op re-promote).
+        # header + AI summary (when produced) + linked PR bullets + trigger line.
+        # Falls back to just the linked bullets if the AI step produced nothing.
         id: slack_root_text
         if: ${{ !inputs.dry_run && success() && steps.ff_push.outputs.already_at_target != 'true' && inputs.slack_channel != '' }}
         env:
-          TARGET: ${{ steps.target.outputs.sha }}
-          PROD_SHA: ${{ steps.ff_push.outputs.prod_sha }}
           IMAGE_REPO: ${{ inputs.image_repo }}
           ACTOR: ${{ github.actor }}
+          SHORT: ${{ steps.target.outputs.short }}
+          COUNT: ${{ steps.gather_prs.outputs.count }}
+          FIRST_NOTE: ${{ steps.gather_prs.outputs.first_note }}
         run: |
           set -uo pipefail
-          SHORT="${TARGET:0:7}"
-          # Commit range since old production tip. First release (no PROD_SHA):
-          # show the most recent commits as a sample rather than walking to root.
-          if [ -n "$PROD_SHA" ] && git rev-parse --verify "$PROD_SHA" >/dev/null 2>&1; then
-            LOG=$(git log --no-merges --format='%h %s' "${PROD_SHA}..${TARGET}" 2>/dev/null)
-            FIRST_NOTE=""
-          else
-            LOG=$(git log --no-merges --format='%h %s' -n 15 "${TARGET}" 2>/dev/null)
-            FIRST_NOTE=" _(first production release)_"
-          fi
-          # `while read` (not mapfile) so this runs on any bash. grep -c counts
-          # non-empty lines; an empty range yields COUNT=0, no bullets.
-          COUNT=$(printf '%s\n' "$LOG" | grep -c . || true)
-          # Cap the bullet list so a big release doesn't blow up the message.
-          MAX=15
-          BULLETS=""
-          i=0
-          while IFS= read -r l; do
-            [ -z "$l" ] && continue
-            if [ "$i" -ge "$MAX" ]; then
-              BULLETS="${BULLETS}"$'\n'"• …and $((COUNT - MAX)) more"
-              break
-            fi
-            # Subjects are plain text; wrap only the sha in code ticks.
-            sha="${l%% *}"; subj="${l#* }"
-            BULLETS="${BULLETS}"$'\n'"• \`${sha}\` ${subj}"
-            i=$((i+1))
-          done <<< "$LOG"
-          TEXT="🚀 *Releasing \`${IMAGE_REPO}\` to production*${FIRST_NOTE}"$'\n'"• SHA: \`${SHORT}\` — ${COUNT} commit(s)"$'\n'"• triggered by @${ACTOR}${BULLETS}"$'\n'"_Rollout starting — live updates below._"
+          BULLETS=$(cat /tmp/release-bullets.txt 2>/dev/null || true)
+          SUMMARY=""
+          [ -s /tmp/release-summary.md ] && SUMMARY=$(cat /tmp/release-summary.md)
           {
             echo "text<<SLACK_EOF"
-            printf '%s\n' "$TEXT"
+            printf '🚀 *Releasing `%s` to production*%s\n' "$IMAGE_REPO" "$FIRST_NOTE"
+            [ -n "$SUMMARY" ] && printf '\n%s\n' "$SUMMARY"
+            printf '\n*Changes* (`%s`, %s):\n%s\n' "$SHORT" "$COUNT" "$BULLETS"
+            printf '\n_triggered by @%s · rollout starting, live updates below._\n' "$ACTOR"
             echo "SLACK_EOF"
           } >> "$GITHUB_OUTPUT"
 
