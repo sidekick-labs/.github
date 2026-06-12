@@ -25,7 +25,7 @@ on:
   workflow_call:
     inputs:
       stack:
-        description: 'Stack: rails | ruby-gem | node-lib | node-app | kmp'
+        description: 'Stack: rails | ruby-gem | node-lib | node-app | kmp | python-app'
         required: true
         type: string
       ruby-version-file:
@@ -48,6 +48,21 @@ on:
         required: false
         type: string
         default: '17'
+      python-version:
+        description: 'Python version (python-app stack).'
+        required: false
+        type: string
+        default: '3.11'
+      python-requirements:
+        description: 'Requirements file installed for verification (python-app stack).'
+        required: false
+        type: string
+        default: 'requirements.txt'
+      pip-extra-args:
+        description: 'Extra args appended to the requirements pip install (python-app stack), e.g. an --extra-index-url for CPU torch wheels.'
+        required: false
+        type: string
+        default: ''
       bundle-update-strategy:
         description: 'Bundler update strategy: lock-update | conservative | none.'
         required: false
@@ -70,6 +85,11 @@ on:
         default: false
       run-npm-audit:
         description: 'Run npm audit fix (rails, node-lib, node-app stacks).'
+        required: false
+        type: boolean
+        default: true
+      run-pip-audit:
+        description: 'Run pip-audit to surface known CVEs, informational (python-app stack).'
         required: false
         type: boolean
         default: true
@@ -165,7 +185,7 @@ jobs:
         run: |
           set -euo pipefail
           case "$STACK" in
-            rails|ruby-gem|node-lib|node-app|kmp) ;;
+            rails|ruby-gem|node-lib|node-app|kmp|python-app) ;;
             *) echo "::error::Invalid stack: $STACK"; exit 1 ;;
           esac
           case "$STRATEGY" in
@@ -250,6 +270,32 @@ jobs:
       - name: Set up Gradle
         if: ${{ inputs.stack == 'kmp' }}
         uses: gradle/actions/setup-gradle@50e97c2cd7a37755bbfafc9c5b7cafaece252f6e # v6
+
+      - name: Set up Python
+        if: ${{ inputs.stack == 'python-app' }}
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: pip
+
+      - name: Install Python dependencies
+        # Needed so the caller's lint/test verification commands (ruff, mypy,
+        # pytest) can actually run. pip-audit is installed unconditionally so
+        # the maintenance prompt's CVE surface step has it on PATH.
+        if: ${{ inputs.stack == 'python-app' }}
+        env:
+          REQS: ${{ inputs.python-requirements }}
+          PIP_EXTRA_ARGS: ${{ inputs.pip-extra-args }}
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [ -f "$REQS" ]; then
+            # shellcheck disable=SC2086 # intentional word-splitting of caller args
+            pip install -r "$REQS" $PIP_EXTRA_ARGS
+          else
+            echo "::warning::python-requirements '$REQS' not found — skipping dependency install"
+          fi
+          pip install pip-audit
 
       # ----- TODO/FIXME census (week-over-week diff via cache) -----
 
@@ -351,6 +397,8 @@ jobs:
           RUN_BRAKEMAN: ${{ inputs.run-brakeman }}
           RUN_SORBET_RBI: ${{ inputs.run-sorbet-rbi }}
           RUN_NPM_AUDIT: ${{ inputs.run-npm-audit }}
+          RUN_PIP_AUDIT: ${{ inputs.run-pip-audit }}
+          PYTHON_REQUIREMENTS: ${{ inputs.python-requirements }}
           LINT_COMMANDS: ${{ inputs.lint-commands }}
           TEST_COMMANDS: ${{ inputs.test-commands }}
           GRADLE_TEST_COMMAND: ${{ inputs.gradle-test-command }}
@@ -422,6 +470,13 @@ jobs:
 
             if [ "$STACK" = "kmp" ]; then
               echo "- Review \`gradle/libs.versions.toml\` for safe minor/patch dependency bumps"
+            fi
+
+            if [ "$STACK" = "python-app" ]; then
+              if [ "$RUN_PIP_AUDIT" = "true" ]; then
+                echo "- Run \`pip-audit -r ${PYTHON_REQUIREMENTS} --desc on\` to surface known dependency CVEs. This is INFORMATIONAL — capture the findings in the PR body. Do NOT bump pinned versions in \`${PYTHON_REQUIREMENTS}\` (Dependabot owns version bumps); if a CVE is already waived in \`.github/pip-audit-ignore.txt\`, note it as accepted."
+              fi
+              echo "- There is no lockfile-update step for this stack: dependencies are pinned and Dependabot handles bumps. The valuable output here is the audit/CVE summary, the TODO/FIXME census, stale-PR review, and any safe in-code fixes (e.g. an actionable CodeQL finding)."
             fi
 
             echo
@@ -535,7 +590,7 @@ jobs:
           } > "$PROMPT_FILE"
 
           # Build the --allowed-tools list.
-          BASE_TOOLS='Read,Glob,Grep,Bash(git checkout:*),Bash(git add:*),Bash(git commit:*),Bash(git push:*),Bash(git fetch:*),Bash(git rebase:*),Bash(git diff:*),Bash(git status:*),Bash(git log:*),Bash(git rev-parse:*),Bash(bundle lock:*),Bash(bundle update:*),Bash(bundle install:*),Bash(bundle exec bundler-audit:*),Bash(bundle exec rubocop:*),Bash(bundle exec rspec:*),Bash(bundle audit:*),Bash(bin/rspec:*),Bash(bin/rubocop:*),Bash(bin/brakeman:*),Bash(bin/tapioca:*),Bash(npm audit:*),Bash(npm run:*),Bash(npm outdated:*),Bash(npm test:*),Bash(./gradlew:*),Bash(cat tmp/maintenance/*),Bash(wc:*),Bash(head:*),Bash(tail:*),Bash(diff:*),Bash(gh pr:*),Bash(gh repo:*),Bash(gh api:*)'
+          BASE_TOOLS='Read,Glob,Grep,Bash(git checkout:*),Bash(git add:*),Bash(git commit:*),Bash(git push:*),Bash(git fetch:*),Bash(git rebase:*),Bash(git diff:*),Bash(git status:*),Bash(git log:*),Bash(git rev-parse:*),Bash(bundle lock:*),Bash(bundle update:*),Bash(bundle install:*),Bash(bundle exec bundler-audit:*),Bash(bundle exec rubocop:*),Bash(bundle exec rspec:*),Bash(bundle audit:*),Bash(bin/rspec:*),Bash(bin/rubocop:*),Bash(bin/brakeman:*),Bash(bin/tapioca:*),Bash(npm audit:*),Bash(npm run:*),Bash(npm outdated:*),Bash(npm test:*),Bash(./gradlew:*),Bash(pip-audit:*),Bash(pip install:*),Bash(pip list:*),Bash(python:*),Bash(python3:*),Bash(ruff:*),Bash(mypy:*),Bash(pytest:*),Bash(alembic:*),Bash(cat tmp/maintenance/*),Bash(wc:*),Bash(head:*),Bash(tail:*),Bash(diff:*),Bash(gh pr:*),Bash(gh repo:*),Bash(gh api:*)'
           TOOLS="$BASE_TOOLS"
           if [ -n "$ADDITIONAL_ALLOWED_TOOLS" ]; then
             TOOLS="$TOOLS,$ADDITIONAL_ALLOWED_TOOLS"
