@@ -34,8 +34,15 @@ inputs:
     required: false
     default: reply
   text:
-    description: "Message body, already formatted as Slack mrkdwn."
+    description: "Message body (Slack mrkdwn). Always sent — also serves as the notification preview + accessibility fallback when `blocks` is set."
     required: true
+  blocks:
+    description: >-
+      Optional Slack Block Kit JSON (an array of block objects, as a string).
+      When set + valid JSON, the message renders from these blocks (with `text`
+      as the notification fallback); invalid JSON soft-degrades to text-only.
+    required: false
+    default: ""
   thread_ts:
     description: >-
       Required for `reply` mode — the root message ts to thread under. Ignored
@@ -66,6 +73,7 @@ runs:
         CHANNEL: ${{ inputs.channel }}
         MODE: ${{ inputs.mode }}
         TEXT: ${{ inputs.text }}
+        BLOCKS: ${{ inputs.blocks }}
         THREAD_TS: ${{ inputs.thread_ts }}
       run: |
         set -uo pipefail
@@ -101,13 +109,21 @@ runs:
 
         # ── Build the payload ────────────────────────────────────────────
         # jq assembles valid JSON (TEXT may contain newlines, quotes, mrkdwn).
-        # unfurl_* off so links don't balloon the thread.
+        # unfurl_* off so links don't balloon the thread. Built incrementally so
+        # thread_ts (reply) and blocks (optional) layer on cleanly.
+        PAYLOAD=$(jq -n --arg ch "$CHANNEL" --arg text "$TEXT" \
+          '{channel: $ch, text: $text, unfurl_links: false, unfurl_media: false}')
         if [ "$MODE" = "reply" ]; then
-          PAYLOAD=$(jq -n --arg ch "$CHANNEL" --arg text "$TEXT" --arg ts "$THREAD_TS" \
-            '{channel: $ch, text: $text, thread_ts: $ts, unfurl_links: false, unfurl_media: false}')
-        else
-          PAYLOAD=$(jq -n --arg ch "$CHANNEL" --arg text "$TEXT" \
-            '{channel: $ch, text: $text, unfurl_links: false, unfurl_media: false}')
+          PAYLOAD=$(printf '%s' "$PAYLOAD" | jq --arg ts "$THREAD_TS" '. + {thread_ts: $ts}')
+        fi
+        # `text` stays as the notification preview / a11y fallback even when
+        # blocks render. Invalid blocks JSON soft-degrades to text-only.
+        if [ -n "$BLOCKS" ]; then
+          if printf '%s' "$BLOCKS" | jq -e 'type == "array"' >/dev/null 2>&1; then
+            PAYLOAD=$(printf '%s' "$PAYLOAD" | jq --argjson b "$BLOCKS" '. + {blocks: $b}')
+          else
+            echo "::warning::slack-deploy-thread: blocks is not a valid JSON array — posting text-only"
+          fi
         fi
 
         # ── Post (soft on any failure) ───────────────────────────────────
