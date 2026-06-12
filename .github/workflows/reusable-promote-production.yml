@@ -358,8 +358,86 @@ jobs:
           if [ -n "$THREAD_TS" ]; then
             ARGS+=(--field slack_thread_ts="$THREAD_TS")
           fi
+          # Record dispatch time (backdated 30s for clock skew) so the watchdog
+          # below can identify the run THIS dispatch created.
+          echo "dispatched_after=$(date -u -d '-30 seconds' +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
           gh workflow run "$DEPLOY_WORKFLOW" "${ARGS[@]}"
           echo "Dispatched $DEPLOY_WORKFLOW for ${SHA:0:7}${THREAD_TS:+ (thread ${THREAD_TS})}"
+
+      - name: Confirm the deploy actually started
+        # Safety net for the deploy thread: if the dispatched deploy never runs
+        # (startup_failure from a bad workflow/permission, cancelled, or never
+        # appears) NO step in it executes — so its `always()` summary never posts
+        # and the #releases thread is orphaned at "Rollout starting…". The
+        # deploy-that-RUNS-and-fails case is already covered by that summary; this
+        # only catches the never-started case, which only promote can observe
+        # (it holds the thread ts and knows it dispatched). Best-effort + bounded.
+        id: watchdog
+        if: ${{ !inputs.dry_run && steps.ff_push.outputs.already_at_target != 'true' && steps.slack_root.outputs.thread_ts != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEPLOY_WORKFLOW: ${{ inputs.deploy_production_workflow }}
+          SINCE: ${{ steps.dispatch_deploy.outputs.dispatched_after }}
+        run: |
+          set -uo pipefail
+          emit() { echo "$1=$2" >> "$GITHUB_OUTPUT"; }
+          DEADLINE=$(( $(date +%s) + 150 ))   # ~2.5 min; the run appears in seconds
+          FAILED_TO_START=1; RUN_URL=""; CONCLUSION="never_appeared"
+          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+            RUN=$(gh run list --workflow="$DEPLOY_WORKFLOW" --limit 5 \
+              --json databaseId,status,conclusion,createdAt,url \
+              --jq "[.[] | select(.createdAt >= \"$SINCE\")] | sort_by(.createdAt) | last // empty" 2>/dev/null || echo "")
+            if [ -z "$RUN" ] || [ "$RUN" = "null" ]; then sleep 10; continue; fi
+            STATUS=$(echo "$RUN" | jq -r '.status'); CONCLUSION=$(echo "$RUN" | jq -r '.conclusion // ""'); RUN_URL=$(echo "$RUN" | jq -r '.url')
+            case "$STATUS" in
+              completed)
+                # success or a normal `failure` (its own always() summary posts) →
+                # the deploy owns the thread, nothing for us to do. Only
+                # startup_failure / cancelled ran NO steps → report.
+                case "$CONCLUSION" in
+                  startup_failure|cancelled) FAILED_TO_START=1 ;;
+                  *) FAILED_TO_START=0 ;;
+                esac
+                break ;;
+              in_progress|requested|waiting|pending)
+                FAILED_TO_START=0; break ;;     # it's running → deploy owns the thread
+              *) sleep 8 ;;                       # queued / unknown — keep waiting
+            esac
+          done
+          emit failed_to_start "$FAILED_TO_START"
+          emit run_url "$RUN_URL"
+          emit conclusion "$CONCLUSION"
+          [ "$FAILED_TO_START" = "1" ] && echo "::warning::Dispatched deploy did not start (conclusion=$CONCLUSION) — reporting to the deploy thread"
+          exit 0
+
+      - name: Compose failed-to-start thread reply
+        id: watchdog_text
+        if: ${{ steps.watchdog.outputs.failed_to_start == 'true' }}
+        env:
+          SHORT: ${{ steps.target.outputs.short }}
+          CONCLUSION: ${{ steps.watchdog.outputs.conclusion }}
+          RUN_URL: ${{ steps.watchdog.outputs.run_url }}
+          DEPLOY_WORKFLOW: ${{ inputs.deploy_production_workflow }}
+        run: |
+          set -uo pipefail
+          LINK=""
+          [ -n "$RUN_URL" ] && LINK=" — <${RUN_URL}|deploy run>"
+          TEXT="❌ *Production deploy failed to start* (\`${CONCLUSION}\`)${LINK}"$'\n'"\`production\` is at \`${SHORT}\` but the rollout did NOT run — no live updates will follow. Re-dispatch \`${DEPLOY_WORKFLOW}\` (with this thread's ts) once the cause is fixed."
+          {
+            echo "text<<WD_EOF"
+            printf '%s\n' "$TEXT"
+            echo "WD_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Report failed-to-start into the deploy thread
+        if: ${{ steps.watchdog.outputs.failed_to_start == 'true' }}
+        uses: sidekick-labs/.github/.github/actions/slack-deploy-thread@8f49414de97d714762ec4d2e4254fbb96c4e0628 # 8f49414 - pinned, bump via PR
+        with:
+          bot_token: ${{ secrets.SLACK_BOT_TOKEN }}
+          channel: ${{ inputs.slack_channel }}
+          mode: reply
+          thread_ts: ${{ steps.slack_root.outputs.thread_ts }}
+          text: ${{ steps.watchdog_text.outputs.text }}
 
       - name: Summary
         if: ${{ !inputs.dry_run && success() }}

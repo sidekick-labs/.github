@@ -272,7 +272,9 @@ runs:
         # it even if the polling loop below times out.
         emit do_deploy_id "$DEPLOY_ID"
         emit do_deploy_url "https://cloud.digitalocean.com/apps/${APP_ID}/deployments/${DEPLOY_ID}"
-        slack_reply "⚙️ DO rollout started — <https://cloud.digitalocean.com/apps/${APP_ID}/deployments/${DEPLOY_ID}|deployment \`${DEPLOY_ID:0:8}\`>"
+        # Backticks don't render inside a Slack <url|label>, so keep the short
+        # id (code-formatted) outside the link and label the link plainly.
+        slack_reply "⚙️ DO rollout started (deployment \`${DEPLOY_ID:0:8}\`) — <https://cloud.digitalocean.com/apps/${APP_ID}/deployments/${DEPLOY_ID}|DO console>"
 
         # ─── Phase 2: poll for terminal phase ────────────────────────
         #
