@@ -89,6 +89,15 @@ runs:
           emit ok "false"
           exit 0
         fi
+        # `text` is declared required, but Actions doesn't enforce that at
+        # runtime — a caller wiring text from a skipped step's output would post
+        # a blank message (Slack `no_text`). Guard rather than post noise.
+        if [ -z "$TEXT" ]; then
+          echo "::notice::slack-deploy-thread: text is empty — skipping Slack post"
+          emit thread_ts ""
+          emit ok "false"
+          exit 0
+        fi
 
         # ── Build the payload ────────────────────────────────────────────
         # jq assembles valid JSON (TEXT may contain newlines, quotes, mrkdwn).
@@ -120,13 +129,23 @@ runs:
           exit 0
         fi
 
-        TS=$(echo "$RESP" | jq -r '.ts')
+        # `// empty` so a (very unlikely) ok=true with no .ts yields "" rather
+        # than the literal "null" — which would otherwise become a bogus thread
+        # root that every later reply fails to thread under.
+        TS=$(echo "$RESP" | jq -r '.ts // empty')
         if [ "$MODE" = "reply" ]; then
-          # Thread identity stays the ROOT ts, not this reply's ts.
+          # Reply ts is informational only; thread identity stays the ROOT ts.
           emit thread_ts "$THREAD_TS"
-          echo "Posted reply into thread ${THREAD_TS} (reply ts ${TS})"
+          emit ok "true"
+          echo "Posted reply into thread ${THREAD_TS}${TS:+ (reply ts ${TS})}"
         else
+          if [ -z "$TS" ]; then
+            echo "::warning::slack-deploy-thread: Slack returned ok=true but no .ts — cannot establish a thread root"
+            emit thread_ts ""
+            emit ok "false"
+            exit 0
+          fi
           emit thread_ts "$TS"
+          emit ok "true"
           echo "Posted thread root (ts ${TS})"
         fi
-        emit ok "true"

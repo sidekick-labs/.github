@@ -345,6 +345,12 @@ jobs:
           # the deploy workflow's `slack_thread_ts` input (passing an unknown
           # --field would 422 the dispatch *after* the FF-push — the one failure
           # mode we must avoid).
+          #
+          # Note: only the thread ts crosses the workflow boundary here. The
+          # channel is NOT dispatched — each caller's deploy workflow configures
+          # its own channel independently (vars.RELEASE_SLACK_CHANNEL_ID), so a
+          # new service wires the channel on its deploy workflow, not via this
+          # dispatch.
           THREAD_TS: ${{ steps.slack_root.outputs.thread_ts }}
         run: |
           set -euo pipefail

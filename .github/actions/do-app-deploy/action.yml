@@ -154,14 +154,22 @@ runs:
           if [ -z "$SLACK_BOT_TOKEN" ] || [ -z "$SLACK_CHANNEL" ] || [ -z "$SLACK_THREAD_TS" ]; then
             return 0
           fi
-          local payload
+          local payload resp
           payload=$(jq -n --arg ch "$SLACK_CHANNEL" --arg text "$1" --arg ts "$SLACK_THREAD_TS" \
             '{channel: $ch, text: $text, thread_ts: $ts, unfurl_links: false, unfurl_media: false}')
-          curl -sS --max-time 15 -X POST https://slack.com/api/chat.postMessage \
+          resp=$(curl -sS --max-time 15 -X POST https://slack.com/api/chat.postMessage \
             -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
             -H "Content-Type: application/json; charset=utf-8" \
-            --data "$payload" >/dev/null 2>&1 \
-            || echo "::warning::do-app-deploy: Slack phase update failed (non-fatal)"
+            --data "$payload" 2>/dev/null) || {
+              echo "::warning::do-app-deploy: Slack phase update curl failed (non-fatal)"
+              return 0
+            }
+          # Surface the Slack error field (not just "failed") — this is the noisy
+          # per-phase path, so a real reason helps when a thread silently stops
+          # updating mid-rollout.
+          if ! printf '%s' "$resp" | jq -e '.ok == true' >/dev/null 2>&1; then
+            echo "::warning::do-app-deploy: Slack phase update rejected (non-fatal): $(printf '%s' "$resp" | jq -r '.error // "unknown"' 2>/dev/null)"
+          fi
         }
         phase_line() {
           # $1 = phase, $2 = elapsed seconds since the poll loop started
