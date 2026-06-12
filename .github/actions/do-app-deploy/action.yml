@@ -40,6 +40,30 @@ inputs:
     description: Polling cadence while the deploy is in flight.
     required: false
     default: "10"
+  slack_bot_token:
+    description: >-
+      Slack bot token (xoxb-…) for live per-phase thread updates. Empty (the
+      default) disables all Slack posting — the poll loop then behaves exactly
+      as it did before Slack wiring, so staging/non-prod callers are unaffected.
+    required: false
+    default: ""
+  slack_channel:
+    description: "Slack channel ID (C…) for per-phase updates. Empty → no posting."
+    required: false
+    default: ""
+  slack_thread_ts:
+    description: >-
+      Root message ts of the deploy thread to reply into (from the promote
+      step's slack-deploy-thread `start`). Empty → no posting.
+    required: false
+    default: ""
+  slack_phase_warn_seconds:
+    description: >-
+      Per-phase soft threshold. When a single in-flight phase (BUILDING /
+      DEPLOYING / …) runs longer than this, post a one-time "still running"
+      deviation note into the thread. Default 360s (6m).
+    required: false
+    default: "360"
 
 outputs:
   do_deploy_id:
@@ -114,8 +138,45 @@ runs:
         APP_ID: ${{ inputs.app_id }}
         POLL_TIMEOUT: ${{ inputs.poll_timeout_seconds }}
         POLL_INTERVAL: ${{ inputs.poll_interval_seconds }}
+        SLACK_BOT_TOKEN: ${{ inputs.slack_bot_token }}
+        SLACK_CHANNEL: ${{ inputs.slack_channel }}
+        SLACK_THREAD_TS: ${{ inputs.slack_thread_ts }}
+        SLACK_PHASE_WARN_SECONDS: ${{ inputs.slack_phase_warn_seconds }}
       run: |
         set -uo pipefail
+
+        # ── Live deploy-thread updates (all soft, all no-op unless wired) ──
+        # Posts per-phase progress into the production deploy thread. Disabled
+        # entirely unless the caller passed token + channel + thread_ts, so
+        # staging and any non-Slack caller run the loop below untouched. Never
+        # fails the deploy: a Slack hiccup is a `::warning::`, nothing more.
+        slack_reply() {
+          if [ -z "$SLACK_BOT_TOKEN" ] || [ -z "$SLACK_CHANNEL" ] || [ -z "$SLACK_THREAD_TS" ]; then
+            return 0
+          fi
+          local payload
+          payload=$(jq -n --arg ch "$SLACK_CHANNEL" --arg text "$1" --arg ts "$SLACK_THREAD_TS" \
+            '{channel: $ch, text: $text, thread_ts: $ts, unfurl_links: false, unfurl_media: false}')
+          curl -sS --max-time 15 -X POST https://slack.com/api/chat.postMessage \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H "Content-Type: application/json; charset=utf-8" \
+            --data "$payload" >/dev/null 2>&1 \
+            || echo "::warning::do-app-deploy: Slack phase update failed (non-fatal)"
+        }
+        phase_line() {
+          # $1 = phase, $2 = elapsed seconds since the poll loop started
+          local p="$1"; local mins=$(( $2 / 60 ))
+          case "$p" in
+            PENDING_BUILD|BUILDING)   echo "⏳ \`${p}\` (${mins}m elapsed)" ;;
+            PENDING_DEPLOY|DEPLOYING) echo "🔧 \`${p}\` (${mins}m elapsed)" ;;
+            ACTIVE)                    echo "✅ \`ACTIVE\` (${mins}m elapsed)" ;;
+            ERROR)                     echo "❌ \`ERROR\` (${mins}m elapsed)" ;;
+            CANCELED)                  echo "🚫 \`CANCELED\` (${mins}m elapsed)" ;;
+            SUPERSEDED)                echo "⏭️ \`SUPERSEDED\` (${mins}m elapsed)" ;;
+            *)                         echo "• \`${p}\` (${mins}m elapsed)" ;;
+          esac
+        }
+        if ! [[ "${SLACK_PHASE_WARN_SECONDS:-}" =~ ^[0-9]+$ ]]; then SLACK_PHASE_WARN_SECONDS=360; fi
         # This step NEVER exits non-zero (see the action description): it
         # records the outcome via outputs and lets the caller gate on it.
         # All commands that may exit non-zero are guarded with `||` patterns.
@@ -203,6 +264,7 @@ runs:
         # it even if the polling loop below times out.
         emit do_deploy_id "$DEPLOY_ID"
         emit do_deploy_url "https://cloud.digitalocean.com/apps/${APP_ID}/deployments/${DEPLOY_ID}"
+        slack_reply "⚙️ DO rollout started — <https://cloud.digitalocean.com/apps/${APP_ID}/deployments/${DEPLOY_ID}|deployment \`${DEPLOY_ID:0:8}\`>"
 
         # ─── Phase 2: poll for terminal phase ────────────────────────
         #
@@ -229,10 +291,44 @@ runs:
         # Reset on every successful response so the warning only fires
         # for sustained outages, not isolated blips.
         UNKNOWN_COUNT=0
+        # Slack phase tracking: announce each phase transition once, and warn
+        # once per phase that overruns SLACK_PHASE_WARN_SECONDS. All no-ops
+        # when Slack isn't wired (slack_reply returns early).
+        LOOP_START=$(date +%s)
+        LAST_PHASE=""
+        PHASE_START=$LOOP_START
+        WARNED_PHASE=""
         while [ "$(date +%s)" -lt "$DEADLINE" ]; do
           PHASE=$(doctl apps get-deployment "$APP_ID" "$DEPLOY_ID" \
             --format Phase --no-header 2>/dev/null | tr -d '[:space:]' || echo "UNKNOWN")
           PHASE="${PHASE:-UNKNOWN}"
+
+          # Announce real phase changes (ignore UNKNOWN blips so a transient
+          # API miss doesn't post a bogus transition). Runs before the case
+          # below so a terminal phase (ACTIVE/ERROR/…) is announced before the
+          # loop breaks. The richer wrap-up (duration, tag, health) is the
+          # caller's summary reply — this is just the live progress line.
+          if [ "$PHASE" != "UNKNOWN" ] && [ "$PHASE" != "$LAST_PHASE" ]; then
+            NOW=$(date +%s)
+            slack_reply "$(phase_line "$PHASE" "$(( NOW - LOOP_START ))")"
+            LAST_PHASE="$PHASE"
+            PHASE_START=$NOW
+            WARNED_PHASE=""
+          fi
+          # One-time slow-phase deviation note — in-flight phases only.
+          if [ "$PHASE" != "UNKNOWN" ] && [ "$PHASE" != "$WARNED_PHASE" ]; then
+            case "$PHASE" in
+              ACTIVE|ERROR|CANCELED|SUPERSEDED) : ;;
+              *)
+                IN_PHASE=$(( $(date +%s) - PHASE_START ))
+                if [ "$IN_PHASE" -ge "$SLACK_PHASE_WARN_SECONDS" ]; then
+                  slack_reply "⚠️ \`${PHASE}\` still running at $(( IN_PHASE / 60 ))m — longer than the usual ~$(( SLACK_PHASE_WARN_SECONDS / 60 ))m"
+                  WARNED_PHASE="$PHASE"
+                fi
+                ;;
+            esac
+          fi
+
           case "$PHASE" in
             ACTIVE)
               TIMED_OUT=0
