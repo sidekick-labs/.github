@@ -427,7 +427,7 @@ jobs:
 
       - name: Post deploy summary to Slack thread
         if: ${{ always() && inputs.slack_thread_ts != '' && inputs.slack_channel != '' }}
-        uses: sidekick-labs/.github/.github/actions/slack-deploy-thread@8f49414de97d714762ec4d2e4254fbb96c4e0628 # BUMP TO THIS PR'S MERGE SHA — slack-deploy-thread gained blocks support
+        uses: sidekick-labs/.github/.github/actions/slack-deploy-thread@8d7ce3925dd85d84703238b5965db0dfeadb897a # 8d7ce39 - pinned, bump via PR (blocks support)
         with:
           bot_token: ${{ secrets.SLACK_BOT_TOKEN }}
           channel: ${{ inputs.slack_channel }}
