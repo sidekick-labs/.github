@@ -1,0 +1,151 @@
+name: Slack deploy thread
+description: >-
+  Post a message to Slack as the root of a deploy thread (`start` mode) or as a
+  reply into an existing thread (`reply` mode), via chat.postMessage. The single
+  Slack-posting path for the production release pipeline: promote posts the root,
+  do-app-deploy posts per-phase replies, deploy posts the summary reply, and
+  post-deploy-triage posts the deviations verdict — all into one thread keyed by
+  the `thread_ts` this action emits in `start` mode.
+
+  SOFT-DEGRADE BY DESIGN: this action NEVER exits non-zero. A release must not
+  fail because Slack was unreachable, the token was missing, or the bot wasn't
+  in the channel. When `bot_token` or `channel` is empty it no-ops (the pipeline
+  runs exactly as it did before any Slack wiring). When the API call fails it
+  emits a `::warning::`, sets `ok=false`, and returns — downstream replies that
+  receive an empty `thread_ts` simply skip.
+
+  Messages are authored as Slack mrkdwn by the caller and passed verbatim in
+  `text` (no GitHub-markdown conversion here — the deploy pipeline writes mrkdwn
+  directly, unlike the brains' slack_post.mjs which converts PR bodies).
+
+inputs:
+  bot_token:
+    description: >-
+      Slack bot token (xoxb-…) with chat:write. Empty → this action no-ops.
+      Composite actions can't read secrets.*, so the caller passes it in.
+    required: false
+    default: ""
+  channel:
+    description: "Slack channel ID (C…). Empty → this action no-ops."
+    required: false
+    default: ""
+  mode:
+    description: '"start" (post a thread root, output its ts) or "reply" (post into thread_ts).'
+    required: false
+    default: reply
+  text:
+    description: "Message body, already formatted as Slack mrkdwn."
+    required: true
+  thread_ts:
+    description: >-
+      Required for `reply` mode — the root message ts to thread under. Ignored
+      in `start` mode. In `reply` mode, an empty value makes the action no-op
+      (the root post must have failed upstream; don't strand a top-level reply).
+    required: false
+    default: ""
+
+outputs:
+  thread_ts:
+    description: >-
+      In `start` mode, the ts of the posted root message (use as `thread_ts` for
+      every later reply). In `reply` mode, the input `thread_ts` echoed back.
+      Empty when the action no-ops or the post failed.
+    value: ${{ steps.post.outputs.thread_ts }}
+  ok:
+    description: '"true" when Slack accepted the post, "false" otherwise (incl. no-op).'
+    value: ${{ steps.post.outputs.ok }}
+
+runs:
+  using: composite
+  steps:
+    - name: Post to Slack
+      id: post
+      shell: bash
+      env:
+        BOT_TOKEN: ${{ inputs.bot_token }}
+        CHANNEL: ${{ inputs.channel }}
+        MODE: ${{ inputs.mode }}
+        TEXT: ${{ inputs.text }}
+        THREAD_TS: ${{ inputs.thread_ts }}
+      run: |
+        set -uo pipefail
+
+        emit() { echo "$1=$2" >> "$GITHUB_OUTPUT"; }
+
+        # ── No-op guards (soft) ──────────────────────────────────────────
+        # Missing token/channel is the "not configured" case — the pipeline
+        # ran fine before Slack wiring, so skip silently-but-visibly.
+        if [ -z "$BOT_TOKEN" ] || [ -z "$CHANNEL" ]; then
+          echo "::notice::slack-deploy-thread: bot_token/channel not set — skipping Slack post"
+          emit thread_ts ""
+          emit ok "false"
+          exit 0
+        fi
+        # A reply with no root ts would post as a stray top-level message —
+        # skip instead (the start post upstream must have failed/skipped).
+        if [ "$MODE" = "reply" ] && [ -z "$THREAD_TS" ]; then
+          echo "::notice::slack-deploy-thread: reply mode with empty thread_ts — skipping (no root to thread under)"
+          emit thread_ts ""
+          emit ok "false"
+          exit 0
+        fi
+        # `text` is declared required, but Actions doesn't enforce that at
+        # runtime — a caller wiring text from a skipped step's output would post
+        # a blank message (Slack `no_text`). Guard rather than post noise.
+        if [ -z "$TEXT" ]; then
+          echo "::notice::slack-deploy-thread: text is empty — skipping Slack post"
+          emit thread_ts ""
+          emit ok "false"
+          exit 0
+        fi
+
+        # ── Build the payload ────────────────────────────────────────────
+        # jq assembles valid JSON (TEXT may contain newlines, quotes, mrkdwn).
+        # unfurl_* off so links don't balloon the thread.
+        if [ "$MODE" = "reply" ]; then
+          PAYLOAD=$(jq -n --arg ch "$CHANNEL" --arg text "$TEXT" --arg ts "$THREAD_TS" \
+            '{channel: $ch, text: $text, thread_ts: $ts, unfurl_links: false, unfurl_media: false}')
+        else
+          PAYLOAD=$(jq -n --arg ch "$CHANNEL" --arg text "$TEXT" \
+            '{channel: $ch, text: $text, unfurl_links: false, unfurl_media: false}')
+        fi
+
+        # ── Post (soft on any failure) ───────────────────────────────────
+        RESP=$(curl -sS --max-time 20 -X POST https://slack.com/api/chat.postMessage \
+          -H "Authorization: Bearer ${BOT_TOKEN}" \
+          -H "Content-Type: application/json; charset=utf-8" \
+          --data "$PAYLOAD" 2>/tmp/slack-curl-err) || {
+            echo "::warning::slack-deploy-thread: curl to Slack failed: $(cat /tmp/slack-curl-err 2>/dev/null || echo 'unknown')"
+            emit thread_ts "$([ "$MODE" = reply ] && echo "$THREAD_TS" || echo "")"
+            emit ok "false"
+            exit 0
+          }
+
+        if ! echo "$RESP" | jq -e '.ok == true' >/dev/null 2>&1; then
+          ERR=$(echo "$RESP" | jq -r '.error // "unparseable response"' 2>/dev/null || echo "unparseable response")
+          echo "::warning::slack-deploy-thread: Slack rejected the post: ${ERR}"
+          emit thread_ts "$([ "$MODE" = reply ] && echo "$THREAD_TS" || echo "")"
+          emit ok "false"
+          exit 0
+        fi
+
+        # `// empty` so a (very unlikely) ok=true with no .ts yields "" rather
+        # than the literal "null" — which would otherwise become a bogus thread
+        # root that every later reply fails to thread under.
+        TS=$(echo "$RESP" | jq -r '.ts // empty')
+        if [ "$MODE" = "reply" ]; then
+          # Reply ts is informational only; thread identity stays the ROOT ts.
+          emit thread_ts "$THREAD_TS"
+          emit ok "true"
+          echo "Posted reply into thread ${THREAD_TS}${TS:+ (reply ts ${TS})}"
+        else
+          if [ -z "$TS" ]; then
+            echo "::warning::slack-deploy-thread: Slack returned ok=true but no .ts — cannot establish a thread root"
+            emit thread_ts ""
+            emit ok "false"
+            exit 0
+          fi
+          emit thread_ts "$TS"
+          emit ok "true"
+          echo "Posted thread root (ts ${TS})"
+        fi

@@ -80,11 +80,30 @@ on:
         required: false
         type: string
         default: sidekick-labs
+      slack_channel:
+        description: |
+          Slack channel ID (C…) for the release deploy thread. Empty (default)
+          disables all Slack posting — the deploy runs exactly as before.
+        required: false
+        type: string
+        default: ""
+      slack_thread_ts:
+        description: |
+          Root message ts of the deploy thread (from the promote step's
+          slack-deploy-thread `start`). The deploy posts live per-phase updates
+          and a final summary into this thread, and hands it to post-deploy-triage
+          via the triage-context artifact. Empty → no Slack posting.
+        required: false
+        type: string
+        default: ""
     secrets:
       DIGITALOCEAN_ACCESS_TOKEN:
         required: true
       SENTRY_AUTH_TOKEN:
         description: "Org token with project:releases:write — only needed when notify_sentry=true."
+        required: false
+      SLACK_BOT_TOKEN:
+        description: "Slack bot token (xoxb-…) with chat:write — only needed when slack_channel is set."
         required: false
 
 permissions:
@@ -126,6 +145,8 @@ jobs:
           set -euo pipefail
           SHA=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${DEPLOY_SHA}" --jq '.sha')
           echo "DEPLOY_SHA=$SHA" >> "$GITHUB_ENV"
+          # Start-of-rollout epoch for the Slack summary's wall-clock duration.
+          echo "DEPLOY_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
           echo "Resolved ${DEPLOY_SHA} → ${SHA}"
 
       - name: Install doctl
@@ -157,11 +178,16 @@ jobs:
         id: do_deploy
         # Shared composite action — referenced by explicit repo path (not `./`)
         # so it resolves from THIS repo regardless of the caller's checkout.
-        uses: sidekick-labs/.github/.github/actions/do-app-deploy@848067fcc24fb22ba28fd2dfdac493b515f7ca3b # 9701a0e — pinned, bump via PR
+        uses: sidekick-labs/.github/.github/actions/do-app-deploy@848067fcc24fb22ba28fd2dfdac493b515f7ca3b # 9701a0e — pinned, bump via PR (BUMP TO THIS PR'S MERGE SHA — do-app-deploy changed)
         with:
           app_id: ${{ inputs.app_id }}
           image_repo: ${{ inputs.image_repo }}
           deploy_sha: ${{ env.DEPLOY_SHA }}
+          # Live per-phase thread updates. All no-op unless the caller wired a
+          # channel + thread_ts + the bot token (production path only).
+          slack_bot_token: ${{ secrets.SLACK_BOT_TOKEN }}
+          slack_channel: ${{ inputs.slack_channel }}
+          slack_thread_ts: ${{ inputs.slack_thread_ts }}
 
       - name: Fail the job if the deploy did not succeed
         if: steps.do_deploy.outputs.outcome != 'success'
@@ -176,9 +202,17 @@ jobs:
         if: ${{ always() && inputs.enable_triage && steps.do_deploy.outputs.do_deploy_id != '' }}
         env:
           DO_DEPLOY_ID: ${{ steps.do_deploy.outputs.do_deploy_id }}
+          SLACK_THREAD_TS: ${{ inputs.slack_thread_ts }}
+          SLACK_CHANNEL: ${{ inputs.slack_channel }}
         run: |
           mkdir -p /tmp/triage-context
           printf '%s' "$DO_DEPLOY_ID" > /tmp/triage-context/do-deployment-id.txt
+          # Hand the deploy thread to post-deploy-triage so its verdict lands in
+          # the same thread. Only when a thread was actually opened.
+          if [ -n "$SLACK_THREAD_TS" ]; then
+            printf '%s' "$SLACK_THREAD_TS" > /tmp/triage-context/slack-thread-ts.txt
+            printf '%s' "$SLACK_CHANNEL"   > /tmp/triage-context/slack-channel.txt
+          fi
 
       - name: Upload triage context
         # Artifact name matches the staging reusable so post-deploy-triage's
@@ -331,3 +365,46 @@ jobs:
             echo "- **Final phase:** \`$DO_PHASE\`"
             echo "- **Environment URL:** $APP_URL"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Compose Slack deploy summary
+        # Wrap-up reply for the deploy thread: success/fail, wall-clock duration,
+        # release tag, and the relevant links. Gated on a thread actually being
+        # open (slack_thread_ts + channel), so non-Slack callers skip it.
+        id: slack_summary
+        if: ${{ always() && inputs.slack_thread_ts != '' && inputs.slack_channel != '' }}
+        env:
+          DO_PHASE: ${{ steps.do_deploy.outputs.phase }}
+          DO_DEPLOY_URL: ${{ steps.do_deploy.outputs.do_deploy_url }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          STAGE: ${{ steps.stage.outputs.stage }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          SHORT="${DEPLOY_SHA:0:7}"
+          NOW=$(date +%s)
+          DUR=$(( NOW - ${DEPLOY_START_EPOCH:-$NOW} ))
+          MINS=$(( DUR / 60 ))
+          LINKS="<${APP_URL}|app> · <${RUN_URL}|deploy run>"
+          [ -n "$DO_DEPLOY_URL" ] && LINKS="${LINKS} · <${DO_DEPLOY_URL}|DO console>"
+          if [ "$DO_PHASE" = "ACTIVE" ]; then
+            REL_LINE=""
+            [ -n "$RELEASE_VERSION" ] && REL_LINE=$'\n• release: `'"${RELEASE_VERSION}"'`'
+            TEXT="✅ *Production deploy complete* — \`${SHORT}\` is live (${MINS}m)${REL_LINE}"$'\n'"• ${LINKS}"
+          else
+            TEXT="❌ *Production deploy failed* — \`${SHORT}\` (${MINS}m)"$'\n'"• final phase: \`${DO_PHASE:-unknown}\`"$'\n'"• stage: ${STAGE:-unknown}"$'\n'"• ${LINKS}"$'\n'"_Post-deploy triage will follow up in this thread._"
+          fi
+          {
+            echo "text<<SLACK_EOF"
+            printf '%s\n' "$TEXT"
+            echo "SLACK_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Post deploy summary to Slack thread
+        if: ${{ always() && inputs.slack_thread_ts != '' && inputs.slack_channel != '' }}
+        uses: sidekick-labs/.github/.github/actions/slack-deploy-thread@848067fcc24fb22ba28fd2dfdac493b515f7ca3b # BUMP TO THIS PR'S MERGE SHA — new action
+        with:
+          bot_token: ${{ secrets.SLACK_BOT_TOKEN }}
+          channel: ${{ inputs.slack_channel }}
+          mode: reply
+          thread_ts: ${{ inputs.slack_thread_ts }}
+          text: ${{ steps.slack_summary.outputs.text }}

@@ -86,11 +86,22 @@ on:
         required: false
         type: string
         default: sidekick-labs
+      slack_channel:
+        description: |
+          Slack channel ID (C…) for the release deploy thread. When set (and not
+          a dry-run / no-op re-promote), promote posts the thread root here and
+          passes its ts to the deploy via the dispatch. Empty → no Slack posting.
+        required: false
+        type: string
+        default: ""
     secrets:
       DIGITALOCEAN_ACCESS_TOKEN:
         required: true
       RELEASE_BOT_PRIVATE_KEY:
         required: true
+      SLACK_BOT_TOKEN:
+        description: "Slack bot token (xoxb-…) with chat:write — only needed when slack_channel is set."
+        required: false
 
 permissions:
   # The FF-push to `production` does NOT use GITHUB_TOKEN (see the App-token
@@ -245,6 +256,9 @@ jobs:
           # first-ever release (production branch doesn't exist yet).
           git fetch --no-tags origin production:refs/remotes/origin/production 2>/dev/null || true
           PROD_SHA=$(git rev-parse refs/remotes/origin/production 2>/dev/null || echo "")
+          # Old production tip (pre-push) — the Slack root composes the commit
+          # range PROD_SHA..TARGET from it. Empty on the first-ever release.
+          echo "prod_sha=$PROD_SHA" >> "$GITHUB_OUTPUT"
           if [ -n "$PROD_SHA" ] && [ "$PROD_SHA" = "$TARGET" ]; then
             echo "already_at_target=true" >> "$GITHUB_OUTPUT"
             echo "production already at ${TARGET:0:7} — push will be a no-op, dispatch will be skipped"
@@ -257,6 +271,64 @@ jobs:
           # history. First-release case: this creates refs/heads/production.
           git push origin "${TARGET}:refs/heads/production"
 
+      - name: Compose release thread root
+        # The "what's being promoted" message: target SHA + the commit range
+        # since the old production tip. Only when Slack is configured and a real
+        # deploy will be dispatched (not dry-run / no-op re-promote).
+        id: slack_root_text
+        if: ${{ !inputs.dry_run && success() && steps.ff_push.outputs.already_at_target != 'true' && inputs.slack_channel != '' }}
+        env:
+          TARGET: ${{ steps.target.outputs.sha }}
+          PROD_SHA: ${{ steps.ff_push.outputs.prod_sha }}
+          IMAGE_REPO: ${{ inputs.image_repo }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -uo pipefail
+          SHORT="${TARGET:0:7}"
+          # Commit range since old production tip. First release (no PROD_SHA):
+          # show the most recent commits as a sample rather than walking to root.
+          if [ -n "$PROD_SHA" ] && git rev-parse --verify "$PROD_SHA" >/dev/null 2>&1; then
+            LOG=$(git log --no-merges --format='%h %s' "${PROD_SHA}..${TARGET}" 2>/dev/null)
+            FIRST_NOTE=""
+          else
+            LOG=$(git log --no-merges --format='%h %s' -n 15 "${TARGET}" 2>/dev/null)
+            FIRST_NOTE=" _(first production release)_"
+          fi
+          # `while read` (not mapfile) so this runs on any bash. grep -c counts
+          # non-empty lines; an empty range yields COUNT=0, no bullets.
+          COUNT=$(printf '%s\n' "$LOG" | grep -c . || true)
+          # Cap the bullet list so a big release doesn't blow up the message.
+          MAX=15
+          BULLETS=""
+          i=0
+          while IFS= read -r l; do
+            [ -z "$l" ] && continue
+            if [ "$i" -ge "$MAX" ]; then
+              BULLETS="${BULLETS}"$'\n'"• …and $((COUNT - MAX)) more"
+              break
+            fi
+            # Subjects are plain text; wrap only the sha in code ticks.
+            sha="${l%% *}"; subj="${l#* }"
+            BULLETS="${BULLETS}"$'\n'"• \`${sha}\` ${subj}"
+            i=$((i+1))
+          done <<< "$LOG"
+          TEXT="🚀 *Releasing \`${IMAGE_REPO}\` to production*${FIRST_NOTE}"$'\n'"• SHA: \`${SHORT}\` — ${COUNT} commit(s)"$'\n'"• triggered by @${ACTOR}${BULLETS}"$'\n'"_Rollout starting — live updates below._"
+          {
+            echo "text<<SLACK_EOF"
+            printf '%s\n' "$TEXT"
+            echo "SLACK_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Post release thread root
+        id: slack_root
+        if: ${{ !inputs.dry_run && success() && steps.ff_push.outputs.already_at_target != 'true' && inputs.slack_channel != '' }}
+        uses: sidekick-labs/.github/.github/actions/slack-deploy-thread@848067fcc24fb22ba28fd2dfdac493b515f7ca3b # BUMP TO THIS PR'S MERGE SHA — new action
+        with:
+          bot_token: ${{ secrets.SLACK_BOT_TOKEN }}
+          channel: ${{ inputs.slack_channel }}
+          mode: start
+          text: ${{ steps.slack_root_text.outputs.text }}
+
       - name: Dispatch production deploy
         # The caller's deploy-production workflow only has workflow_dispatch,
         # and CI is scoped to [main], so nothing fires it implicitly — this is
@@ -268,10 +340,26 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SHA: ${{ steps.target.outputs.sha }}
           DEPLOY_WORKFLOW: ${{ inputs.deploy_production_workflow }}
+          # Empty unless the Slack root was posted. Only forwarded when set, so
+          # this reusable stays compatible with callers that don't yet declare
+          # the deploy workflow's `slack_thread_ts` input (passing an unknown
+          # --field would 422 the dispatch *after* the FF-push — the one failure
+          # mode we must avoid).
+          #
+          # Note: only the thread ts crosses the workflow boundary here. The
+          # channel is NOT dispatched — each caller's deploy workflow configures
+          # its own channel independently (vars.RELEASE_SLACK_CHANNEL_ID), so a
+          # new service wires the channel on its deploy workflow, not via this
+          # dispatch.
+          THREAD_TS: ${{ steps.slack_root.outputs.thread_ts }}
         run: |
           set -euo pipefail
-          gh workflow run "$DEPLOY_WORKFLOW" --field ref="$SHA"
-          echo "Dispatched $DEPLOY_WORKFLOW for ${SHA:0:7}"
+          ARGS=(--field ref="$SHA")
+          if [ -n "$THREAD_TS" ]; then
+            ARGS+=(--field slack_thread_ts="$THREAD_TS")
+          fi
+          gh workflow run "$DEPLOY_WORKFLOW" "${ARGS[@]}"
+          echo "Dispatched $DEPLOY_WORKFLOW for ${SHA:0:7}${THREAD_TS:+ (thread ${THREAD_TS})}"
 
       - name: Summary
         if: ${{ !inputs.dry_run && success() }}
