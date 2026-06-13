@@ -369,8 +369,23 @@ jobs:
         run: |
           set -uo pipefail
           BULLETS=$(cat /tmp/release-bullets.txt 2>/dev/null || true)
+          # GitHub-markdown → Slack mrkdwn. The AI summary is free-form and LLMs
+          # default to GitHub markdown (**bold**, ## heads, - lists, [t](u)) which
+          # Slack renders LITERALLY. Normalize so bold + bullets actually take.
+          # (Bullets/header/links elsewhere are composed by us and already clean.)
+          # Each sed expr in order: [t](u)→<u|t>; **b**→*b*; __b__→*b*; ~~s~~→~s~;
+          # leading #-heading→*bold*; leading -/* list marker→• bullet.
+          to_mrkdwn() {
+            sed -E \
+              -e 's/\[([^]]+)\]\(([^)]+)\)/<\2|\1>/g' \
+              -e 's/(^|[^*])\*\*([^*]+)\*\*/\1*\2*/g' \
+              -e 's/(^|[^_])__([^_]+)__/\1*\2*/g' \
+              -e 's/~~([^~]+)~~/~\1~/g' \
+              -e 's/^[[:space:]]*#{1,6}[[:space:]]+(.*)$/*\1*/' \
+              -e 's/^([[:space:]]*)[-*][[:space:]]+/\1• /'
+          }
           SUMMARY=""
-          [ -s /tmp/release-summary.md ] && SUMMARY=$(cat /tmp/release-summary.md)
+          [ -s /tmp/release-summary.md ] && SUMMARY=$(to_mrkdwn < /tmp/release-summary.md)
           {
             echo "text<<SLACK_EOF"
             printf '🚀 *Releasing `%s` to production*%s\n' "$IMAGE_REPO" "$FIRST_NOTE"
