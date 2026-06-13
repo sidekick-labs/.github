@@ -303,13 +303,19 @@ jobs:
             [ -z "$sha" ] && continue
             COUNT=$((COUNT+1))
             [ "$COUNT" -gt "$MAX" ] && continue
-            PR=$(gh api "repos/${REPO}/commits/${sha}/pulls" \
-              --jq '.[0] | "\(.number)\t\(.title)\t\(.html_url)\t\(.body // "")"' 2>/dev/null || true)
-            if [ -n "$PR" ] && [ "$PR" != "null" ]; then
-              NUM=$(printf '%s' "$PR" | cut -f1)
-              TITLE=$(printf '%s' "$PR" | cut -f2)
-              URL=$(printf '%s' "$PR" | cut -f3)
-              BODY=$(printf '%s' "$PR" | cut -f4 | tr '\n' ' ' | cut -c1-300)
+            # Capture the PR JSON once, then extract each field with jq. Do NOT
+            # pack fields into a tab tuple: PR bodies contain newlines+tabs that
+            # break `cut`, corrupting the number/title/url and leaking body text
+            # (incl. tool footers) into the bullets. title/url are single-line;
+            # body is explicitly flattened + footer-stripped + capped.
+            J=$(gh api "repos/${REPO}/commits/${sha}/pulls" 2>/dev/null || echo '[]')
+            NUM=$(printf '%s' "$J" | jq -r '.[0].number // empty' 2>/dev/null || true)
+            if [ -n "$NUM" ]; then
+              TITLE=$(printf '%s' "$J" | jq -r '.[0].title // ""' 2>/dev/null)
+              URL=$(printf '%s' "$J" | jq -r '.[0].html_url // ""' 2>/dev/null)
+              BODY=$(printf '%s' "$J" | jq -r '.[0].body // ""' 2>/dev/null \
+                | sed -E 's/(🤖|:robot_face:).*$//' \
+                | tr '\n\t' '  ' | tr -s ' ' | cut -c1-200)
               printf '• <%s|#%s> %s\n' "$URL" "$NUM" "$TITLE" >> /tmp/release-bullets.txt
               printf -- '- #%s %s — %s\n' "$NUM" "$TITLE" "$BODY" >> /tmp/release-prs.txt
             else
