@@ -386,52 +386,27 @@ jobs:
           MINS=$(( DUR / 60 ))
           LINKS="<${APP_URL}|app> · <${RUN_URL}|deploy run>"
           [ -n "$DO_DEPLOY_URL" ] && LINKS="${LINKS} · <${DO_DEPLOY_URL}|DO console>"
-          # HEAD = summary without links (links move to a favicon context block);
-          # TEXT = full text incl. links, kept as the notification preview + the
-          # fallback when blocks don't render.
+          # Plain text summary with inline mrkdwn links (the favicon Block Kit
+          # rendered poorly — icons on a white background — so it was dropped).
           if [ "$DO_PHASE" = "ACTIVE" ]; then
             REL_LINE=""
             [ -n "$RELEASE_VERSION" ] && REL_LINE=$'\n• release: `'"${RELEASE_VERSION}"'`'
-            HEAD="✅ *Production deploy complete* — \`${SHORT}\` is live (${MINS}m)${REL_LINE}"
-            TEXT="${HEAD}"$'\n'"• ${LINKS}"
+            TEXT="✅ *Production deploy complete* — \`${SHORT}\` is live (${MINS}m)${REL_LINE}"$'\n'"• ${LINKS}"
           else
-            HEAD="❌ *Production deploy failed* — \`${SHORT}\` (${MINS}m)"$'\n'"• final phase: \`${DO_PHASE:-unknown}\`"$'\n'"• stage: ${STAGE:-unknown}"$'\n'"_Post-deploy triage will follow up in this thread._"
-            TEXT="${HEAD}"$'\n'"• ${LINKS}"
+            TEXT="❌ *Production deploy failed* — \`${SHORT}\` (${MINS}m)"$'\n'"• final phase: \`${DO_PHASE:-unknown}\`"$'\n'"• stage: ${STAGE:-unknown}"$'\n'"• ${LINKS}"$'\n'"_Post-deploy triage will follow up in this thread._"
           fi
-          # Favicon resolver — built-in globe fallback when a site has none; the
-          # text label beside each favicon keeps the link usable even if the
-          # image fails to render.
-          fav() { printf 'https://www.google.com/s2/favicons?domain=%s&sz=64' "$1"; }
-          APP_HOST=$(printf '%s' "$APP_URL" | sed -E 's#^https?://##; s#/.*##')
-          BLOCKS=$(jq -nc \
-            --arg head "$HEAD" \
-            --arg appurl "$APP_URL"       --arg appfav "$(fav "$APP_HOST")" \
-            --arg runurl "$RUN_URL"       --arg runfav "$(fav github.com)" \
-            --arg dourl  "$DO_DEPLOY_URL" --arg dofav  "$(fav cloud.digitalocean.com)" \
-            '[
-              {type:"section", text:{type:"mrkdwn", text:$head}},
-              {type:"context", elements: (
-                [ {type:"image", image_url:$appfav, alt_text:"app"},   {type:"mrkdwn", text:("<"+$appurl+"|app>")},
-                  {type:"image", image_url:$runfav, alt_text:"GitHub"}, {type:"mrkdwn", text:("<"+$runurl+"|deploy run>")} ]
-                + (if $dourl != "" then
-                    [ {type:"image", image_url:$dofav, alt_text:"DigitalOcean"}, {type:"mrkdwn", text:("<"+$dourl+"|DO console>")} ]
-                   else [] end)
-              )}
-            ]')
           {
             echo "text<<SLACK_EOF"
             printf '%s\n' "$TEXT"
             echo "SLACK_EOF"
-            echo "blocks=$BLOCKS"
           } >> "$GITHUB_OUTPUT"
 
       - name: Post deploy summary to Slack thread
         if: ${{ always() && inputs.slack_thread_ts != '' && inputs.slack_channel != '' }}
-        uses: sidekick-labs/.github/.github/actions/slack-deploy-thread@8d7ce3925dd85d84703238b5965db0dfeadb897a # 8d7ce39 - pinned, bump via PR (blocks support)
+        uses: sidekick-labs/.github/.github/actions/slack-deploy-thread@8d7ce3925dd85d84703238b5965db0dfeadb897a # 8d7ce39 - pinned, bump via PR
         with:
           bot_token: ${{ secrets.SLACK_BOT_TOKEN }}
           channel: ${{ inputs.slack_channel }}
           mode: reply
           thread_ts: ${{ inputs.slack_thread_ts }}
           text: ${{ steps.slack_summary.outputs.text }}
-          blocks: ${{ steps.slack_summary.outputs.blocks }}

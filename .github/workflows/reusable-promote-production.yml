@@ -102,8 +102,8 @@ on:
       SLACK_BOT_TOKEN:
         description: "Slack bot token (xoxb-…) with chat:write — only needed when slack_channel is set."
         required: false
-      claude-code-oauth-token:
-        description: "CLAUDE_CODE_OAUTH_TOKEN — only used for the AI release-summary step; absent → that step soft-skips and the root falls back to the linked PR list."
+      CLAUDE_CODE_OAUTH_TOKEN:
+        description: "Used for the AI release-summary step. Underscore name so `secrets: inherit` matches the org secret (a hyphenated name never matched → the summary silently no-op'd). Absent → that step soft-skips and the root falls back to the linked PR list."
         required: false
 
 permissions:
@@ -341,7 +341,7 @@ jobs:
         continue-on-error: true
         uses: anthropics/claude-code-action@593d7a5c4e0073569f74772c2b7b64c30ec14707 # main@2.1.160
         with:
-          claude_code_oauth_token: ${{ secrets.claude-code-oauth-token }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           claude_args: >-
             --model ${{ vars.CLAUDE_MODEL || 'claude-opus-4-8' }}
             --allowed-tools Read,Write
