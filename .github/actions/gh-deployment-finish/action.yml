@@ -1,10 +1,19 @@
 name: Finish GitHub Deployment
 description: >-
-  Post the terminal status of a GitHub Deployment from the job's outcome.
+  Post the terminal status of a GitHub Deployment from the ACTUAL DEPLOY
+  OUTCOME — the DigitalOcean phase (do_phase), not the calling job's status.
   Extracted from the always()-scoped "Post final deployment status" step
   duplicated across the staging and production deploy reusables. Call this from
   an `if: always() && <deployment_id> != ''` step so the deployment timeline
   reflects success, failure, or cancellation.
+
+  Why do_phase, not job.status: `job.status` means "did every step succeed",
+  which diverges from "did the rollout reach ACTIVE" — a cosmetic post-deploy
+  step (release tag, Sentry notify, Slack) failing would mislabel a healthy
+  deploy as failed, and a crash in the polling step once mislabeled a rollout
+  that DO actually completed. do_phase == ACTIVE is the source of truth. We
+  fall back to job.status only when do_phase is empty (deploy never started —
+  paired with do-app-deploy's EXIT trap, which makes that nearly impossible).
 
   environment_url is always set — DigitalOcean auto-rolls back failed deploys,
   so the URL still points at a working (previous) version even on failure.
@@ -57,15 +66,23 @@ runs:
         # Prefer the DO deployment URL — one click closer to the deploy logs.
         LOG_URL="${DO_URL:-$RUN_URL}"
 
-        if [ "$JOB_STATUS" = "success" ]; then
-          STATE="success"
-          DESC="Deployed to ${ENVIRONMENT} (phase=${DO_PHASE:-N/A}, deployment ${DO_DEPLOY_ID})"
-        elif [ "$JOB_STATUS" = "cancelled" ]; then
+        # Source of truth = the DigitalOcean phase. job.status is only a
+        # fallback for when no phase was reported at all (deploy never started).
+        if [ "$JOB_STATUS" = "cancelled" ]; then
           STATE="error"
-          DESC="Deploy workflow cancelled"
-        else
+          DESC="Deploy workflow cancelled (phase=${DO_PHASE:-N/A})"
+        elif [ "$DO_PHASE" = "ACTIVE" ]; then
+          STATE="success"
+          DESC="Deployed to ${ENVIRONMENT} (phase=ACTIVE, deployment ${DO_DEPLOY_ID})"
+        elif [ -n "$DO_PHASE" ]; then
+          # Definite non-ACTIVE phase from DO (ERROR/TIMEOUT/UNKNOWN/…) — the
+          # rollout did not confirm ACTIVE, regardless of job.status.
           STATE="failure"
-          DESC="Deploy workflow failed (phase=${DO_PHASE:-N/A}, deployment ${DO_DEPLOY_ID})"
+          DESC="Deploy did not reach ACTIVE (phase=${DO_PHASE}, deployment ${DO_DEPLOY_ID})"
+        else
+          # No phase reported — fall back to the job's status.
+          if [ "$JOB_STATUS" = "success" ]; then STATE="success"; else STATE="failure"; fi
+          DESC="Deploy ${STATE} (no DO phase reported; job=${JOB_STATUS})"
         fi
 
         gh api "repos/${{ github.repository }}/deployments/${{ inputs.deployment_id }}/statuses" \

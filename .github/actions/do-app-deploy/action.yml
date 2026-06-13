@@ -214,8 +214,41 @@ runs:
           emit do_deploy_id ""
           emit do_deploy_url ""
           emit outcome "failure"
+          PHASE_EMITTED=1
           exit 0
         }
+
+        # ── Always emit a phase, even on an UNHANDLED exit ───────────────
+        # The deployment status is sourced from the `phase` output (see
+        # gh-deployment-finish). Every *handled* error calls fail() (which
+        # emits) and the normal path emits at the end — but an unexpected
+        # crash (e.g. a bug that trips the inherited `bash -e`) would exit
+        # with NO phase, leaving the finish step to fall back to job.status
+        # and mislabel a rollout that DO actually completed. This trap closes
+        # that hole: on any exit before a phase was emitted, do one best-effort
+        # `apps get-deployment` and emit whatever DO reports (UNKNOWN if we
+        # can't ask). It does NOT wait for a terminal phase — the polling loop
+        # owns that; this only guarantees the output is never empty.
+        PHASE_EMITTED=0
+        finalize_phase() {
+          [ "${PHASE_EMITTED:-0}" = "1" ] && return 0
+          local p=""
+          if [ -n "${DEPLOY_ID:-}" ] && [ -n "${APP_ID:-}" ]; then
+            p=$(doctl apps get-deployment "$APP_ID" "$DEPLOY_ID" --format Phase --no-header 2>/dev/null | tr -d '[:space:]' || true)
+          fi
+          p="${p:-UNKNOWN}"
+          echo "::warning::do-app-deploy: step exited before emitting a phase; reconciled from DO as '${p}'"
+          emit phase "$p"
+          emit do_deploy_id "${DEPLOY_ID:-}"
+          if [ -n "${DEPLOY_ID:-}" ] && [ -n "${APP_ID:-}" ]; then
+            emit do_deploy_url "https://cloud.digitalocean.com/apps/${APP_ID}/deployments/${DEPLOY_ID}"
+          else
+            emit do_deploy_url ""
+          fi
+          if [ "$p" = "ACTIVE" ]; then emit outcome "success"; else emit outcome "failure"; fi
+          PHASE_EMITTED=1
+        }
+        trap finalize_phase EXIT
 
         # Validate the numeric inputs before they reach arithmetic context.
         # Under `set -e` a non-numeric value (e.g. "30m" or "") would make
@@ -403,4 +436,5 @@ runs:
           emit outcome "failure"
         fi
         emit phase "$PHASE"
+        PHASE_EMITTED=1   # normal path emitted a real phase — trap is now a no-op
         echo "Deployed $DEPLOY_ID (phase=$PHASE)"
