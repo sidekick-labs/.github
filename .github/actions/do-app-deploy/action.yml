@@ -150,38 +150,47 @@ runs:
         # entirely unless the caller passed token + channel + thread_ts, so
         # staging and any non-Slack caller run the loop below untouched. Never
         # fails the deploy: a Slack hiccup is a `::warning::`, nothing more.
-        slack_reply() {
+        # ONE status message per rollout, edited in place via chat.update as
+        # phases advance (instead of a new reply per phase — much less noise).
+        # STATUS_TS holds the message id; empty = not posted yet. No-op when
+        # Slack isn't wired. Soft on every failure.
+        STATUS_TS=""
+        slack_status() {   # $1 = full message text (replaces the message body)
           if [ -z "$SLACK_BOT_TOKEN" ] || [ -z "$SLACK_CHANNEL" ] || [ -z "$SLACK_THREAD_TS" ]; then
             return 0
           fi
-          local payload resp
-          payload=$(jq -n --arg ch "$SLACK_CHANNEL" --arg text "$1" --arg ts "$SLACK_THREAD_TS" \
-            '{channel: $ch, text: $text, thread_ts: $ts, unfurl_links: false, unfurl_media: false}')
-          resp=$(curl -sS --max-time 15 -X POST https://slack.com/api/chat.postMessage \
+          local url payload resp
+          if [ -z "$STATUS_TS" ]; then
+            url=https://slack.com/api/chat.postMessage
+            payload=$(jq -n --arg ch "$SLACK_CHANNEL" --arg text "$1" --arg ts "$SLACK_THREAD_TS" \
+              '{channel: $ch, text: $text, thread_ts: $ts, unfurl_links: false, unfurl_media: false}')
+          else
+            url=https://slack.com/api/chat.update
+            payload=$(jq -n --arg ch "$SLACK_CHANNEL" --arg text "$1" --arg ts "$STATUS_TS" \
+              '{channel: $ch, text: $text, ts: $ts}')
+          fi
+          resp=$(curl -sS --max-time 15 -X POST "$url" \
             -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
             -H "Content-Type: application/json; charset=utf-8" \
             --data "$payload" 2>/dev/null) || {
-              echo "::warning::do-app-deploy: Slack phase update curl failed (non-fatal)"
+              echo "::warning::do-app-deploy: Slack status post/update failed (non-fatal)"
               return 0
             }
-          # Surface the Slack error field (not just "failed") — this is the noisy
-          # per-phase path, so a real reason helps when a thread silently stops
-          # updating mid-rollout.
-          if ! printf '%s' "$resp" | jq -e '.ok == true' >/dev/null 2>&1; then
-            echo "::warning::do-app-deploy: Slack phase update rejected (non-fatal): $(printf '%s' "$resp" | jq -r '.error // "unknown"' 2>/dev/null)"
+          if printf '%s' "$resp" | jq -e '.ok == true' >/dev/null 2>&1; then
+            [ -z "$STATUS_TS" ] && STATUS_TS=$(printf '%s' "$resp" | jq -r '.ts // empty')
+          else
+            echo "::warning::do-app-deploy: Slack status rejected (non-fatal): $(printf '%s' "$resp" | jq -r '.error // "unknown"' 2>/dev/null)"
           fi
         }
-        phase_line() {
-          # $1 = phase, $2 = elapsed seconds since the poll loop started
-          local p="$1"; local mins=$(( $2 / 60 ))
-          case "$p" in
-            PENDING_BUILD|BUILDING)   echo "⏳ \`${p}\` (${mins}m elapsed)" ;;
-            PENDING_DEPLOY|DEPLOYING) echo "🔧 \`${p}\` (${mins}m elapsed)" ;;
-            ACTIVE)                    echo "✅ \`ACTIVE\` (${mins}m elapsed)" ;;
-            ERROR)                     echo "❌ \`ERROR\` (${mins}m elapsed)" ;;
-            CANCELED)                  echo "🚫 \`CANCELED\` (${mins}m elapsed)" ;;
-            SUPERSEDED)                echo "⏭️ \`SUPERSEDED\` (${mins}m elapsed)" ;;
-            *)                         echo "• \`${p}\` (${mins}m elapsed)" ;;
+        phase_chip() {   # $1 = phase, $2 = elapsed minutes — one compact chip
+          case "$1" in
+            PENDING_BUILD|BUILDING)   echo "⏳ \`${1}\` (${2}m)" ;;
+            PENDING_DEPLOY|DEPLOYING) echo "🔧 \`${1}\` (${2}m)" ;;
+            ACTIVE)                    echo "✅ \`ACTIVE\` (${2}m)" ;;
+            ERROR)                     echo "❌ \`ERROR\` (${2}m)" ;;
+            CANCELED)                  echo "🚫 \`CANCELED\` (${2}m)" ;;
+            SUPERSEDED)                echo "⏭️ \`SUPERSEDED\` (${2}m)" ;;
+            *)                         echo "• \`${1}\` (${2}m)" ;;
           esac
         }
         if ! [[ "${SLACK_PHASE_WARN_SECONDS:-}" =~ ^[0-9]+$ ]]; then SLACK_PHASE_WARN_SECONDS=360; fi
@@ -272,9 +281,12 @@ runs:
         # it even if the polling loop below times out.
         emit do_deploy_id "$DEPLOY_ID"
         emit do_deploy_url "https://cloud.digitalocean.com/apps/${APP_ID}/deployments/${DEPLOY_ID}"
-        # Backticks don't render inside a Slack <url|label>, so keep the short
-        # id (code-formatted) outside the link and label the link plainly.
-        slack_reply "⚙️ DO rollout started (deployment \`${DEPLOY_ID:0:8}\`) — <https://cloud.digitalocean.com/apps/${APP_ID}/deployments/${DEPLOY_ID}|DO console>"
+        # Header line for the single status message; phase chips append to TRAIL
+        # below and the whole thing is edited in place. Backticks don't render
+        # inside a Slack <url|label>, so the short id sits outside the link.
+        STATUS_HEADER="⚙️ *Production rollout* (deployment \`${DEPLOY_ID:0:8}\`) — <https://cloud.digitalocean.com/apps/${APP_ID}/deployments/${DEPLOY_ID}|DO console>"
+        TRAIL=""
+        slack_status "$STATUS_HEADER"
 
         # ─── Phase 2: poll for terminal phase ────────────────────────
         #
@@ -320,19 +332,22 @@ runs:
           # caller's summary reply — this is just the live progress line.
           if [ "$PHASE" != "UNKNOWN" ] && [ "$PHASE" != "$LAST_PHASE" ]; then
             NOW=$(date +%s)
-            slack_reply "$(phase_line "$PHASE" "$(( NOW - LOOP_START ))")"
+            CHIP="$(phase_chip "$PHASE" "$(( (NOW - LOOP_START) / 60 ))")"
+            if [ -z "$TRAIL" ]; then TRAIL="$CHIP"; else TRAIL="${TRAIL} · ${CHIP}"; fi
+            slack_status "${STATUS_HEADER}"$'\n'"${TRAIL}"
             LAST_PHASE="$PHASE"
             PHASE_START=$NOW
             WARNED_PHASE=""
           fi
-          # One-time slow-phase deviation note — in-flight phases only.
+          # One-time slow-phase deviation note — appended to the status message
+          # (in-flight phases only).
           if [ "$PHASE" != "UNKNOWN" ] && [ "$PHASE" != "$WARNED_PHASE" ]; then
             case "$PHASE" in
               ACTIVE|ERROR|CANCELED|SUPERSEDED) : ;;
               *)
                 IN_PHASE=$(( $(date +%s) - PHASE_START ))
                 if [ "$IN_PHASE" -ge "$SLACK_PHASE_WARN_SECONDS" ]; then
-                  slack_reply "⚠️ \`${PHASE}\` still running at $(( IN_PHASE / 60 ))m — longer than the usual ~$(( SLACK_PHASE_WARN_SECONDS / 60 ))m"
+                  slack_status "${STATUS_HEADER}"$'\n'"${TRAIL}"$'\n'"⚠️ \`${PHASE}\` running >$(( SLACK_PHASE_WARN_SECONDS / 60 ))m"
                   WARNED_PHASE="$PHASE"
                 fi
                 ;;
