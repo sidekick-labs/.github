@@ -1,0 +1,34 @@
+name: Test release-thread logic
+
+# Runs the regression tests for the bash logic embedded in the production
+# release reusables (the `to_mrkdwn` normalizer + the gather_prs bullet/LLM
+# construction). Two of these shipped bugs to live releases before this existed.
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/reusable-promote-production.yml'
+      - '.github/workflows/reusable-deploy-production.yml'
+      - '.github/actions/slack-deploy-thread/**'
+      - '.github/actions/do-app-deploy/**'
+      - '.github/tests/release-thread-logic.sh'
+      - '.github/workflows/test-release-thread.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/reusable-promote-production.yml'
+      - '.github/workflows/reusable-deploy-production.yml'
+      - '.github/actions/slack-deploy-thread/**'
+      - '.github/actions/do-app-deploy/**'
+      - '.github/tests/release-thread-logic.sh'
+
+permissions:
+  contents: read
+
+jobs:
+  release-thread-logic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Run release-thread logic tests
+        run: bash .github/tests/release-thread-logic.sh
