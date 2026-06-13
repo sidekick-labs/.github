@@ -46,4 +46,34 @@ assert_no "no body leak in bullet" 'Changes'        "$BULLET"
 assert_eq "LLM line single line"   1 "$(printf '%s' "$LLM" | grep -c .)"
 assert_no "footer stripped (LLM)"  'Generated with' "$LLM"
 
+# ── do-app-deploy slack_status under bash -e (SYNC: do-app-deploy) ──
+# GitHub runs composite `shell: bash` steps as `bash -e …`; the step's own
+# `set -uo pipefail` does NOT clear that inherited -e. slack_status is called
+# bare (not in a condition/||), so if it ever returns non-zero the deploy step
+# dies silently — exactly the bug that aborted a live prod rollout (the DO
+# rollout reached ACTIVE in the background but the workflow reported failure).
+# This runs the helper under -e on BOTH the post (kickoff) and update paths and
+# asserts the script reaches the end. KEEP IN SYNC with do-app-deploy.
+SS_RC=$(bash -euo pipefail -c '
+  SLACK_BOT_TOKEN=x; SLACK_CHANNEL=C; SLACK_THREAD_TS=1.2
+  curl() { echo "{\"ok\":true,\"ts\":\"9.9\"}"; }
+  STATUS_TS=""
+  slack_status() {
+    if [ -z "$SLACK_BOT_TOKEN" ] || [ -z "$SLACK_CHANNEL" ] || [ -z "$SLACK_THREAD_TS" ]; then return 0; fi
+    local url payload resp
+    if [ -z "$STATUS_TS" ]; then url=post; payload=$(jq -n --arg t "$1" "{text:\$t}")
+    else url=update; payload=$(jq -n --arg t "$1" "{text:\$t}"); fi
+    resp=$(curl -sS "$url" --data "$payload" 2>/dev/null) || { echo "::warning::post failed"; return 0; }
+    if printf "%s" "$resp" | jq -e ".ok == true" >/dev/null 2>&1; then
+      if [ -z "$STATUS_TS" ]; then STATUS_TS=$(printf "%s" "$resp" | jq -r ".ts // empty"); fi
+    else echo "::warning::rejected"; fi
+    return 0
+  }
+  slack_status kickoff   # post path
+  slack_status update    # update path — STATUS_TS now set; the regression point
+  echo REACHED_END
+' 2>/dev/null; echo "rc=$?")
+assert_eq "slack_status survives -e"  'REACHED_END
+rc=0' "$SS_RC"
+
 if [ "$fail" = 0 ]; then echo "ALL PASS"; else echo "TESTS FAILED"; exit 1; fi

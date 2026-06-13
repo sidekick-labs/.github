@@ -177,10 +177,19 @@ runs:
               return 0
             }
           if printf '%s' "$resp" | jq -e '.ok == true' >/dev/null 2>&1; then
-            [ -z "$STATUS_TS" ] && STATUS_TS=$(printf '%s' "$resp" | jq -r '.ts // empty')
+            # Capture the message id on first post so later calls edit in place.
+            # MUST be an `if`, not `[ … ] && …`: GitHub runs composite steps with
+            # `bash -e` (the step's `set -uo pipefail` adds -u/pipefail but does
+            # NOT clear the inherited -e). A trailing `[ … ] && …` whose test is
+            # false makes this the function's last command → returns 1 → the bare
+            # `slack_status` call site trips -e and silently kills the deploy.
+            if [ -z "$STATUS_TS" ]; then STATUS_TS=$(printf '%s' "$resp" | jq -r '.ts // empty'); fi
           else
             echo "::warning::do-app-deploy: Slack status rejected (non-fatal): $(printf '%s' "$resp" | jq -r '.error // "unknown"' 2>/dev/null)"
           fi
+          # This helper is soft-degrade by contract — never let it propagate a
+          # non-zero status to the (bash -e) caller. See the comment above.
+          return 0
         }
         phase_chip() {   # $1 = phase, $2 = elapsed minutes — one compact chip
           case "$1" in
