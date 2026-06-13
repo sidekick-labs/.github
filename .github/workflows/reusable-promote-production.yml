@@ -385,7 +385,14 @@ jobs:
               -e 's/^([[:space:]]*)[-*][[:space:]]+/\1• /'
           }
           SUMMARY=""
-          [ -s /tmp/release-summary.md ] && SUMMARY=$(to_mrkdwn < /tmp/release-summary.md)
+          if [ -s /tmp/release-summary.md ]; then
+            SUMMARY=$(to_mrkdwn < /tmp/release-summary.md)
+          else
+            # Loud, not silent: this exact case (empty token → no summary) hid for
+            # weeks. The root still posts (linked PR list), but flag it so a
+            # broken token/timeout is visible in the Action log.
+            echo "::warning::AI release summary produced no output (CLAUDE_CODE_OAUTH_TOKEN missing, or the step timed out/failed) — root will use the linked PR list only"
+          fi
           {
             echo "text<<SLACK_EOF"
             printf '🚀 *Releasing `%s` to production*%s\n' "$IMAGE_REPO" "$FIRST_NOTE"
