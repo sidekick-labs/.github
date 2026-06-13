@@ -216,7 +216,7 @@ jobs:
         # Done here (not at deploy time) so we fail BEFORE FF-pushing to
         # production — otherwise we'd advance production to a SHA the deploy
         # can't roll out.
-        uses: sidekick-labs/.github/.github/actions/docr-image-exists@8f49414de97d714762ec4d2e4254fbb96c4e0628 # 8f49414 - pinned, bump via PR
+        uses: sidekick-labs/.github/.github/actions/docr-image-exists@v3  # moving release tag — see #1/v3
         with:
           image_repo: ${{ inputs.image_repo }}
           tag: ${{ steps.target.outputs.sha }}
@@ -398,7 +398,7 @@ jobs:
       - name: Post release thread root
         id: slack_root
         if: ${{ !inputs.dry_run && success() && steps.ff_push.outputs.already_at_target != 'true' && inputs.slack_channel != '' }}
-        uses: sidekick-labs/.github/.github/actions/slack-deploy-thread@8f49414de97d714762ec4d2e4254fbb96c4e0628 # 8f49414 - pinned, bump via PR
+        uses: sidekick-labs/.github/.github/actions/slack-deploy-thread@v3  # moving release tag — see #1/v3
         with:
           bot_token: ${{ secrets.SLACK_BOT_TOKEN }}
           channel: ${{ inputs.slack_channel }}
@@ -507,7 +507,7 @@ jobs:
 
       - name: Report failed-to-start into the deploy thread
         if: ${{ steps.watchdog.outputs.failed_to_start == 'true' }}
-        uses: sidekick-labs/.github/.github/actions/slack-deploy-thread@8f49414de97d714762ec4d2e4254fbb96c4e0628 # 8f49414 - pinned, bump via PR
+        uses: sidekick-labs/.github/.github/actions/slack-deploy-thread@v3  # moving release tag — see #1/v3
         with:
           bot_token: ${{ secrets.SLACK_BOT_TOKEN }}
           channel: ${{ inputs.slack_channel }}
@@ -563,7 +563,7 @@ jobs:
 
       - name: Comment on merged PR when promote fails
         if: failure()
-        uses: sidekick-labs/.github/.github/actions/deploy-failure-comment@8f49414de97d714762ec4d2e4254fbb96c4e0628 # 8f49414 - pinned, bump via PR
+        uses: sidekick-labs/.github/.github/actions/deploy-failure-comment@v3  # moving release tag — see #1/v3
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           sha: ${{ steps.target.outputs.sha }}
