@@ -31,9 +31,10 @@ name: Reusable — Promote to Production
 #
 # Also: a reusable workflow's GITHUB_TOKEN permissions can only be NARROWED
 # here, never elevated — the calling job/workflow must itself grant
-# `actions: write` (to dispatch the production deploy) and `pull-requests: write`
-# (plus `contents: read`). Without actions:write the FF-push succeeds but the
-# deploy is never dispatched (production silently stays on the old image).
+# `pull-requests: write` (failure-comment on the source PR) plus `contents: read`.
+# The production deploy is dispatched with the release-bot App token (see the
+# Dispatch step), NOT GITHUB_TOKEN, so callers no longer need to grant
+# `actions: write` — GITHUB_TOKEN here only needs `actions: read` (watchdog).
 #
 # VERSION PINNING: the composite actions this workflow calls (docr-image-exists,
 # deploy-failure-comment) are pinned to a commit SHA on this repo's `main`,
@@ -110,10 +111,12 @@ permissions:
   # The FF-push to `production` does NOT use GITHUB_TOKEN (see the App-token
   # step). contents: read here is just for read-side gh api calls.
   contents: read
-  # actions: write so the final step can dispatch the production deploy
-  # workflow. Without this the dispatch returns 403 and production silently
-  # never deploys.
-  actions: write
+  # actions: read for the watchdog's `gh run list` (confirm the deploy started).
+  # The deploy DISPATCH no longer uses GITHUB_TOKEN — it uses the release-bot
+  # App token so the deploy's completion workflow_run reaches post-deploy-triage
+  # (a GITHUB_TOKEN-created run would be suppressed by the no-recursive-runs
+  # guard), so GITHUB_TOKEN no longer needs actions: write here.
+  actions: read
   # Allows the failure-notification step to comment on the source PR.
   pull-requests: write
 
@@ -148,8 +151,20 @@ jobs:
         with:
           client-id: ${{ inputs.release_bot_client_id }}
           private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
-          # Scope the token to the minimum it needs — pushing to production.
+          # Scope the token to the minimum it needs:
+          #   contents:write → the FF-push to `production`.
+          #   actions:write  → dispatch the production deploy below. The deploy
+          #     MUST be dispatched by the App (not GITHUB_TOKEN): GitHub's
+          #     "no recursive workflow runs" guard suppresses the deploy run's
+          #     completion `workflow_run` event when the run was created by
+          #     GITHUB_TOKEN, so post-deploy-triage (which listens via
+          #     workflow_run) never fires for production. App-token-created runs
+          #     are exempt, so the triage verdict reaches the release thread.
+          # create-github-app-token narrows the token to ONLY the permission-*
+          # scopes requested here, so actions:write must be listed explicitly
+          # even though the App is granted it at the installation level.
           permission-contents: write
+          permission-actions: write
 
       - name: Checkout (full history for ancestor check)
         id: checkout
@@ -415,12 +430,20 @@ jobs:
       - name: Dispatch production deploy
         # The caller's deploy-production workflow only has workflow_dispatch,
         # and CI is scoped to [main], so nothing fires it implicitly — this is
-        # the chain. GITHUB_TOKEN with actions: write is enough to dispatch.
-        # Gated on already_at_target to avoid a redundant DO re-apply.
+        # the chain. Gated on already_at_target to avoid a redundant DO re-apply.
+        #
+        # Dispatch with the release-bot App token, NOT GITHUB_TOKEN. A run
+        # created by GITHUB_TOKEN is subject to the "no recursive workflow runs"
+        # guard, which suppresses the deploy's completion `workflow_run` event —
+        # so post-deploy-triage (a workflow_run listener) never fires for a
+        # production rollout, and the thread never gets a triage verdict. Runs
+        # created by a GitHub App installation token are exempt from that guard.
+        # workflow_dispatch itself is allowed for either token, so the deploy
+        # still starts; only the downstream workflow_run differs.
         id: dispatch_deploy
         if: ${{ !inputs.dry_run && success() && steps.ff_push.outputs.already_at_target != 'true' }}
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
           SHA: ${{ steps.target.outputs.sha }}
           DEPLOY_WORKFLOW: ${{ inputs.deploy_production_workflow }}
           # Empty unless the Slack root was posted. Only forwarded when set, so
@@ -562,7 +585,7 @@ jobs:
           elif [ "${{ steps.ff_push.outcome }}" = "failure" ]; then
             STAGE="fast-forward push to production branch (non-FF history, or release-bot App missing from production ruleset bypass list?)"
           elif [ "${{ steps.dispatch_deploy.outcome }}" = "failure" ]; then
-            STAGE="dispatching production deploy (production branch advanced but deploy never started — manual dispatch may be needed)"
+            STAGE="dispatching production deploy (production branch advanced but deploy never started — manual dispatch may be needed; if the dispatch 403'd, the release-bot App install may need re-approval for Actions:write)"
           else
             STAGE="environment setup (doctl install, registry auth, …)"
           fi
