@@ -6,6 +6,12 @@ description: >-
   deploy" steps that were duplicated across sidekick-web and sidekick-harness
   staging + production deploy workflows.
 
+  If the tracked deployment ends non-ACTIVE (notably SUPERSEDED — when a
+  concurrent deploy was already in flight at update time), the action
+  reconciles against the app's live active deployment and reports ACTIVE when
+  the app is genuinely serving the target SHA, so a superseding deploy that
+  carries the same image is not reported as a spurious failure.
+
   PREREQUISITES (the caller must do these before invoking this action):
     - `doctl` is installed and authenticated (`doctl auth init --access-token …`).
       doctl persists auth under $HOME for the rest of the job, so this action's
@@ -428,6 +434,69 @@ runs:
           # enumerating every non-terminal state.
           echo "::warning::Deployment $DEPLOY_ID timed out after ${POLL_TIMEOUT}s (last seen phase: $PHASE)"
           PHASE="TIMEOUT"
+        fi
+
+        # ─── Phase 3: outcome-based reconciliation ───────────────────
+        #
+        # Everything above tracks ONE deployment id — the one doctl's `apps
+        # update` response reported as in_progress. But that response returns
+        # whatever deployment is in flight *at call time*, which is NOT
+        # necessarily the one our update creates: if a deployment was already
+        # running when we issued the update (a concurrent trigger — a DOCR
+        # image-push auto-deploy, an overlapping release, a doctl retry), DO
+        # hands back that older id and then creates a *new* deployment that
+        # supersedes it. We poll the older id, watch it go SUPERSEDED, and
+        # cry failure — even though the superseding deploy rolled OUR exact
+        # target image to ACTIVE. (Observed 2026-06-16 on a sidekick-inference
+        # prod release: tracked deployment went SUPERSEDED while the
+        # superseder deployed the same SHA to ACTIVE; the run failed spuriously.)
+        #
+        # So when our tracked deployment ends non-ACTIVE, don't take that as
+        # the verdict — ask the ground-truth question instead: is the app
+        # right now ACTIVE on the SHA we were deploying? Poll the live active
+        # deployment (bounded), and flip to success ONLY if it is ACTIVE AND
+        # every component is on DEPLOY_SHA. A superseder carrying a *different*
+        # image, or a rollback to the prior image, correctly stays a failure.
+        if [ "$PHASE" != "ACTIVE" ]; then
+          echo "::warning::do-app-deploy: tracked deployment ${DEPLOY_ID} ended '${PHASE}'; reconciling against the app's live active deployment (a concurrent deploy may have carried ${DEPLOY_SHA} to ACTIVE)"
+          # Give a superseding deploy that's still in flight a bounded window
+          # to land; stop early if nothing is deploying and the active image
+          # isn't ours (no superseder is coming).
+          RECON_DEADLINE=$(( $(date +%s) + 300 ))
+          while : ; do
+            ACTIVE_JSON=$(doctl apps get "$APP_ID" --output json 2>/dev/null || echo "[]")
+            echo "$ACTIVE_JSON" | jq empty 2>/dev/null || ACTIVE_JSON="[]"
+            ACTIVE_PHASE=$(echo "$ACTIVE_JSON" | jq -r '.[0].active_deployment.phase // ""' 2>/dev/null || echo "")
+            # Names of components whose live active image tag is NOT our SHA.
+            # Empty string ⇒ every component is on DEPLOY_SHA.
+            OFF_TAG=$(echo "$ACTIVE_JSON" | jq -r --arg sha "$DEPLOY_SHA" '
+              [ (.[0].active_deployment.spec // {}) | (.services[]?, .workers[]?, .jobs[]?)
+                | select(.image.tag != $sha) | .name ] | join(",")' 2>/dev/null || echo "PARSE_ERR")
+            INPROG=$(echo "$ACTIVE_JSON" | jq -r '.[0].in_progress_deployment.id // ""' 2>/dev/null || echo "")
+
+            if [ "$ACTIVE_PHASE" = "ACTIVE" ] && [ -z "$OFF_TAG" ]; then
+              RECONCILED_ID=$(echo "$ACTIVE_JSON" | jq -r '.[0].active_deployment.id // ""' 2>/dev/null || echo "")
+              echo "::warning::do-app-deploy: app is ACTIVE on the target SHA ${DEPLOY_SHA} via deployment ${RECONCILED_ID:-unknown} — a concurrent deploy superseded ours with the same image; treating as success"
+              PHASE="ACTIVE"
+              if [ -n "$RECONCILED_ID" ]; then
+                # Re-emit so downstream consumers point at the deployment that
+                # actually went live (last write wins in $GITHUB_OUTPUT).
+                DEPLOY_ID="$RECONCILED_ID"
+                emit do_deploy_id "$DEPLOY_ID"
+                emit do_deploy_url "https://cloud.digitalocean.com/apps/${APP_ID}/deployments/${DEPLOY_ID}"
+              fi
+              slack_status "${STATUS_HEADER}"$'\n'"${TRAIL}"$'\n'"✅ reconciled — app ACTIVE on \`${DEPLOY_SHA:0:8}\`"
+              break
+            fi
+            # No deploy in flight and the active image isn't ours ⇒ no
+            # superseder will land our SHA; keep the failure.
+            if [ -z "$INPROG" ]; then
+              echo "::warning::do-app-deploy: no deployment in progress and the active image is not ${DEPLOY_SHA} — reconciliation cannot succeed; keeping phase '${PHASE}'"
+              break
+            fi
+            [ "$(date +%s)" -ge "$RECON_DEADLINE" ] && { echo "::warning::do-app-deploy: reconciliation window elapsed with a deploy (${INPROG}) still in flight; keeping phase '${PHASE}'"; break; }
+            sleep "$POLL_INTERVAL"
+          done
         fi
 
         if [ "$PHASE" = "ACTIVE" ]; then
