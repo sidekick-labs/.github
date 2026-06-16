@@ -592,6 +592,15 @@ jobs:
           # Build the --allowed-tools list.
           BASE_TOOLS='Read,Glob,Grep,Bash(git checkout:*),Bash(git add:*),Bash(git commit:*),Bash(git push:*),Bash(git fetch:*),Bash(git rebase:*),Bash(git diff:*),Bash(git status:*),Bash(git log:*),Bash(git rev-parse:*),Bash(bundle lock:*),Bash(bundle update:*),Bash(bundle install:*),Bash(bundle exec bundler-audit:*),Bash(bundle exec rubocop:*),Bash(bundle exec rspec:*),Bash(bundle audit:*),Bash(bin/rspec:*),Bash(bin/rubocop:*),Bash(bin/brakeman:*),Bash(bin/tapioca:*),Bash(npm audit:*),Bash(npm run:*),Bash(npm outdated:*),Bash(npm test:*),Bash(./gradlew:*),Bash(pip-audit:*),Bash(pip install:*),Bash(pip list:*),Bash(python:*),Bash(python3:*),Bash(ruff:*),Bash(mypy:*),Bash(pytest:*),Bash(alembic:*),Bash(cat tmp/maintenance/*),Bash(wc:*),Bash(head:*),Bash(tail:*),Bash(diff:*),Bash(gh pr:*),Bash(gh repo:*),Bash(gh api:*)'
           TOOLS="$BASE_TOOLS"
+          if [ "$STACK" = "kmp" ]; then
+            # KMP has no allowlisted command that can look up the latest
+            # Maven/Gradle dependency versions (the gem/npm stacks get this
+            # for free from bundle/npm). Without a network-capable tool the
+            # agent's version lookups are auto-denied and it wrongly reports
+            # "Maven Central unreachable". Grant WebFetch/WebSearch so it can
+            # query Maven Central / Sonatype directly.
+            TOOLS="$TOOLS,WebFetch,WebSearch"
+          fi
           if [ -n "$ADDITIONAL_ALLOWED_TOOLS" ]; then
             TOOLS="$TOOLS,$ADDITIONAL_ALLOWED_TOOLS"
           fi
