@@ -101,10 +101,12 @@ runs:
         DEPLOY_SHA: ${{ inputs.deploy_sha }}
       run: |
         set -euo pipefail
-        # DO is the source of truth for the appspec — env vars, instance
-        # sizes, alerts, etc. are managed in the DO UI. We only patch the
-        # image source: replace the `github`/`dockerfile_path` build with
-        # an `image:` block pinned to this commit's SHA. Restarts and
+        # DO is the source of truth for the appspec — instance sizes, alerts,
+        # and all other env vars are managed in the DO UI. We patch only two
+        # things: the image source (replace the `github`/`dockerfile_path`
+        # build with an `image:` block pinned to this commit's SHA) and a
+        # single `SENTRY_RELEASE` env var stamped to the same SHA, so Sentry
+        # issues correlate to the exact deployed version. Restarts and
         # instance replacements then pull the same digest CI validated.
         #
         # `(.services[], .workers[], .jobs[])` walks all three component
@@ -115,6 +117,10 @@ runs:
 
         # `mikefarah/yq` is preinstalled on ubuntu-latest. `strenv()` is
         # the safe way to interpolate env vars into a yq expression.
+        #
+        # The `.envs` upsert filters out any existing SENTRY_RELEASE first so
+        # it's idempotent (replace, not append-duplicate) and never disturbs
+        # the other DO-managed env vars on the component.
         yq -i '
           (.services[], .workers[], .jobs[]) |= (
             del(.dockerfile_path, .source_dir, .github) |
@@ -122,7 +128,12 @@ runs:
               "registry_type": "DOCR",
               "repository": strenv(IMAGE_REPO),
               "tag": strenv(DEPLOY_SHA)
-            }
+            } |
+            .envs = ((.envs // []) | map(select(.key != "SENTRY_RELEASE"))) + [{
+              "key": "SENTRY_RELEASE",
+              "value": strenv(DEPLOY_SHA),
+              "scope": "RUN_TIME"
+            }]
           )
         ' /tmp/spec.yaml
 
