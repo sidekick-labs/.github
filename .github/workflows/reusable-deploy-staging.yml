@@ -207,7 +207,7 @@ jobs:
         # what fails the job, keeping do_deploy_id available to the always()
         # status steps. Referenced by explicit repo path (not `./`) so it
         # resolves from THIS repo regardless of the caller's checkout.
-        uses: sidekick-labs/.github/.github/actions/do-app-deploy@848067fcc24fb22ba28fd2dfdac493b515f7ca3b # 9701a0e — pinned, bump via PR
+        uses: sidekick-labs/.github/.github/actions/do-app-deploy@bee9fbfb62e6ad28151687d1268d0947263b2ef4 # #75 SENTRY_RELEASE stamp — pinned, bump via PR
         with:
           app_id: ${{ inputs.app_id }}
           image_repo: ${{ inputs.image_repo }}
