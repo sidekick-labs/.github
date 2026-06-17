@@ -30,6 +30,7 @@ on:
       - '.github/tests/release-thread-logic.sh'
       - '.github/tests/deployment-status-logic.sh'
       - '.github/tests/do-app-deploy-reconcile-logic.sh'
+      - '.github/workflows/test-release-thread.yml'
 
 permissions:
   contents: read

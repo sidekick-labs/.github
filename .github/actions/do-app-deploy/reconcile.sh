@@ -31,10 +31,14 @@ reconcile_eval() {  # $1=ACTIVE_JSON  $2=DEPLOY_SHA
   local ACTIVE_PHASE OFF_TAG ON_SHA INPROG RECONCILED_ID
   ACTIVE_PHASE=$(echo "$ACTIVE_JSON" | jq -r '.[0].active_deployment.phase // ""' 2>/dev/null || echo "")
   # Names of components whose live active image tag is NOT our SHA.
-  # Empty string ⇒ no component is off-SHA.
+  # Empty string ⇒ no component is off-SHA. On a jq failure we emit the
+  # `__PARSE_ERR__` sentinel — chosen to be non-empty (so the `-z "$OFF_TAG"`
+  # reconcile guard below stays false: a parse error must never read as "all on
+  # SHA") and deliberately unlike any real component name, so the check can't be
+  # confused with a component that merely happens to be off-SHA.
   OFF_TAG=$(echo "$ACTIVE_JSON" | jq -r --arg sha "$DEPLOY_SHA" '
     [ (.[0].active_deployment.spec // {}) | (.services[]?, .workers[]?, .jobs[]?)
-      | select(.image.tag != $sha) | .name ] | join(",")' 2>/dev/null || echo "PARSE_ERR")
+      | select(.image.tag != $sha) | .name ] | join(",")' 2>/dev/null || echo "__PARSE_ERR__")
   # Count of components actually pinned to our SHA. Empty OFF_TAG alone is not
   # enough to declare success: a spec with ZERO parseable components (a fetch
   # glitch, an unexpected shape) also yields an empty OFF_TAG, which would

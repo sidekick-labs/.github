@@ -37,7 +37,11 @@ assert_eq() { if [ "$2" = "$3" ]; then echo "ok: $1"; else echo "FAIL: $1"; echo
 #   STEP        fake seconds advanced per WAIT poll (the action sleeps POLL_INTERVAL)
 # Echoes the final verdict:  RECONCILED:<id>  |  KEEP_FAILURE
 reconcile_loop() {  # $1=DEPLOY_SHA
-  local DEPLOY_SHA="$1" i=0 deadline=$(( NOW + WINDOW )) snap v last=$(( ${#FIXTURES[@]} - 1 ))
+  # Copy the injected clock into a local `_now` and advance THAT, never the
+  # caller's global NOW. Each test case sets NOW before calling; keeping the
+  # mutation local means the harness can't be contaminated by a future caller
+  # that invokes reconcile_loop twice without resetting NOW in between.
+  local DEPLOY_SHA="$1" i=0 _now="$NOW" deadline=$(( NOW + WINDOW )) snap v last=$(( ${#FIXTURES[@]} - 1 ))
   while : ; do
     if [ "$i" -le "$last" ]; then snap="${FIXTURES[$i]}"; else snap="${FIXTURES[$last]}"; fi
     v=$(reconcile_eval "$snap" "$DEPLOY_SHA")
@@ -46,8 +50,8 @@ reconcile_loop() {  # $1=DEPLOY_SHA
       GIVE_UP)      printf 'KEEP_FAILURE'; return 0 ;;
     esac
     # WAIT:<id> — a deploy is still in flight; wait until the window elapses.
-    if [ "$NOW" -ge "$deadline" ]; then printf 'KEEP_FAILURE'; return 0; fi
-    NOW=$(( NOW + STEP )); i=$(( i + 1 ))
+    if [ "$_now" -ge "$deadline" ]; then printf 'KEEP_FAILURE'; return 0; fi
+    _now=$(( _now + STEP )); i=$(( i + 1 ))
   done
 }
 
