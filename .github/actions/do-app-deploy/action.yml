@@ -470,43 +470,60 @@ runs:
         # image, or a rollback to the prior image, correctly stays a failure.
         if [ "$PHASE" != "ACTIVE" ]; then
           echo "::warning::do-app-deploy: tracked deployment ${DEPLOY_ID} ended '${PHASE}'; reconciling against the app's live active deployment (a concurrent deploy may have carried ${DEPLOY_SHA} to ACTIVE)"
+          # The per-poll decision (is the app ACTIVE on our SHA? still in flight?
+          # or hopeless?) lives in reconcile.sh so it can be unit-tested offline
+          # against canned doctl JSON — see ../../tests/do-app-deploy-reconcile-logic.sh.
+          # GITHUB_ACTION_PATH is set by the runner for composite actions and
+          # points at this action's directory. Sourced lazily here (only when we
+          # actually need to reconcile) and after the EXIT trap is armed, so a
+          # missing/unreadable helper still emits a phase via the trap.
+          # shellcheck source=reconcile.sh
+          source "$GITHUB_ACTION_PATH/reconcile.sh"
           # Give a superseding deploy that's still in flight a bounded window
           # to land; stop early if nothing is deploying and the active image
           # isn't ours (no superseder is coming).
           RECON_DEADLINE=$(( $(date +%s) + 300 ))
           while : ; do
             ACTIVE_JSON=$(doctl apps get "$APP_ID" --output json 2>/dev/null || echo "[]")
-            echo "$ACTIVE_JSON" | jq empty 2>/dev/null || ACTIVE_JSON="[]"
-            ACTIVE_PHASE=$(echo "$ACTIVE_JSON" | jq -r '.[0].active_deployment.phase // ""' 2>/dev/null || echo "")
-            # Names of components whose live active image tag is NOT our SHA.
-            # Empty string ⇒ every component is on DEPLOY_SHA.
-            OFF_TAG=$(echo "$ACTIVE_JSON" | jq -r --arg sha "$DEPLOY_SHA" '
-              [ (.[0].active_deployment.spec // {}) | (.services[]?, .workers[]?, .jobs[]?)
-                | select(.image.tag != $sha) | .name ] | join(",")' 2>/dev/null || echo "PARSE_ERR")
-            INPROG=$(echo "$ACTIVE_JSON" | jq -r '.[0].in_progress_deployment.id // ""' 2>/dev/null || echo "")
-
-            if [ "$ACTIVE_PHASE" = "ACTIVE" ] && [ -z "$OFF_TAG" ]; then
-              RECONCILED_ID=$(echo "$ACTIVE_JSON" | jq -r '.[0].active_deployment.id // ""' 2>/dev/null || echo "")
-              echo "::warning::do-app-deploy: app is ACTIVE on the target SHA ${DEPLOY_SHA} via deployment ${RECONCILED_ID:-unknown} — a concurrent deploy superseded ours with the same image; treating as success"
-              PHASE="ACTIVE"
-              if [ -n "$RECONCILED_ID" ]; then
-                # Re-emit so downstream consumers point at the deployment that
-                # actually went live (last write wins in $GITHUB_OUTPUT).
-                DEPLOY_ID="$RECONCILED_ID"
-                emit do_deploy_id "$DEPLOY_ID"
-                emit do_deploy_url "https://cloud.digitalocean.com/apps/${APP_ID}/deployments/${DEPLOY_ID}"
-              fi
-              slack_status "${STATUS_HEADER}"$'\n'"${TRAIL}"$'\n'"✅ reconciled — app ACTIVE on \`${DEPLOY_SHA:0:8}\`"
-              break
-            fi
-            # No deploy in flight and the active image isn't ours ⇒ no
-            # superseder will land our SHA; keep the failure.
-            if [ -z "$INPROG" ]; then
-              echo "::warning::do-app-deploy: no deployment in progress and the active image is not ${DEPLOY_SHA} — reconciliation cannot succeed; keeping phase '${PHASE}'"
-              break
-            fi
-            [ "$(date +%s)" -ge "$RECON_DEADLINE" ] && { echo "::warning::do-app-deploy: reconciliation window elapsed with a deploy (${INPROG}) still in flight; keeping phase '${PHASE}'"; break; }
-            sleep "$POLL_INTERVAL"
+            # reconcile_eval is pure (snapshot + SHA → verdict); all the doctl/
+            # sleep/emit/Slack side effects stay here in the loop.
+            VERDICT=$(reconcile_eval "$ACTIVE_JSON" "$DEPLOY_SHA")
+            case "$VERDICT" in
+              RECONCILED:*)
+                RECONCILED_ID="${VERDICT#RECONCILED:}"
+                echo "::warning::do-app-deploy: app is ACTIVE on the target SHA ${DEPLOY_SHA} via deployment ${RECONCILED_ID:-unknown} — a concurrent deploy superseded ours with the same image; treating as success"
+                PHASE="ACTIVE"
+                if [ -n "$RECONCILED_ID" ]; then
+                  # Re-emit so downstream consumers point at the deployment that
+                  # actually went live (last write wins in $GITHUB_OUTPUT).
+                  DEPLOY_ID="$RECONCILED_ID"
+                  emit do_deploy_id "$DEPLOY_ID"
+                  emit do_deploy_url "https://cloud.digitalocean.com/apps/${APP_ID}/deployments/${DEPLOY_ID}"
+                fi
+                slack_status "${STATUS_HEADER}"$'\n'"${TRAIL}"$'\n'"✅ reconciled — app ACTIVE on \`${DEPLOY_SHA:0:8}\`"
+                break
+                ;;
+              GIVE_UP)
+                # No deploy in flight and the active image isn't ours ⇒ no
+                # superseder will land our SHA; keep the failure.
+                echo "::warning::do-app-deploy: no deployment in progress and the active image is not ${DEPLOY_SHA} — reconciliation cannot succeed; keeping phase '${PHASE}'"
+                break
+                ;;
+              WAIT:*)
+                # A superseding deploy is still in flight — wait for it, bounded
+                # by the reconciliation window.
+                INPROG="${VERDICT#WAIT:}"
+                [ "$(date +%s)" -ge "$RECON_DEADLINE" ] && { echo "::warning::do-app-deploy: reconciliation window elapsed with a deploy (${INPROG}) still in flight; keeping phase '${PHASE}'"; break; }
+                sleep "$POLL_INTERVAL"
+                ;;
+              *)
+                # Defensive: reconcile_eval only ever prints the three verdicts
+                # above. Treat anything else like WAIT (bounded by the window) so
+                # an unexpected value can never busy-loop hammering the DO API.
+                [ "$(date +%s)" -ge "$RECON_DEADLINE" ] && { echo "::warning::do-app-deploy: unexpected reconcile verdict '${VERDICT}'; window elapsed, keeping phase '${PHASE}'"; break; }
+                sleep "$POLL_INTERVAL"
+                ;;
+            esac
           done
         fi
 
