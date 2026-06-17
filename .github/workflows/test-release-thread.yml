@@ -2,8 +2,10 @@ name: Test release-thread logic
 
 # Runs the regression tests for the bash logic embedded in the production
 # release reusables: the `to_mrkdwn` normalizer + gather_prs construction
-# (release-thread-logic.sh), and the GitHub Deployment STATE decision +
-# do-app-deploy EXIT-trap phase guarantee (deployment-status-logic.sh).
+# (release-thread-logic.sh), the GitHub Deployment STATE decision +
+# do-app-deploy EXIT-trap phase guarantee (deployment-status-logic.sh), and
+# do-app-deploy's outcome-based reconciliation poll loop
+# (do-app-deploy-reconcile-logic.sh).
 # Several of these shipped bugs to live releases before these tests existed.
 on:
   pull_request:
@@ -15,6 +17,7 @@ on:
       - '.github/actions/gh-deployment-finish/**'
       - '.github/tests/release-thread-logic.sh'
       - '.github/tests/deployment-status-logic.sh'
+      - '.github/tests/do-app-deploy-reconcile-logic.sh'
       - '.github/workflows/test-release-thread.yml'
   push:
     branches: [main]
@@ -26,6 +29,7 @@ on:
       - '.github/actions/gh-deployment-finish/**'
       - '.github/tests/release-thread-logic.sh'
       - '.github/tests/deployment-status-logic.sh'
+      - '.github/tests/do-app-deploy-reconcile-logic.sh'
 
 permissions:
   contents: read
@@ -40,3 +44,5 @@ jobs:
         run: bash .github/tests/release-thread-logic.sh
       - name: Run deployment-status logic tests
         run: bash .github/tests/deployment-status-logic.sh
+      - name: Run do-app-deploy reconcile logic tests
+        run: bash .github/tests/do-app-deploy-reconcile-logic.sh
