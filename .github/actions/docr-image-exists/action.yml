@@ -32,13 +32,20 @@ runs:
         # doctl list-tags auto-paginates (PaginateResp), so this returns ALL
         # tags, not just the first page.
         #
+        # NOTE: `doctl registry repository list-tags` has NO `--registry` flag —
+        # a DO account has a single registry, selected implicitly by the
+        # authenticated token. Passing `--registry` errors with "unknown flag"
+        # on the pinned doctl, which masqueraded as "tag absent" and blocked
+        # every promote. The `registry` input is kept for caller compatibility
+        # and surfaced in the error below, but not passed to doctl.
+        #
         # Separate the registry call from the tag check so a DOCR/auth failure
         # doesn't masquerade as "tag absent". Both still fail closed (exit 1) —
         # we never deploy a SHA we can't positively confirm — but the logs name
         # the real cause.
         if ! TAGS_JSON=$(doctl registry repository list-tags "$IMAGE_REPO" \
-              --registry "$REGISTRY" --output json); then
-          echo "::error::Could not list tags for ${IMAGE_REPO} in DOCR (registry unreachable or auth failed)"
+              --output json); then
+          echo "::error::Could not list tags for ${IMAGE_REPO} in DOCR registry ${REGISTRY} (registry unreachable or auth failed)"
           exit 1
         fi
         if ! echo "$TAGS_JSON" \
