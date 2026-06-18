@@ -84,3 +84,10 @@ Creates a Sentry release with optional frontend source map upload.
 ## DOCR Setup
 
 See [DOCR-SETUP.md](DOCR-SETUP.md) for the manual provisioning checklist.
+
+## Cognition operating standard
+
+The cognition/`-ops` repos in this org follow the paradigm + standards recorded in
+**sidekick-labs/octo-brain `decisions/`**: DEC-OCTO-0003 (sensors/actuators on an issue
+spine, Slack lifecycle), DEC-OCTO-0004 (cross-org Slack channel taxonomy + 5-day/SRE-daily
+scheduling). That decision log is the source of truth.
