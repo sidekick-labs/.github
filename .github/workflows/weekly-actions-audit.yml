@@ -24,7 +24,11 @@ name: Weekly Actions Audit
 
 on:
   schedule:
-    - cron: '0 1 * * 1'   # Mon 01:00 UTC = 09:00 SGT
+    # 02:00 SGT Monday — the issue-creating-SENSOR slot (DEC-OCTO-0004 re-time),
+    # ahead of the 07:00 SGT PR-creating actuators so the freshest ci-audit issues
+    # are present when ci-fix-sweep runs. 02:00 SGT = 18:00 UTC the PREVIOUS day,
+    # so Monday-SGT maps to Sunday UTC → DOW 0 (the date-line day-shift), NOT 1.
+    - cron: '0 18 * * 0'   # Mon 02:00 SGT = Sun 18:00 UTC (DOW 0)
   workflow_dispatch:
     inputs:
       scope:
