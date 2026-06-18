@@ -12,7 +12,13 @@ env:
 jobs:
   claude_review:
     name: Claude Code Review
-    if: github.event.pull_request.draft == false && github.event.pull_request.user.login != 'dependabot[bot]'
+    # NOTE: deliberately NOT gating the JOB on dependabot here. A skipped
+    # job reports its required status context as skipped/neutral, which
+    # GitHub treats as not-satisfied -> the required "Claude Code Review"
+    # check stays forever-pending and auto-merge hangs. Instead the job
+    # RUNS for dependabot PRs and the review STEPS are step-gated below, so
+    # the job completes green without spending LLM budget on a version bump.
+    if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -34,13 +40,13 @@ jobs:
           fi
 
       - name: Checkout repository
-        if: steps.token-check.outputs.skip != 'true'
+        if: steps.token-check.outputs.skip != 'true' && github.event.pull_request.user.login != 'dependabot[bot]'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 1
 
       - name: Run Claude Code Review
-        if: steps.token-check.outputs.skip != 'true'
+        if: steps.token-check.outputs.skip != 'true' && github.event.pull_request.user.login != 'dependabot[bot]'
         uses: anthropics/claude-code-action@d5726de019ec4498aa667642bc3a80fca83aa102 # main@2.1.160 (thinking-block 400 fix; ahead of release v1.0.133 — see rarebit-one/rarebit-ops#119)
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
