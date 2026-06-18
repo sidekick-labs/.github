@@ -1,0 +1,43 @@
+name: Dependabot auto-merge
+
+# Org-shared reusable auto-lander. A thin per-repo caller
+# (dependabot-auto-merge.yml, `on: pull_request_target`) invokes this so the
+# logic lives in one place — mirrors the claude-code-review reusable+caller
+# pattern. On a Dependabot PR: read the semver update-type via fetch-metadata,
+# then enable squash auto-merge for patch + minor (GitHub merges once the
+# repo's required checks go green). Major bumps are left for a human.
+#
+# Safety: the caller fires on pull_request_target (writable token), but this
+# workflow checks out no PR code and runs no PR bundle — it only reads metadata
+# and calls the gh API. Dependabot PRs are same-repo branches, and the only
+# privileged action is "approve + enable auto-merge", which still defers the
+# actual merge to the branch-protection gate.
+
+on:
+  workflow_call:
+
+jobs:
+  auto-merge:
+    # Only act on Dependabot's own PRs.
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Fetch Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Approve and enable auto-merge for patch/minor
+        if: |
+          steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
+          steps.metadata.outputs.update-type == 'version-update:semver-minor'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          gh pr review --approve "$PR_URL" || true
+          gh pr merge --auto --squash "$PR_URL"
