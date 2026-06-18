@@ -1,19 +1,32 @@
 #!/usr/bin/env python3
 """
-Open/refresh GitHub issues for the actions-audit's judgment-call findings.
+Open/refresh `ci-audit` issues for the actions-audit's findings (the SENSOR sink).
 
-The judgment sink (flakes, slow-failing workflows, burners) is a CENTRAL GitHub
-tracker in sidekick-labs/sre-brain — the infra/CI-health brain that already owns
-health sweeps + weekly retros, so CI-inefficiency findings belong with it. NOT
-the audited source repos, and NOT Linear (retired). One `ci-audit` issue/finding.
+ALL actionable findings (concurrency, flakes, slow-failing workflows, burners) land
+as `ci-audit` issues in a CENTRAL GitHub tracker — sidekick-labs/sre-brain, the
+infra/CI-health brain that already owns health sweeps + weekly retros. NOT the
+audited source repos, and NOT Linear (retired). One `ci-audit` issue per finding.
 (`.github` was the first pick but has Issues disabled — sre-brain is the home.)
 
-Idempotency mirrors the auto-PR loop's branch-existence dedup: every issue body
-ends with a hidden marker `<!-- actions-audit:<rec_id> -->`. Before creating, we
-search OPEN `ci-audit` issues in the tracker for that marker; if one exists we
-SKIP (leave it — don't stack duplicates), and only create when absent. rec_id is
-the stable hash(repo, workflow_file, category) that recommendations.py stamps on
-every judgment item.
+These issues are the INPUT to the actuator — sre-brain's ci-fix-sweep + ci-fix-
+engine (sre-brain#109). So each body carries the TARGET REPO + the offending
+workflow file in a MACHINE-PARSEABLE form the engine reads deterministically:
+
+    repo: <owner/repo>
+    workflow: .github/workflows/<file>.yml
+    category: <concurrency|flakes|failed-minutes|burners>
+
+(rendered inside a ```` ```ci-target ... ``` ```` fenced block AND as a stable
+`<!-- ci-target repo=<owner/repo> workflow=<path> category=<cat> -->` HTML comment,
+so the engine can parse either the fence or the comment — robust to body edits).
+`workflow` is `(none)` only when the audit couldn't locate the file; the engine
+then locates it itself.
+
+Idempotency: every issue body also ends with a hidden marker
+`<!-- actions-audit:<rec_id> -->`. Before creating, we search OPEN `ci-audit`
+issues for that marker; if one exists we SKIP (leave it — don't stack duplicates),
+and only create when absent. rec_id is the stable hash(repo, workflow_file,
+category) that recommendations.py stamps on every finding.
 
 Reads recommendations.json (the partition output), iterates `judgment[]`. Auth:
 GH_TOKEN env (read by `gh`) — the minted sidekick-release-bot token, which has
@@ -29,11 +42,20 @@ import os
 import subprocess
 import sys
 
-# Central judgment tracker = sre-brain (infra/CI-health). Per-repo routing is the
+# Central tracker = sre-brain (infra/CI-health). Per-repo routing is the
 # alternative: file in the audited repo (sidekick-release-bot has org-wide
 # issues:write) — switchable via the AUDIT_TRACKER_REPO env or this default.
 TRACKER_REPO = os.environ.get("AUDIT_TRACKER_REPO", "sidekick-labs/sre-brain")
 LABEL = "ci-audit"
+# Owner that the audited repo NAMES belong to (audit.py emits owner-stripped names,
+# e.g. "sidekick-web"). The engine needs a fully-qualified owner/name, so we
+# re-qualify here. Mirrors recommendations.py's AUDIT_ORG default.
+ORG = os.environ.get("AUDIT_ORG", "sidekick-labs")
+
+
+def full_repo(repo: str) -> str:
+    """Re-qualify an owner-stripped repo name to owner/name for the engine."""
+    return repo if "/" in repo else f"{ORG}/{repo}"
 
 
 def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
@@ -45,7 +67,7 @@ def ensure_label() -> None:
     r = run([
         "gh", "label", "create", LABEL, "--repo", TRACKER_REPO,
         "--color", "BFD4F2",
-        "--description", "Weekly actions-audit judgment-call finding",
+        "--description", "Weekly actions-audit finding; input to the ci-fix engine",
         "--force",
     ])
     if r.returncode != 0:
@@ -99,15 +121,45 @@ def issue_title(j: dict) -> str:
     return f"[ci-audit] {j['repo']}/{j['workflow_name']}: {j['category']}"
 
 
+def target_block(repo_full: str, wf_path: str, category: str) -> str:
+    """Machine-parseable target descriptor the ci-fix engine reads.
+
+    Rendered TWICE for robustness: a fenced ```ci-target``` block (human-visible,
+    grep-friendly) and a stable HTML comment (survives body re-renders). The engine
+    parses either; both name the SAME owner/repo + workflow path + category."""
+    wf = wf_path or "(none)"
+    fence = (
+        "```ci-target\n"
+        f"repo: {repo_full}\n"
+        f"workflow: {wf}\n"
+        f"category: {category}\n"
+        "```"
+    )
+    comment = f"<!-- ci-target repo={repo_full} workflow={wf} category={category} -->"
+    return f"{fence}\n\n{comment}"
+
+
 def issue_body(j: dict, run_url: str) -> str:
-    wf_file = j.get("workflow_file", "") or "(unknown)"
+    repo_full = full_repo(j["repo"])
+    wf_file = j.get("workflow_file", "") or "(none)"
+    suggested = j.get("suggested_fix", "")
+    suggested_md = (
+        f"**Suggested fix (the engine re-verifies + yaml-validates before applying)**\n"
+        f"```yaml\n{suggested}\n```\n\n"
+        if suggested else ""
+    )
     return (
         f"{j.get('note', '').strip()}\n\n"
-        f"**Source workflow:** `{j['repo']}` · `{wf_file}`\n"
+        f"**Target** — the ci-fix engine fixes this workflow:\n\n"
+        f"{target_block(repo_full, j.get('workflow_file', ''), j['category'])}\n\n"
+        f"**Source workflow:** `{repo_full}` · `{wf_file}`\n"
         f"**Category:** {j['category']}\n\n"
+        f"{suggested_md}"
         f"**Metrics**\n{metrics_block(j)}\n\n"
-        f"_Filed by the weekly actions-audit ({run_url}). Awaits a human — "
-        f"nothing here is auto-fixed._\n\n"
+        f"_Filed by the weekly actions-audit ({run_url}) as the SENSOR half of the "
+        f"CI self-healing loop (sre-brain#109). The `ci-fix` engine reads the "
+        f"`ci-target` above, proposes a guarded workflow fix, and opens a "
+        f"ready-for-review PR that links back here. A human closes this issue._\n\n"
         f"{marker(j['rec_id'])}"
     )
 
