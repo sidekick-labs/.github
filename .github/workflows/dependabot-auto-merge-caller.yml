@@ -1,0 +1,22 @@
+name: Dependabot auto-merge
+
+# Caller that runs the auto-lander on this repo's own Dependabot PRs. The
+# reusable definition lives alongside it (dependabot-auto-merge.yml,
+# `on: workflow_call`) and doesn't self-trigger. Referenced locally (`./`).
+
+on: pull_request_target
+
+permissions: {}
+
+concurrency:
+  group: dependabot-auto-merge-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  auto-merge:
+    if: github.actor == 'dependabot[bot]'
+    permissions:
+      contents: write
+      pull-requests: write
+    uses: ./.github/workflows/dependabot-auto-merge.yml
+    secrets: inherit
