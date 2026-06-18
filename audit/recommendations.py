@@ -1,33 +1,45 @@
 #!/usr/bin/env python3
 """
-Partition actions-audit findings into auto-PR-able vs judgment-call recs.
+Partition actions-audit findings into deduped `ci-audit` issue recs (the SENSOR).
 
-Reads the findings JSON from audit.py and produces two lists:
+This is the SENSOR half of the CI self-healing loop (DEC-OCTO-0003, sre-brain#109):
+a deterministic scan that turns EVERY actionable finding into a `ci-audit` issue in
+the org's CI-health tracker (sidekick-labs/sre-brain). It opens NO PRs — the fix is
+the actuator's job (sre-brain's ci-fix-sweep + ci-fix-engine), which reads these
+issues, proposes a guarded workflow fix, and opens a ready-for-review PR that links
+back to the originating issue. Keeping the sensor PR-free is the whole point: one
+auditable work unit per finding, fixed (or not) downstream where a human gates it.
 
-  - auto_pr:   high-confidence, deterministic fixes the engine can open a PR for.
-               START WITH ONLY ONE PATTERN (locked decision): add a missing
-               `concurrency:` block to a workflow whose cancel rate is >=10% with
-               >=3 cancels (the audit's Lens-4 threshold).
-  - judgment:  everything else with signal (flake root-cause, slow-failing
-               workflows, burners) -> routed to a central GitHub-issue tracker in
-               sidekick-labs/.github (the judgment sink; Linear is retired). NOT a
-               committed markdown report.
+(Previously this file also produced an `auto_pr` list — a narrow inline
+`concurrency:` auto-fix PR. Per sre-brain#109 that path moved to the ci-fix engine,
+so `concurrency` is now just another `judgment` finding category like flakes /
+failed-minutes / burners. The `auto_pr`/`false_positives` lists are retained in the
+output for shape stability but `auto_pr` is always empty.)
 
-Each rec (auto-PR AND judgment) carries a STABLE rec id = short hash(repo,
-workflow file, change-type/category). For auto-PR recs the workflow names the
-branch `actions-audit/<rec-id>` and stays idempotent across weeks (skip if the
-branch or an open PR with that head exists). For judgment recs the workflow
-embeds a hidden `<!-- actions-audit:<rec-id> -->` marker in the GitHub issue body
-and searches for it before creating, so re-runs refresh rather than stack
-duplicates — the same idempotency idea applied to issues.
+Findings (all routed to `ci-audit` issues):
+  - concurrency:    a workflow with a >=10% cancel rate (>=3 cancels) and NO
+                    top-level `concurrency:` block (the audit's Lens-4 threshold) —
+                    the engine's most common fix.
+  - flakes:         same-SHA retry-then-success flake(s); needs root-cause.
+  - failed-minutes: failures that burn real minutes before failing.
+  - burners:        top minute-consumers worth a human/engine look.
+
+Each rec carries a STABLE rec id = short hash(repo, workflow file, category). The
+workflow embeds a hidden `<!-- actions-audit:<rec-id> -->` marker in the `ci-audit`
+issue body and searches for it before creating, so re-runs refresh rather than
+stack duplicates (the issue-spine dedup discipline). Crucially, every rec carries
+the TARGET REPO (`repo`, owner-stripped) AND the offending workflow file
+(`workflow_file`, the `.github/workflows/<file>.yml` path) so the downstream
+ci-fix engine knows exactly what to fix — open_issues.py renders these as
+machine-parseable `repo:` / `workflow:` lines in the issue body.
 
 Cheap pre-check (Skill Rule #1): for a `concurrency` rec we fetch the workflow's
 raw YAML via `gh api` and, if a top-level `concurrency:` key is already present,
-DROP the rec as a false positive before it ever reaches the engine. The engine
+DROP the rec as a false positive before it ever becomes an issue. The engine
 prompt repeats this verification at edit time; this is the inexpensive first gate.
 
 Output: a single JSON object on stdout:
-  {"auto_pr": [...], "judgment": [...], "false_positives": [...]}
+  {"auto_pr": [], "judgment": [...], "false_positives": [...]}
 Diagnostics go to stderr. Auth: GH_TOKEN env (read by `gh`), same as audit.py.
 
 The workflow's scope INCLUDES sidekick-labs/.github itself (locked decision), so
@@ -49,7 +61,9 @@ ORG = os.environ.get("AUDIT_ORG", "sidekick-labs")
 CANCEL_RATE_MIN = 0.10
 CANCEL_COUNT_MIN = 3
 
-CHANGE_ADD_CONCURRENCY = "add-concurrency"
+# Finding category for the missing-concurrency pattern. The ci-fix engine reads
+# the `suggested_fix` snippet below as a strong hint (it re-verifies before editing).
+CAT_CONCURRENCY = "concurrency"
 
 CONCURRENCY_SNIPPET = """concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -60,10 +74,10 @@ _TOP_LEVEL_CONCURRENCY = re.compile(r"(?m)^concurrency\s*:")
 
 
 def rec_id(repo: str, workflow_file: str, change_type: str) -> str:
-    """Stable short id for idempotency. For auto-PR recs `change_type` is the
-    change kind (e.g. add-concurrency) and names the branch actions-audit/<rec-id>;
-    for judgment recs it is the finding `category`, and the id is embedded as the
-    `<!-- actions-audit:<rec-id> -->` issue marker for dedup."""
+    """Stable short id for idempotency. `change_type` is the finding `category`
+    (concurrency / flakes / failed-minutes / burners); the id is embedded as the
+    `<!-- actions-audit:<rec-id> -->` marker in the `ci-audit` issue body and
+    dedups on it across runs (refresh in place, never stack duplicates)."""
     h = hashlib.sha256(f"{repo}\0{workflow_file}\0{change_type}".encode()).hexdigest()
     return h[:12]
 
@@ -99,53 +113,64 @@ def partition(data: dict) -> dict:
         name = w["name"]
         wf_path = w.get("path", "")
 
-        # ---- Auto-PR-able pattern: missing concurrency on a high-cancel workflow.
+        # ---- Missing concurrency on a high-cancel workflow -> ci-audit issue.
+        # The ci-fix engine (sre-brain) reads the issue, re-verifies the block is
+        # genuinely missing, and opens a guarded ready-for-review PR. We still run
+        # the cheap pre-check here so already-fixed workflows never become noise.
         if w.get("cancelled", 0) >= CANCEL_COUNT_MIN and w.get("cancel_rate", 0) >= CANCEL_RATE_MIN:
-            rid = rec_id(repo, wf_path, CHANGE_ADD_CONCURRENCY)
-            rec = {
-                "rec_id": rid,
-                "repo": repo,
-                "workflow_name": name,
-                "workflow_file": wf_path,
-                "change_type": CHANGE_ADD_CONCURRENCY,
-                "branch": f"actions-audit/{rid}",
-                "cancelled": w["cancelled"],
-                "cancel_rate": w["cancel_rate"],
-                "cancelled_minutes": w.get("cancelled_minutes", 0),
-                "snippet": CONCURRENCY_SNIPPET,
-                "rationale": (
-                    f"{name} in {repo} cancelled {w['cancelled']} runs "
-                    f"({w['cancel_rate']*100:.0f}% cancel rate), wasting "
-                    f"~{w.get('cancelled_minutes', 0):.0f} min. A top-level "
-                    f"`concurrency:` block keyed on the ref with "
-                    f"`cancel-in-progress: true` collapses superseded in-flight runs."
-                ),
-            }
+            note = (
+                f"{name} in {repo} cancelled {w['cancelled']} runs "
+                f"({w['cancel_rate']*100:.0f}% cancel rate), wasting "
+                f"~{w.get('cancelled_minutes', 0):.0f} min. A top-level "
+                f"`concurrency:` block keyed on the ref with "
+                f"`cancel-in-progress: true` collapses superseded in-flight runs."
+            )
 
-            # Cheap pre-check (Skill Rule #1): if the YAML already has a
-            # top-level concurrency block, this is a false positive — drop it.
             if not wf_path:
-                # Can't locate the file (e.g. run.path was empty) -> route to a
-                # judgment GitHub issue for a human rather than blindly opening a PR.
+                # Can't locate the file (e.g. run.path was empty) -> still file a
+                # ci-audit issue, but flag that the engine must locate the workflow.
                 judgment.append({
                     "repo": repo,
                     "workflow_name": name,
                     "workflow_file": wf_path,
-                    "category": "cancellations",
-                    "note": "high cancel rate but workflow file path unknown; "
-                            "needs manual location",
-                    "metrics": {"cancelled": w["cancelled"], "cancel_rate": w["cancel_rate"]},
+                    "category": CAT_CONCURRENCY,
+                    "note": note + " NOTE: workflow file path unknown — the engine "
+                            "must locate the offending workflow before editing.",
+                    "metrics": {
+                        "cancelled": w["cancelled"],
+                        "cancel_rate": w["cancel_rate"],
+                        "cancelled_minutes": w.get("cancelled_minutes", 0),
+                    },
                 })
-                continue
-
-            yaml_text = gh_raw_workflow(repo, wf_path)
-            if yaml_text is not None and has_concurrency_block(yaml_text):
-                false_positives.append({
-                    **rec,
-                    "reason": "top-level `concurrency:` block already present",
-                })
-                continue
-            auto_pr.append(rec)
+            else:
+                # Cheap pre-check (Skill Rule #1): if the YAML already has a
+                # top-level concurrency block, this is a false positive — drop it
+                # before it ever becomes a ci-audit issue.
+                yaml_text = gh_raw_workflow(repo, wf_path)
+                if yaml_text is not None and has_concurrency_block(yaml_text):
+                    false_positives.append({
+                        "repo": repo,
+                        "workflow_name": name,
+                        "workflow_file": wf_path,
+                        "category": CAT_CONCURRENCY,
+                        "reason": "top-level `concurrency:` block already present",
+                    })
+                else:
+                    judgment.append({
+                        "repo": repo,
+                        "workflow_name": name,
+                        "workflow_file": wf_path,
+                        "category": CAT_CONCURRENCY,
+                        "note": note,
+                        # A concrete fix hint the engine treats as a strong
+                        # suggestion (it re-verifies + yaml-validates before push).
+                        "suggested_fix": CONCURRENCY_SNIPPET,
+                        "metrics": {
+                            "cancelled": w["cancelled"],
+                            "cancel_rate": w["cancel_rate"],
+                            "cancelled_minutes": w.get("cancelled_minutes", 0),
+                        },
+                    })
 
         # ---- Judgment-call signal -> GitHub-issue tracker (not a committed report).
         if w.get("flake_count", 0) > 0:
@@ -200,12 +225,11 @@ def partition(data: dict) -> dict:
             },
         })
 
-    # Stamp every judgment rec with a STABLE rec_id = hash(repo, workflow_file,
-    # category) — the same hashing scheme/helper as auto-PR recs, with the
-    # finding `category` as the change-type component. The workflow embeds this id
-    # as a hidden `<!-- actions-audit:<rec-id> -->` marker in the GitHub issue and
-    # dedups on it across runs (refresh, don't stack). Stamped here (one place)
-    # rather than at each of the judgment append sites.
+    # Stamp every finding with a STABLE rec_id = hash(repo, workflow_file,
+    # category). The workflow embeds this id as a hidden
+    # `<!-- actions-audit:<rec-id> -->` marker in the `ci-audit` issue and dedups
+    # on it across runs (refresh, don't stack). Stamped here (one place) rather
+    # than at each of the append sites.
     for j in judgment:
         j["rec_id"] = rec_id(j["repo"], j.get("workflow_file", ""), j["category"])
 
@@ -213,6 +237,8 @@ def partition(data: dict) -> dict:
         "generated_at": data.get("generated_at"),
         "window_days": data.get("window_days"),
         "scope": data.get("scope"),
+        # `auto_pr` is retained for output-shape stability but is always empty:
+        # the actuator (sre-brain ci-fix) now owns ALL fixes (sre-brain#109).
         "auto_pr": auto_pr,
         "judgment": judgment,
         "false_positives": false_positives,

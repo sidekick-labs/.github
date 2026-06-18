@@ -1,37 +1,32 @@
 name: Weekly Actions Audit
 
-# Org-level GitHub Actions waste audit + auto-fix sweep.
+# Org-level GitHub Actions waste audit — the deterministic SENSOR of the CI
+# self-healing loop (DEC-OCTO-0003 / sre-brain#109).
 #
 # NOT a reusable per-repo workflow — this is a single org-level sweep that lives
 # in sidekick-labs/.github, audits Actions *usage* across the whole org (INCLUDING
-# this repo's own reusable workflows), and opens auto-fix PRs in the target repos.
-# It reuses reusable-weekly-maintenance.yml's conventions: engine selection
-# (claude | codex), a validate-secrets gate, actions/cache for week-over-week
-# deltas, SHA-pinned third-party actions, and signed PRs.
+# this repo's own reusable workflows), and files ONE deduped `ci-audit` issue per
+# finding in the central sidekick-labs/sre-brain tracker.
 #
-# Build-order status (docs/weekly-actions-audit-automation-plan.md): this is the
-# go-live — the weekly Monday cron is enabled (steps 5-6). It triggers on a
-# schedule AND workflow_dispatch. The dispatch dry-run path remains for ad-hoc
-# single-repo validation.
+# ISSUE-ONLY (sensor): this workflow opens NO PRs. EVERY actionable finding —
+# including the missing-`concurrency:` pattern that used to be an inline auto-fix
+# PR here — is now a `ci-audit` issue. The fix moved to the ACTUATOR: sre-brain's
+# ci-fix-sweep + ci-fix-engine read these issues, propose a guarded workflow fix,
+# and open a ready-for-review PR that links back to the issue (a human closes it).
+# Each `ci-audit` issue carries the TARGET REPO + offending workflow file in a
+# machine-parseable `ci-target` block (see audit/open_issues.py) so the engine
+# knows exactly what to fix. This keeps the sensor deterministic (no LLM/OAuth
+# budget) and every fix an auditable work unit. Nothing here merges (rule #7).
 #
-# Auto-PR scope is intentionally narrow: the ONLY auto-PR-able pattern for now is
-# adding a missing top-level `concurrency:` block to a workflow with a >=10%
-# cancel rate (>=3 cancels). Everything else (flake root-causes, slow-failing
-# workflows, burners) is routed to a deduped GitHub issue in the central
-# sidekick-labs/sre-brain `ci-audit` tracker, never a committed markdown report.
-# Nothing here merges (workspace rule #7).
+# Kept from the prior design: the deterministic audit.py/recommendations.py scan,
+# the actions/cache week-over-week deltas, marker-based issue dedup, and the Slack
+# digest. SHA-pinned third-party actions throughout.
 
 on:
   schedule:
     - cron: '0 1 * * 1'   # Mon 01:00 UTC = 09:00 SGT
   workflow_dispatch:
     inputs:
-      engine:
-        description: 'AI engine: claude (default) or codex.'
-        required: false
-        type: choice
-        options: [claude, codex]
-        default: claude
       scope:
         description: 'Audit scope passed to audit.py: auto | core5 | all.'
         required: false
@@ -44,39 +39,32 @@ on:
         type: string
         default: '7'
       dry-run:
-        description: 'When true, run the audit + partition and post the digest, but do NOT open PRs or GitHub ci-audit issues. Use for the first single-repo validation.'
+        description: 'When true, run the audit + partition and post the digest, but do NOT open ci-audit issues. Use for ad-hoc validation.'
         required: false
         type: boolean
         default: false
 
 permissions: {}
 
-env:
-  # Single source of truth for the Claude model (mirrors weekly-maintenance).
-  CLAUDE_MODEL: "${{ vars.CLAUDE_MODEL || 'claude-opus-4-8' }}"
-  # Codex model; empty lets codex-action pick its default. Only used when engine=codex.
-  CODEX_MODEL: "${{ vars.CODEX_MODEL || '' }}"
+concurrency:
+  group: weekly-actions-audit
+  cancel-in-progress: false
 
 jobs:
   audit:
-    name: Actions audit + auto-fix sweep
+    name: Actions audit (issue-only sensor)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
-      contents: read   # job token only reads this repo; cross-repo writes use the minted App token
+      contents: read   # job token only reads this repo; cross-repo issue writes use the minted App token
 
     steps:
       - name: Validate inputs
         env:
-          ENGINE: ${{ inputs.engine }}
           SCOPE: ${{ inputs.scope }}
           WINDOW: ${{ inputs.window }}
         run: |
           set -euo pipefail
-          case "$ENGINE" in
-            claude|codex) ;;
-            *) echo "::error::Invalid engine: $ENGINE (expected claude or codex)"; exit 1 ;;
-          esac
           case "$SCOPE" in
             auto|core5|all) ;;
             *) echo "::error::Invalid scope: $SCOPE"; exit 1 ;;
@@ -87,23 +75,16 @@ jobs:
 
       - name: Validate required secrets
         env:
-          ENGINE: ${{ inputs.engine }}
-          CLAUDE_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
           APP_PRIVATE_KEY: ${{ secrets.SIDEKICK_RELEASE_BOT_PRIVATE_KEY }}
           APP_ID: ${{ vars.SIDEKICK_RELEASE_BOT_APP_ID }}
         run: |
           set -euo pipefail
-          # Engine creds (never ANTHROPIC_API_KEY for the claude engine).
+          # Cross-repo App credentials (sidekick-release-bot) are required to read
+          # org-wide Actions usage and to file ci-audit issues in the sre-brain
+          # tracker. No engine creds here — this sensor opens no PRs and runs no LLM.
           # Use `[ -n ] || { … }`, not `[ -z ] && { … }`: under `set -e` a `[ -z ]`
           # test that PASSES (secret present) returns 1 as the branch's last command
           # and would abort the step even though every secret is set.
-          if [ "$ENGINE" = "codex" ]; then
-            [ -n "${CODEX_AUTH_JSON:-}" ] || { echo "::error::engine=codex but CODEX_AUTH_JSON secret is not set"; exit 1; }
-          else
-            [ -n "${CLAUDE_TOKEN:-}" ] || { echo "::error::engine=claude but CLAUDE_CODE_OAUTH_TOKEN secret is not set"; exit 1; }
-          fi
-          # Cross-repo App credentials (sidekick-release-bot) are required to open PRs.
           [ -n "${APP_ID:-}" ] || { echo "::error::vars.SIDEKICK_RELEASE_BOT_APP_ID is not set"; exit 1; }
           [ -n "${APP_PRIVATE_KEY:-}" ] || { echo "::error::secrets.SIDEKICK_RELEASE_BOT_PRIVATE_KEY is not set"; exit 1; }
           echo "required secrets present"
@@ -122,7 +103,9 @@ jobs:
       # sidekick-release-bot App. Reuses the SAME app-id/private-key names that
       # octo-brain + the team-brains use. owner: sidekick-labs with no
       # `repositories:` => all repos the App is installed on (the org-level sweep
-      # needs org-wide reach to clone + open PRs in any target repo).
+      # needs org-wide reach to READ each repo's Actions usage + workflow files).
+      # ISSUE-ONLY sensor: contents:read (not write) + issues:write only — no
+      # pull-requests scope, because the fix (and its PR) lives in the ci-fix engine.
       - name: Mint sidekick-release-bot installation token
         id: app_token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
@@ -130,10 +113,9 @@ jobs:
           app-id: ${{ vars.SIDEKICK_RELEASE_BOT_APP_ID }}
           private-key: ${{ secrets.SIDEKICK_RELEASE_BOT_PRIVATE_KEY }}
           owner: sidekick-labs
-          permission-contents: write
-          permission-pull-requests: write
-          permission-issues: write   # open/refresh the ci-audit judgment issues in the sre-brain tracker
-          permission-actions: read
+          permission-contents: read   # read workflow files for the concurrency pre-check
+          permission-issues: write    # open/refresh the ci-audit issues in the sre-brain tracker
+          permission-actions: read    # read org-wide Actions runs/usage (the audit)
           permission-metadata: read
 
       # ----- week-over-week deltas via cache (mirror weekly-maintenance census cache) -----
@@ -175,168 +157,30 @@ jobs:
           set -euo pipefail
           python3 audit/recommendations.py "$GITHUB_WORKSPACE/tmp/audit/audit.json" \
             --output "$GITHUB_WORKSPACE/tmp/audit/recommendations.json"
-          AUTO_COUNT=$(jq '.auto_pr | length' "$GITHUB_WORKSPACE/tmp/audit/recommendations.json")
           JUDG_COUNT=$(jq '.judgment | length' "$GITHUB_WORKSPACE/tmp/audit/recommendations.json")
           FP_COUNT=$(jq '.false_positives | length' "$GITHUB_WORKSPACE/tmp/audit/recommendations.json")
           {
-            echo "auto_count=$AUTO_COUNT"
             echo "judgment_count=$JUDG_COUNT"
             echo "fp_count=$FP_COUNT"
           } >> "$GITHUB_OUTPUT"
           {
-            echo "## Recommendations partition"
-            echo "- Auto-PR-able (concurrency): $AUTO_COUNT"
-            echo "- Judgment-call (-> GitHub ci-audit issues): $JUDG_COUNT"
+            echo "## Findings partition"
+            echo "- Findings (-> ci-audit issues): $JUDG_COUNT"
             echo "- False positives (already fixed): $FP_COUNT"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ----- Codex auth (only when engine=codex) -----
-
-      - name: Setup Codex auth
-        id: codex-auth
-        if: ${{ inputs.engine == 'codex' }}
-        uses: sidekick-labs/.github/.github/actions/setup-codex-auth@main
-        with:
-          auth-json: ${{ secrets.CODEX_AUTH_JSON }}
-          enable-workspace-network: 'true'
-
-      # ----- per-rec auto-PR loop -----
+      # ----- issue sink: open/refresh a ci-audit issue per finding (the sensor's output) -----
       #
-      # For each auto-PR-able rec: skip if its branch or an open PR with that head
-      # already exists (idempotency), then clone the target repo with the minted
-      # token, assemble an engine prompt that re-verifies the fix is missing
-      # (Skill Rule #1), invoke the configured engine, and open a GH-signed PR.
-
-      - name: Open auto-fix PRs
-        id: autopr
-        if: ${{ steps.recs.outputs.auto_count != '0' && inputs.dry-run != true }}
-        env:
-          GH_TOKEN: ${{ steps.app_token.outputs.token }}
-          ENGINE: ${{ inputs.engine }}
-          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          CLAUDE_MODEL: ${{ env.CLAUDE_MODEL }}
-          CODEX_MODEL: ${{ env.CODEX_MODEL }}
-          CODEX_HOME: ${{ steps.codex-auth.outputs.codex-home }}
-          RECS_FILE: ${{ github.workspace }}/tmp/audit/recommendations.json
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          OPENED_FILE="$GITHUB_WORKSPACE/tmp/audit/opened-prs.txt"
-          : > "$OPENED_FILE"
-
-          COUNT=$(jq '.auto_pr | length' "$RECS_FILE")
-          for i in $(seq 0 $((COUNT - 1))); do
-            REC=$(jq -c ".auto_pr[$i]" "$RECS_FILE")
-            REPO=$(jq -r '.repo' <<<"$REC")
-            WF_FILE=$(jq -r '.workflow_file' <<<"$REC")
-            WF_NAME=$(jq -r '.workflow_name' <<<"$REC")
-            BRANCH=$(jq -r '.branch' <<<"$REC")
-            RATIONALE=$(jq -r '.rationale' <<<"$REC")
-            SNIPPET=$(jq -r '.snippet' <<<"$REC")
-            FULL="sidekick-labs/$REPO"
-
-            echo "::group::$FULL :: $WF_FILE ($BRANCH)"
-
-            # --- Idempotency: skip if the branch already exists ...
-            if gh api "repos/$FULL/git/ref/heads/$BRANCH" >/dev/null 2>&1; then
-              echo "branch $BRANCH already exists on $FULL — skipping (idempotent)"
-              echo "::endgroup::"; continue
-            fi
-            # ... or an open PR already has that head.
-            EXISTING_PR=$(gh pr list --repo "$FULL" --head "$BRANCH" --state open --json url --jq '.[0].url // ""')
-            if [ -n "$EXISTING_PR" ]; then
-              echo "open PR with head $BRANCH already exists: $EXISTING_PR — skipping"
-              echo "::endgroup::"; continue
-            fi
-
-            # --- Clone target repo with the minted installation token.
-            WORKDIR="$RUNNER_TEMP/$REPO-$i"
-            rm -rf "$WORKDIR"
-            git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/$FULL.git" "$WORKDIR"
-            DEFAULT_BRANCH=$(git -C "$WORKDIR" rev-parse --abbrev-ref HEAD)
-            git -C "$WORKDIR" config user.name "sidekick-release-bot[bot]"
-            git -C "$WORKDIR" config user.email "sidekick-release-bot[bot]@users.noreply.github.com"
-
-            # --- Assemble the engine prompt. Skill Rule #1: VERIFY BEFORE EDIT.
-            PROMPT_FILE="$RUNNER_TEMP/prompt-$i.txt"
-            {
-              echo "TASK: Add a missing top-level \`concurrency:\` block to the GitHub Actions workflow at \`$WF_FILE\` in the repo $FULL (already cloned into the current working directory)."
-              echo
-              echo "WHY: $RATIONALE"
-              echo
-              echo "## MANDATORY verification BEFORE any edit (do this FIRST)"
-              echo "1. Read \`$WF_FILE\`."
-              echo "2. If a TOP-LEVEL \`concurrency:\` key already exists (column 0, not nested under a job), this is a FALSE POSITIVE. Do NOT edit. Do NOT commit. Do NOT open a PR. Output exactly: 'FALSE POSITIVE: concurrency already present in $WF_FILE' and stop."
-              echo "3. Only if there is genuinely NO top-level \`concurrency:\` key, proceed."
-              echo
-              echo "## The edit (only when verified missing)"
-              echo "Add this top-level block to \`$WF_FILE\` (place it after the top-level \`on:\` block, at column 0):"
-              echo '```yaml'
-              printf '%s\n' "$SNIPPET"
-              echo '```'
-              echo "Do NOT change anything else. Do NOT touch job-level concurrency if present — only ADD the missing top-level block. Preserve formatting/indentation of the rest of the file. The workflow YAML must remain valid."
-              echo
-              echo "## After editing: open a signed PR"
-              echo "BRANCH=$BRANCH ; DEFAULT_BRANCH=$DEFAULT_BRANCH"
-              echo '```bash'
-              echo "git checkout -b \"$BRANCH\""
-              echo 'git add -A'
-              echo "git commit -m \"ci: add concurrency block to $WF_NAME\""
-              echo 'git push -u origin HEAD'
-              echo '# Replace the unsigned commit with a signed one via the GitHub API (GH-signed).'
-              echo 'TREE=$(git rev-parse HEAD^{tree}); PARENT=$(git rev-parse HEAD^)'
-              echo "SIGNED=\$(gh api \"repos/$FULL/git/commits\" --method POST -f message=\"ci: add concurrency block to $WF_NAME\" -f tree=\"\$TREE\" -f \"parents[]=\$PARENT\" --jq '.sha')"
-              echo '[ -z "$SIGNED" ] && { echo "ERROR: signed commit failed" >&2; exit 1; }'
-              echo "gh api \"repos/$FULL/git/refs/heads/$BRANCH\" --method PATCH -f sha=\"\$SIGNED\" -F force=true"
-              echo "UPDATED=\$(gh api \"repos/$FULL/git/refs/heads/$BRANCH\" --jq '.object.sha')"
-              echo '[ "$UPDATED" != "$SIGNED" ] && { echo "ERROR: ref did not advance to signed SHA" >&2; exit 1; }'
-              echo '```'
-              echo
-              echo "Then open the PR (do NOT merge):"
-              echo "gh pr create --repo $FULL --base \"$DEFAULT_BRANCH\" --head \"$BRANCH\" --title \"ci: add concurrency block to $WF_NAME\" --body \"...\""
-              echo "PR body MUST include: the rationale above, the cancel-rate stats, this audit run URL ($RUN_URL), and a note that this was opened by the weekly actions-audit and awaits human review (nothing auto-merges)."
-            } > "$PROMPT_FILE"
-
-            # --- Invoke the configured engine inside the cloned repo.
-            if [ "$ENGINE" = "codex" ]; then
-              ( cd "$WORKDIR" && codex exec --sandbox workspace-write \
-                  ${CODEX_MODEL:+--model "$CODEX_MODEL"} \
-                  "$(cat "$PROMPT_FILE")" ) || echo "::warning::codex run failed for $FULL/$WF_FILE"
-            else
-              # Headless claude run inside the cloned repo. Uses the OAuth token
-              # (never ANTHROPIC_API_KEY). The prompt embeds the verify-then-edit
-              # discipline + the signed-commit + gh pr create flow.
-              ( cd "$WORKDIR" && claude -p "$(cat "$PROMPT_FILE")" \
-                  --model "$CLAUDE_MODEL" \
-                  --allowedTools "Read,Glob,Grep,Edit,Bash(git checkout:*),Bash(git add:*),Bash(git commit:*),Bash(git push:*),Bash(git rev-parse:*),Bash(git status:*),Bash(git diff:*),Bash(gh api:*),Bash(gh pr create:*),Bash(gh pr list:*),Bash(cat:*)" ) \
-                || echo "::warning::claude run failed for $FULL/$WF_FILE"
-            fi
-
-            # Record whatever PR now exists for that head (if any).
-            NEW_PR=$(gh pr list --repo "$FULL" --head "$BRANCH" --state open --json url --jq '.[0].url // ""')
-            [ -n "$NEW_PR" ] && echo "$NEW_PR" >> "$OPENED_FILE"
-            echo "::endgroup::"
-          done
-
-          PR_COUNT=$(wc -l < "$OPENED_FILE" | tr -d ' ')
-          echo "pr_count=$PR_COUNT" >> "$GITHUB_OUTPUT"
-
-      # Install the claude CLI only for the claude engine + when there's work.
-      - name: Install Claude CLI
-        if: ${{ steps.recs.outputs.auto_count != '0' && inputs.dry-run != true && inputs.engine != 'codex' }}
-        run: npm install -g @anthropic-ai/claude-code
-
-      # ----- judgment sink: open/refresh a GitHub ci-audit issue per finding -----
-      #
-      # Judgment-call items (flakes, slow failures, burners) become deduped GitHub
-      # issues in the CENTRAL sidekick-labs/sre-brain `ci-audit` tracker (the
+      # EVERY finding (concurrency, flakes, slow failures, burners) becomes a
+      # deduped `ci-audit` issue in the CENTRAL sidekick-labs/sre-brain tracker (the
       # infra/CI-health brain — NOT the audited source repos), NOT committed
-      # markdown, NOT Linear (retired). Idempotency mirrors the auto-PR dedup:
-      # each issue body carries a hidden `<!-- actions-audit:<rec_id> -->` marker;
-      # open_issues.py searches for it before creating and skips if present.
-      # Uses the minted release-bot token (issues:write org-wide).
+      # markdown, NOT Linear (retired). Each body carries the machine-parseable
+      # `ci-target` block (target repo + workflow path) the ci-fix engine reads, and
+      # a hidden `<!-- actions-audit:<rec_id> -->` dedup marker; open_issues.py
+      # searches for it before creating and skips if present. Uses the minted
+      # release-bot token (issues:write org-wide).
 
-      - name: Open/refresh GitHub issues for judgment-call findings
+      - name: Open/refresh ci-audit issues for findings
         id: issues
         if: ${{ steps.recs.outputs.judgment_count != '0' && inputs.dry-run != true }}
         env:
@@ -372,10 +216,8 @@ jobs:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           OCTO_INTERNAL_CHANNEL: C0B81ERAXCP   # #octo-internal (private)
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          AUTO_COUNT: ${{ steps.recs.outputs.auto_count }}
           JUDG_COUNT: ${{ steps.recs.outputs.judgment_count }}
           FP_COUNT: ${{ steps.recs.outputs.fp_count }}
-          PR_COUNT: ${{ steps.autopr.outputs.pr_count }}
           ISSUE_COUNT: ${{ steps.issues.outputs.issue_count }}
           DRY_RUN: ${{ inputs.dry-run }}
         run: |
@@ -384,16 +226,11 @@ jobs:
             echo "::warning::SLACK_BOT_TOKEN or OCTO_INTERNAL_CHANNEL not set — skipping Slack digest (run summary still has the report)."
             exit 0
           fi
-          OPENED_FILE="$GITHUB_WORKSPACE/tmp/audit/opened-prs.txt"
-          PR_LINKS="(none)"
-          if [ -f "$OPENED_FILE" ] && [ -s "$OPENED_FILE" ]; then
-            PR_LINKS=$(sed 's/^/• /' "$OPENED_FILE")
-          fi
           MODE="live"
-          [ "${DRY_RUN:-false}" = "true" ] && MODE="DRY-RUN (no PRs/issues)"
+          [ "${DRY_RUN:-false}" = "true" ] && MODE="DRY-RUN (no issues)"
 
-          TEXT=$(printf ':broom: *Weekly Actions Audit* (%s)\n*Run:* %s\nAuto-PR-able findings: %s · False positives skipped: %s · Judgment-call -> GitHub ci-audit: %s\n*PRs opened:* %s · *ci-audit issues created:* %s\n\n*Opened PRs:*\n%s' \
-            "$MODE" "$RUN_URL" "${AUTO_COUNT:-0}" "${FP_COUNT:-0}" "${JUDG_COUNT:-0}" "${PR_COUNT:-0}" "${ISSUE_COUNT:-0}" "$PR_LINKS")
+          TEXT=$(printf ':broom: *Weekly Actions Audit* (sensor, %s)\n*Run:* %s\nFindings: %s · False positives skipped: %s · *ci-audit issues created:* %s\n\nFixes are opened by the `ci-fix` actuator in sre-brain (sre-brain#109).' \
+            "$MODE" "$RUN_URL" "${JUDG_COUNT:-0}" "${FP_COUNT:-0}" "${ISSUE_COUNT:-0}")
 
           # chat.postMessage returns HTTP 200 even on logical errors (e.g.
           # not_in_channel) — so don't rely on curl -f; parse `.ok`.
