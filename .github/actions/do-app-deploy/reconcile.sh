@@ -57,17 +57,21 @@ reconcile_eval() {  # $1=ACTIVE_JSON  $2=DEPLOY_SHA
 }
 
 # Canonicalize a raw `doctl apps get-deployment --format Phase` value (already
-# whitespace-stripped). doctl prints the literal "<nil>" when the deployment's
-# phase field is null — observed on config-only ("Deployed configuration
-# changes") deploys, where get-deployment reports "<nil>" indefinitely even
-# though the app is already ACTIVE — and prints "" on a missing/failed read.
-# Both must read as UNKNOWN so the poll loop's UNKNOWN branch (which cross-checks
-# the live active deployment) handles them, instead of treating "<nil>" as an
-# unrecognized in-flight phase and spinning to the full poll timeout. Real phase
-# strings (ACTIVE / BUILDING / DEPLOYING / ERROR / …) pass through unchanged.
+# whitespace-stripped) to one of DO's documented deployment phases, or UNKNOWN.
+# doctl renders a null phase via Go templating as the literal "<nil>" — observed
+# on config-only ("Deployed configuration changes") deploys, where it reports
+# "<nil>" for the whole window even though the app is already ACTIVE — and can
+# emit "" / "<no value>" on other empty reads. Rather than denylist every
+# non-phase string doctl might print (a guessing game — "<nil>" vs "<no value>"
+# vs …), we ALLOWLIST the known phase set and fold everything else to UNKNOWN, so
+# the poll loop's UNKNOWN branch (which cross-checks the live active deployment)
+# handles it instead of treating a non-phase as an in-flight phase and spinning
+# to the full poll timeout. The allowlist mirrors the phase ladder documented in
+# action.yml's Phase-2 comment.
 normalize_phase() {  # $1 = raw phase
   case "$1" in
-    ""|"<nil>"|"<none>"|null|NULL) printf 'UNKNOWN' ;;
-    *)                              printf '%s' "$1" ;;
+    PENDING_BUILD|BUILDING|PENDING_DEPLOY|DEPLOYING|ACTIVE|ERROR|CANCELED|SUPERSEDED|UNKNOWN)
+      printf '%s' "$1" ;;
+    *) printf 'UNKNOWN' ;;
   esac
 }
