@@ -153,6 +153,12 @@ runs:
       shell: bash
       env:
         APP_ID: ${{ inputs.app_id }}
+        # Forwarded explicitly (not inherited from the caller's job env): the
+        # poll cross-check + Phase-3 reconciliation compare the live active
+        # image tag against DEPLOY_SHA. Without this the step relied on the
+        # caller happening to set a job-level DEPLOY_SHA; an empty value would
+        # make reconciliation silently never match.
+        DEPLOY_SHA: ${{ inputs.deploy_sha }}
         POLL_TIMEOUT: ${{ inputs.poll_timeout_seconds }}
         POLL_INTERVAL: ${{ inputs.poll_interval_seconds }}
         SLACK_BOT_TOKEN: ${{ inputs.slack_bot_token }}
