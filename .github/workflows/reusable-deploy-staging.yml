@@ -207,7 +207,7 @@ jobs:
         # what fails the job, keeping do_deploy_id available to the always()
         # status steps. Referenced by explicit repo path (not `./`) so it
         # resolves from THIS repo regardless of the caller's checkout.
-        uses: sidekick-labs/.github/.github/actions/do-app-deploy@37b16e13eee92aeb9c740cb1f60603cddc0fc90e # #78 reconcile.sh extraction + tests — pinned, bump via PR
+        uses: sidekick-labs/.github/.github/actions/do-app-deploy@61dd002b0cf083188e3b88ac9204cd7b0fd32bc5 # #84 poll <nil> hardening + DEPLOY_SHA env — pinned, bump via PR
         with:
           app_id: ${{ inputs.app_id }}
           image_repo: ${{ inputs.image_repo }}
