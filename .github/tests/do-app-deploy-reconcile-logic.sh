@@ -121,4 +121,22 @@ assert_eq "eval: ACTIVE on old SHA, superseder in flight → WAIT" "WAIT:ip" "$(
 assert_eq "eval: building phase, in flight → WAIT"     "WAIT:ip"      "$(reconcile_eval "$(snap PENDING_DEPLOY a "$OTHER" "$OTHER" ip)" "$SHA")"
 assert_eq "eval: off-SHA, nothing in flight → GIVE_UP" "GIVE_UP"      "$(reconcile_eval "$(snap ACTIVE a "$OTHER" "$OTHER" "")"  "$SHA")"
 
+# ── normalize_phase: fold doctl's non-phase outputs into UNKNOWN ──
+# doctl prints "<nil>" for a null phase (config-only deploys); without folding it
+# to UNKNOWN the poll loop treats it as an in-flight phase and spins to timeout.
+assert_eq "normalize: <nil> → UNKNOWN"    "UNKNOWN"   "$(normalize_phase '<nil>')"
+assert_eq "normalize: empty → UNKNOWN"    "UNKNOWN"   "$(normalize_phase '')"
+assert_eq "normalize: <none> → UNKNOWN"   "UNKNOWN"   "$(normalize_phase '<none>')"
+assert_eq "normalize: ACTIVE passes"      "ACTIVE"    "$(normalize_phase 'ACTIVE')"
+assert_eq "normalize: BUILDING passes"    "BUILDING"  "$(normalize_phase 'BUILDING')"
+
+# ── Phase-2 cross-check building block ──
+# On a sustained-UNKNOWN poll the loop finishes early IFF *our* deployment id is
+# the live active one on the SHA. reconcile_eval surfaces the active id, so the
+# caller matches the exact string RECONCILED:<our id>. A different active id
+# yields a different verdict → no match → the loop keeps polling (a premature
+# success on a prior same-SHA deploy is thereby avoided).
+assert_eq "xcheck: our id ACTIVE on SHA → matchable" "RECONCILED:dep-123"  "$(reconcile_eval "$(snap ACTIVE dep-123  "$SHA" "$SHA" "")" "$SHA")"
+assert_eq "xcheck: a DIFFERENT id ACTIVE → no match" "RECONCILED:other-id" "$(reconcile_eval "$(snap ACTIVE other-id "$SHA" "$SHA" "")" "$SHA")"
+
 if [ "$fail" = 0 ]; then echo "ALL PASS"; else echo "TESTS FAILED"; exit 1; fi

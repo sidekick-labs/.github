@@ -55,3 +55,19 @@ reconcile_eval() {  # $1=ACTIVE_JSON  $2=DEPLOY_SHA
   if [ -z "$INPROG" ]; then printf 'GIVE_UP'; return 0; fi
   printf 'WAIT:%s' "$INPROG"
 }
+
+# Canonicalize a raw `doctl apps get-deployment --format Phase` value (already
+# whitespace-stripped). doctl prints the literal "<nil>" when the deployment's
+# phase field is null — observed on config-only ("Deployed configuration
+# changes") deploys, where get-deployment reports "<nil>" indefinitely even
+# though the app is already ACTIVE — and prints "" on a missing/failed read.
+# Both must read as UNKNOWN so the poll loop's UNKNOWN branch (which cross-checks
+# the live active deployment) handles them, instead of treating "<nil>" as an
+# unrecognized in-flight phase and spinning to the full poll timeout. Real phase
+# strings (ACTIVE / BUILDING / DEPLOYING / ERROR / …) pass through unchanged.
+normalize_phase() {  # $1 = raw phase
+  case "$1" in
+    ""|"<nil>"|"<none>"|null|NULL) printf 'UNKNOWN' ;;
+    *)                              printf '%s' "$1" ;;
+  esac
+}
