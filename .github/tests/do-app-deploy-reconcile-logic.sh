@@ -136,7 +136,7 @@ assert_eq "normalize: BUILDING passes"    "BUILDING"  "$(normalize_phase 'BUILDI
 # caller matches the exact string RECONCILED:<our id>. A different active id
 # yields a different verdict → no match → the loop keeps polling (a premature
 # success on a prior same-SHA deploy is thereby avoided).
-assert_eq "xcheck: our id ACTIVE on SHA → matchable" "RECONCILED:dep-123"  "$(reconcile_eval "$(snap ACTIVE dep-123  "$SHA" "$SHA" "")" "$SHA")"
-assert_eq "xcheck: a DIFFERENT id ACTIVE → no match" "RECONCILED:other-id" "$(reconcile_eval "$(snap ACTIVE other-id "$SHA" "$SHA" "")" "$SHA")"
+assert_eq "xcheck: our id ACTIVE on SHA → RECONCILED:<our id> (caller matches)"        "RECONCILED:dep-123"  "$(reconcile_eval "$(snap ACTIVE dep-123  "$SHA" "$SHA" "")" "$SHA")"
+assert_eq "xcheck: different active id → RECONCILED:<other id> (caller-side non-match)" "RECONCILED:other-id" "$(reconcile_eval "$(snap ACTIVE other-id "$SHA" "$SHA" "")" "$SHA")"
 
 if [ "$fail" = 0 ]; then echo "ALL PASS"; else echo "TESTS FAILED"; exit 1; fi
