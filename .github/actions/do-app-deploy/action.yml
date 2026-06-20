@@ -153,6 +153,12 @@ runs:
       shell: bash
       env:
         APP_ID: ${{ inputs.app_id }}
+        # Forwarded explicitly (not inherited from the caller's job env): the
+        # poll cross-check + Phase-3 reconciliation compare the live active
+        # image tag against DEPLOY_SHA. Without this the step relied on the
+        # caller happening to set a job-level DEPLOY_SHA; an empty value would
+        # make reconciliation silently never match.
+        DEPLOY_SHA: ${{ inputs.deploy_sha }}
         POLL_TIMEOUT: ${{ inputs.poll_timeout_seconds }}
         POLL_INTERVAL: ${{ inputs.poll_interval_seconds }}
         SLACK_BOT_TOKEN: ${{ inputs.slack_bot_token }}
@@ -347,6 +353,15 @@ runs:
         TRAIL=""
         slack_status "$STATUS_HEADER"
 
+        # Load the shared reconcile decision helper (reconcile_eval + the phase
+        # normalizer). Used by BOTH the Phase-2 poll cross-check below and
+        # Phase-3 reconciliation, so it's sourced here — after the EXIT trap is
+        # armed (a missing/unreadable helper still emits a phase via the trap)
+        # and before the poll loop that now depends on it. GITHUB_ACTION_PATH is
+        # set by the runner for composite actions and points at this action's dir.
+        # shellcheck source=reconcile.sh
+        source "$GITHUB_ACTION_PATH/reconcile.sh"
+
         # ─── Phase 2: poll for terminal phase ────────────────────────
         #
         # Replaces what `--wait` would do, but bound to our specific
@@ -382,7 +397,10 @@ runs:
         while [ "$(date +%s)" -lt "$DEADLINE" ]; do
           PHASE=$(doctl apps get-deployment "$APP_ID" "$DEPLOY_ID" \
             --format Phase --no-header 2>/dev/null | tr -d '[:space:]' || echo "UNKNOWN")
-          PHASE="${PHASE:-UNKNOWN}"
+          # Fold doctl's "<nil>" (null phase, seen on config-only deploys) and an
+          # empty read into UNKNOWN, so the UNKNOWN branch's cross-check kicks in
+          # rather than treating "<nil>" as an in-flight phase forever.
+          PHASE=$(normalize_phase "$PHASE")
 
           # Announce real phase changes (ignore UNKNOWN blips so a transient
           # API miss doesn't post a bogus transition). Runs before the case
@@ -424,6 +442,24 @@ runs:
               ;;
             UNKNOWN)
               UNKNOWN_COUNT=$(( UNKNOWN_COUNT + 1 ))
+              # get-deployment is uninformative (UNKNOWN, or a normalized "<nil>").
+              # doctl's apps-get view can report the deployment ACTIVE while
+              # get-deployment's Phase stays "<nil>" (config-only deploys), which
+              # would otherwise spin to the full timeout. After a few misses,
+              # cross-check the live active deployment and finish early IFF *our*
+              # deployment is ACTIVE on the target SHA: reconcile_eval returns
+              # RECONCILED:<active id>, so an exact match on our DEPLOY_ID proves
+              # it's ours. A different active id is NOT a match → keep polling and
+              # let Phase-3 reconciliation handle any superseder after the loop.
+              if [ "$UNKNOWN_COUNT" -ge 3 ]; then
+                XCHECK=$(reconcile_eval "$(doctl apps get "$APP_ID" --output json 2>/dev/null || echo '[]')" "$DEPLOY_SHA")
+                if [ "$XCHECK" = "RECONCILED:${DEPLOY_ID}" ]; then
+                  echo "::warning::do-app-deploy: get-deployment phase unavailable, but deployment ${DEPLOY_ID} is ACTIVE on ${DEPLOY_SHA} (per apps-get) — treating as success"
+                  PHASE="ACTIVE"
+                  TIMED_OUT=0
+                  break
+                fi
+              fi
               if [ "$UNKNOWN_COUNT" -ge 6 ]; then
                 echo "::warning::get-deployment returned UNKNOWN 6× in a row (~1min) — DO API may be unreachable"
                 UNKNOWN_COUNT=0
@@ -471,14 +507,9 @@ runs:
         if [ "$PHASE" != "ACTIVE" ]; then
           echo "::warning::do-app-deploy: tracked deployment ${DEPLOY_ID} ended '${PHASE}'; reconciling against the app's live active deployment (a concurrent deploy may have carried ${DEPLOY_SHA} to ACTIVE)"
           # The per-poll decision (is the app ACTIVE on our SHA? still in flight?
-          # or hopeless?) lives in reconcile.sh so it can be unit-tested offline
-          # against canned doctl JSON — see ../../tests/do-app-deploy-reconcile-logic.sh.
-          # GITHUB_ACTION_PATH is set by the runner for composite actions and
-          # points at this action's directory. Sourced lazily here (only when we
-          # actually need to reconcile) and after the EXIT trap is armed, so a
-          # missing/unreadable helper still emits a phase via the trap.
-          # shellcheck source=reconcile.sh
-          source "$GITHUB_ACTION_PATH/reconcile.sh"
+          # or hopeless?) lives in reconcile.sh (reconcile_eval), sourced above
+          # before Phase 2 — see ../../tests/do-app-deploy-reconcile-logic.sh for
+          # its offline coverage.
           # Give a superseding deploy that's still in flight a bounded window
           # to land; stop early if nothing is deploying and the active image
           # isn't ours (no superseder is coming).

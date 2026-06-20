@@ -121,4 +121,27 @@ assert_eq "eval: ACTIVE on old SHA, superseder in flight → WAIT" "WAIT:ip" "$(
 assert_eq "eval: building phase, in flight → WAIT"     "WAIT:ip"      "$(reconcile_eval "$(snap PENDING_DEPLOY a "$OTHER" "$OTHER" ip)" "$SHA")"
 assert_eq "eval: off-SHA, nothing in flight → GIVE_UP" "GIVE_UP"      "$(reconcile_eval "$(snap ACTIVE a "$OTHER" "$OTHER" "")"  "$SHA")"
 
+# ── normalize_phase: allowlist DO phases, fold everything else to UNKNOWN ──
+# doctl renders a null phase as "<nil>" (config-only deploys); without folding it
+# to UNKNOWN the poll loop treats it as in-flight and spins to the timeout. The
+# allowlist makes ANY non-phase (sentinel or future garbage) read as UNKNOWN.
+assert_eq "normalize: <nil> → UNKNOWN"          "UNKNOWN"        "$(normalize_phase '<nil>')"
+assert_eq "normalize: empty → UNKNOWN"          "UNKNOWN"        "$(normalize_phase '')"
+assert_eq "normalize: <no value> → UNKNOWN"     "UNKNOWN"        "$(normalize_phase '<no value>')"
+assert_eq "normalize: unrecognized → UNKNOWN"   "UNKNOWN"        "$(normalize_phase 'REBUILDING')"
+assert_eq "normalize: ACTIVE passes"            "ACTIVE"         "$(normalize_phase 'ACTIVE')"
+assert_eq "normalize: BUILDING passes"          "BUILDING"       "$(normalize_phase 'BUILDING')"
+assert_eq "normalize: PENDING_DEPLOY passes"    "PENDING_DEPLOY" "$(normalize_phase 'PENDING_DEPLOY')"
+assert_eq "normalize: SUPERSEDED passes"        "SUPERSEDED"     "$(normalize_phase 'SUPERSEDED')"
+assert_eq "normalize: UNKNOWN passes"           "UNKNOWN"        "$(normalize_phase 'UNKNOWN')"
+
+# ── Phase-2 cross-check building block ──
+# On a sustained-UNKNOWN poll the loop finishes early IFF *our* deployment id is
+# the live active one on the SHA. reconcile_eval surfaces the active id, so the
+# caller matches the exact string RECONCILED:<our id>. A different active id
+# yields a different verdict → no match → the loop keeps polling (a premature
+# success on a prior same-SHA deploy is thereby avoided).
+assert_eq "xcheck: our id ACTIVE on SHA → RECONCILED:<our id> (caller matches)"        "RECONCILED:dep-123"  "$(reconcile_eval "$(snap ACTIVE dep-123  "$SHA" "$SHA" "")" "$SHA")"
+assert_eq "xcheck: different active id → RECONCILED:<other id> (caller-side non-match)" "RECONCILED:other-id" "$(reconcile_eval "$(snap ACTIVE other-id "$SHA" "$SHA" "")" "$SHA")"
+
 if [ "$fail" = 0 ]; then echo "ALL PASS"; else echo "TESTS FAILED"; exit 1; fi
