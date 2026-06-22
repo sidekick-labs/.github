@@ -1,0 +1,60 @@
+name: Dependabot sweep
+
+# Org-level, single-pass auto-lander that COMPLEMENTS the per-PR
+# dependabot-auto-merge.yml. The per-PR workflow approves minor/patch bumps and
+# arms GitHub native auto-merge (which lands a CLEAN PR for free). This sweep
+# only mops up the tail native auto-merge can't: PRs that fall BEHIND on
+# strict-protected repos (native auto-merge never updates a branch). One cron for
+# the whole org — not a per-repo workflow — to keep Actions minutes down.
+#
+# Phase 1 merges ready (CLEAN, already-approved) dependabot PRs; Phase 2 rebases
+# exactly ONE behind PR per repo per pass (O(N) CI, not the O(N^2) you get from
+# rebasing the whole stack). Majors are skipped (the per-PR gate never approves
+# them, and this only acts on APPROVED PRs). See scripts/dependabot-sweep.sh.
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'   # every 6h — drains BEHIND stragglers ~4x/day
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: 'Log decisions without merging/rebasing'
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: dependabot-sweep
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    name: Sweep dependabot PRs
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read   # job token only checks out this repo; merges/rebases use the minted App token
+    steps:
+      - name: Mint app token (contents + PRs write across the org)
+        id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.SIDEKICK_RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.SIDEKICK_RELEASE_BOT_PRIVATE_KEY }}
+          owner: sidekick-labs
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Checkout (sweep script)
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 1
+
+      - name: Sweep
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          ORG: sidekick-labs
+          # schedule has no inputs → live; dispatch honours the dry-run toggle.
+          DRY_RUN: ${{ inputs.dry-run && 'true' || 'false' }}
+        run: bash .github/scripts/dependabot-sweep.sh
