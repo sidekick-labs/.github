@@ -65,8 +65,8 @@ jobs:
     steps:
       - name: Validate inputs
         env:
-          SCOPE: ${{ inputs.scope }}
-          WINDOW: ${{ inputs.window }}
+          SCOPE: ${{ inputs.scope || 'auto' }}
+          WINDOW: ${{ inputs.window || '7' }}
         run: |
           set -euo pipefail
           case "$SCOPE" in
@@ -137,8 +137,8 @@ jobs:
         id: audit
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
-          SCOPE: ${{ inputs.scope }}
-          WINDOW: ${{ inputs.window }}
+          SCOPE: ${{ inputs.scope || 'auto' }}
+          WINDOW: ${{ inputs.window || '7' }}
         run: |
           set -euo pipefail
           mkdir -p "$GITHUB_WORKSPACE/tmp/audit" .audit-cache
