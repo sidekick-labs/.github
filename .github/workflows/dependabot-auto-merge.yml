@@ -1,25 +1,35 @@
-name: Dependabot auto-merge
+name: Auto-lander (Dependabot + autonomous engine PRs)
 
 # Org-shared reusable auto-lander. A thin per-repo caller
 # (dependabot-auto-merge.yml, `on: pull_request_target`) invokes this so the
 # logic lives in one place — mirrors the claude-code-review reusable+caller
-# pattern. On a Dependabot PR: read the semver update-type via fetch-metadata,
-# then enable squash auto-merge for patch + minor (GitHub merges once the
-# repo's required checks go green). Major bumps are left for a human.
+# pattern. It lands two classes of PR by enabling squash auto-merge (GitHub
+# merges once the repo's required checks go green):
+#
+#   1. Dependabot PRs — read the semver update-type via fetch-metadata, then
+#      enable auto-merge for patch + minor. Major bumps are left for a human.
+#   2. Autonomous SRE engine PRs — branches prefixed issue-worker/, ci-fix/, or
+#      sentry-autofix/, opened by the SRE engine workflows. These are already
+#      vetted by the engine's own guardrails before opening, so they get
+#      auto-merge enabled directly (no semver gate).
 #
 # Safety: the caller fires on pull_request_target (writable token), but this
 # workflow checks out no PR code and runs no PR bundle — it only reads metadata
-# and calls the gh API. Dependabot PRs are same-repo branches, and the only
-# privileged action is "approve + enable auto-merge", which still defers the
-# actual merge to the branch-protection gate.
+# and calls the gh API. The only privileged action is "approve + enable
+# auto-merge", which still defers the actual merge to the required-checks gate.
 
 on:
   workflow_call:
 
 jobs:
   auto-merge:
-    # Only act on Dependabot's own PRs.
-    if: github.actor == 'dependabot[bot]'
+    # Act on Dependabot's own PRs and on autonomous SRE engine PRs (identified
+    # by their head-ref prefix).
+    if: >-
+      github.actor == 'dependabot[bot]' ||
+      startsWith(github.event.pull_request.head.ref, 'issue-worker/') ||
+      startsWith(github.event.pull_request.head.ref, 'ci-fix/') ||
+      startsWith(github.event.pull_request.head.ref, 'sentry-autofix/')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -27,17 +37,32 @@ jobs:
     steps:
       - name: Fetch Dependabot metadata
         id: metadata
+        if: github.actor == 'dependabot[bot]'
         uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Approve and enable auto-merge for patch/minor
-        if: |
+        if: >-
+          github.actor == 'dependabot[bot]' && (
           steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
-          steps.metadata.outputs.update-type == 'version-update:semver-minor'
+          steps.metadata.outputs.update-type == 'version-update:semver-minor')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_URL: ${{ github.event.pull_request.html_url }}
         run: |
           gh pr review --approve "$PR_URL" || true
+          gh pr merge --auto --squash "$PR_URL" || echo "::warning::auto-merge not enabled for $PR_URL"
+
+      - name: Enable auto-merge — autonomous SRE engine PR
+        if: github.actor != 'dependabot[bot]'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          # Engine PRs (issue-worker/*, ci-fix/*, sentry-autofix/*) are already
+          # vetted by the engine's own guardrails (path guards, diff-line cap,
+          # test gate, signed commit) before opening — so just enable squash
+          # auto-merge and let the repo's required-checks gate do the rest, the
+          # same as Dependabot.
           gh pr merge --auto --squash "$PR_URL" || echo "::warning::auto-merge not enabled for $PR_URL"
