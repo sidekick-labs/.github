@@ -1,8 +1,10 @@
-name: Dependabot auto-merge
+name: Auto-lander (Dependabot + autonomous engine PRs)
 
-# Caller that runs the auto-lander on this repo's own Dependabot PRs. The
-# reusable definition lives alongside it (dependabot-auto-merge.yml,
-# `on: workflow_call`) and doesn't self-trigger. Referenced locally (`./`).
+# Caller that runs the auto-lander on this repo's own PRs. The reusable
+# definition lives alongside it (dependabot-auto-merge.yml, `on: workflow_call`)
+# and doesn't self-trigger. Referenced locally (`./`). Invokes the reusable for
+# Dependabot PRs and for autonomous SRE engine PRs (branches prefixed
+# issue-worker/, ci-fix/, or sentry-autofix/).
 
 on: pull_request_target
 
@@ -14,7 +16,11 @@ concurrency:
 
 jobs:
   auto-merge:
-    if: github.actor == 'dependabot[bot]'
+    if: >-
+      github.actor == 'dependabot[bot]' ||
+      startsWith(github.event.pull_request.head.ref, 'issue-worker/') ||
+      startsWith(github.event.pull_request.head.ref, 'ci-fix/') ||
+      startsWith(github.event.pull_request.head.ref, 'sentry-autofix/')
     permissions:
       contents: write
       pull-requests: write
