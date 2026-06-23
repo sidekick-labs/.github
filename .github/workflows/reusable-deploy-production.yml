@@ -265,22 +265,50 @@ jobs:
           # Anchor auto-notes to the previous release so the first-ever release
           # doesn't walk back to the repo root.
           PREV_TAG=$(gh release list --limit 1 --json tagName --jq '.[0].tagName // ""')
+          # Capture gh's exit code + stderr instead of letting `set -e` abort
+          # silently: `continue-on-error` would otherwise report this step as
+          # success with no tag and the real error swallowed. We keep
+          # continue-on-error (a metadata hiccup must not fail an ACTIVE deploy)
+          # but surface the failure loudly as a ::warning:: + job-summary so the
+          # next deploy exposes the root cause (see ai-foundations-brain#144).
+          ERR_LOG=$(mktemp)
+          set +e
           if [ -n "$PREV_TAG" ]; then
             gh release create "$TAG" \
               --target "$DEPLOY_SHA" \
               --title "$TAG" \
               --generate-notes \
               --notes-start-tag "$PREV_TAG" \
-              --latest
+              --latest 2>"$ERR_LOG"
           else
             gh release create "$TAG" \
               --target "$DEPLOY_SHA" \
               --title "$TAG" \
               --notes "First production release. Created automatically at SHA \`${DEPLOY_SHA}\`." \
-              --latest
+              --latest 2>"$ERR_LOG"
           fi
-          echo "version=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Created release $TAG at ${DEPLOY_SHA:0:7}"
+          RC=$?
+          set -e
+          cat "$ERR_LOG" >&2   # keep stderr in the step log regardless of outcome
+          if [ "$RC" -eq 0 ]; then
+            echo "version=$TAG" >> "$GITHUB_OUTPUT"
+            echo "Created release $TAG at ${DEPLOY_SHA:0:7}"
+          else
+            STDERR=$(cat "$ERR_LOG")
+            echo "::warning title=Release tag not created::gh release create '${TAG}' exited ${RC}; deploy is ACTIVE but the release tag/notes were skipped. stderr: ${STDERR}"
+            {
+              echo "### ⚠️ Release tag not created"
+              echo ""
+              echo "\`gh release create ${TAG}\` exited **${RC}** at \`${DEPLOY_SHA:0:7}\`. The production deploy reached **ACTIVE**, but the release tag + auto-notes were **skipped**. Create the tag manually and investigate (likely a token scope — consider the RELEASE_BOT app token, as promote-production does)."
+              echo ""
+              echo '```'
+              echo "${STDERR:-(no stderr captured)}"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            # Preserve the failure as the step conclusion; continue-on-error keeps
+            # the deploy green while the warning/summary above expose the cause.
+            exit "$RC"
+          fi
 
       - name: Notify Sentry of deploy
         # Registers a deploy against the Sentry release for this SHA, scoped to
