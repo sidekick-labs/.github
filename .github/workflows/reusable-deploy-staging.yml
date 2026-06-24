@@ -170,6 +170,10 @@ jobs:
 
       - name: Build and push app image
         id: build_push
+        # continue-on-error so a transient DOCR push flake doesn't fail the job
+        # outright — the retry step below gets one more attempt. A genuine build
+        # failure still fails the job at the (non-continue-on-error) retry step.
+        continue-on-error: true
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: ${{ inputs.context }}
@@ -189,9 +193,29 @@ jobs:
           cache-from: type=registry,ref=registry.digitalocean.com/${{ inputs.registry }}/${{ inputs.image_repo }}:cache
           cache-to: type=registry,ref=registry.digitalocean.com/${{ inputs.registry }}/${{ inputs.image_repo }}:cache,mode=max
 
+      - name: Build and push app image (retry once on transient push flake)
+        id: build_push_retry
+        # Runs only if the first attempt failed. NOT continue-on-error, so a
+        # second failure fails the job naturally. The cache-to from the first
+        # attempt means the retry mostly re-pushes rather than rebuilds.
+        if: steps.build_push.outcome == 'failure'
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          push: true
+          build-args: ${{ inputs.build_args }}
+          secrets: |
+            ${{ inputs.build_secrets }}
+            ${{ inputs.build_secret_id != '' && format('{0}={1}', inputs.build_secret_id, secrets.BUILD_SECRET_VALUE) || '' }}
+          tags: |
+            registry.digitalocean.com/${{ inputs.registry }}/${{ inputs.image_repo }}:${{ inputs.deploy_sha }}
+          cache-from: type=registry,ref=registry.digitalocean.com/${{ inputs.registry }}/${{ inputs.image_repo }}:cache
+          cache-to: type=registry,ref=registry.digitalocean.com/${{ inputs.registry }}/${{ inputs.image_repo }}:cache,mode=max
+
       - name: Create GitHub Deployment + mark in_progress
         id: deployment
-        uses: sidekick-labs/.github/.github/actions/gh-deployment-start@848067fcc24fb22ba28fd2dfdac493b515f7ca3b # 9701a0e — pinned, bump via PR
+        uses: sidekick-labs/.github/.github/actions/gh-deployment-start@v3  # moving release tag — see #1/v3 (matches production)
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           environment: ${{ inputs.environment }}
@@ -207,7 +231,7 @@ jobs:
         # what fails the job, keeping do_deploy_id available to the always()
         # status steps. Referenced by explicit repo path (not `./`) so it
         # resolves from THIS repo regardless of the caller's checkout.
-        uses: sidekick-labs/.github/.github/actions/do-app-deploy@61dd002b0cf083188e3b88ac9204cd7b0fd32bc5 # #84 poll <nil> hardening + DEPLOY_SHA env — pinned, bump via PR
+        uses: sidekick-labs/.github/.github/actions/do-app-deploy@v3  # moving release tag — see #1/v3 (matches production; do-app-deploy is shared)
         with:
           app_id: ${{ inputs.app_id }}
           image_repo: ${{ inputs.image_repo }}
@@ -253,7 +277,7 @@ jobs:
 
       - name: Post final deployment status
         if: always() && steps.deployment.outputs.deployment_id != ''
-        uses: sidekick-labs/.github/.github/actions/gh-deployment-finish@848067fcc24fb22ba28fd2dfdac493b515f7ca3b # 9701a0e — pinned, bump via PR
+        uses: sidekick-labs/.github/.github/actions/gh-deployment-finish@v3  # moving release tag — see #1/v3 (matches production)
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           deployment_id: ${{ steps.deployment.outputs.deployment_id }}
@@ -273,8 +297,11 @@ jobs:
           # Walk the pipeline in order; first failed step names the stage.
           if [ "${{ steps.checkout.outcome }}" = "failure" ]; then
             STAGE="repository checkout"
-          elif [ "${{ steps.build_push.outcome }}" = "failure" ]; then
-            STAGE="image build or push to DOCR"
+          elif [ "${{ steps.build_push.outcome }}" = "failure" ] && [ "${{ steps.build_push_retry.outcome }}" != "success" ]; then
+            # build_push is continue-on-error; the build stage only counts as
+            # failed when the retry also didn't succeed (a transient flake that
+            # the retry recovered leaves no failure() at all).
+            STAGE="image build or push to DOCR (after one retry)"
           elif [ "${{ steps.deployment.outcome }}" = "failure" ]; then
             STAGE="GitHub deployment API call"
           elif [ "${{ steps.do_deploy.outcome }}" = "failure" ]; then
@@ -290,7 +317,7 @@ jobs:
 
       - name: Comment on merged PR when deploy fails
         if: failure()
-        uses: sidekick-labs/.github/.github/actions/deploy-failure-comment@848067fcc24fb22ba28fd2dfdac493b515f7ca3b # 9701a0e — pinned, bump via PR
+        uses: sidekick-labs/.github/.github/actions/deploy-failure-comment@v3  # moving release tag — see #1/v3 (matches production)
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           sha: ${{ inputs.deploy_sha }}
