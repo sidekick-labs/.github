@@ -296,6 +296,10 @@ runs:
         # — that's OUR deployment, captured at the source. From here
         # on, we hold the exact ID for the rest of the flow regardless
         # of any rollback DO does in the background.
+        # Record the kickoff time just before the update so a later
+        # list-deployments fallback (below) can pick OUT our deployment by
+        # created_at without depending on the caller exporting a start epoch.
+        DEPLOY_KICKOFF_EPOCH=$(date +%s)
         # Capture stderr separately — `doctl --output json` writes only
         # JSON to stdout, but warnings (deprecations, retries) land on
         # stderr. Mixing them would make jq trip over the JSON envelope.
@@ -334,8 +338,34 @@ runs:
           echo "$UPDATE_JSON" | jq empty 2>/dev/null || UPDATE_JSON="[]"
         done
 
+        # Fallback: `apps update` exited 0 (we're past UPDATE_FAILED/PARSE_FAILED),
+        # so DO DID create a deployment — but the inline in_progress_deployment.id
+        # capture came back empty (seen on the 2026-06-13 prod release: deploy went
+        # ACTIVE on DO, yet the job failed `NO_DEPLOY_ID` → spurious ❌). Failing
+        # closed on a successful update is wrong. Recover the id from
+        # list-deployments: the newest deployment caused by our spec update and
+        # created at/after kickoff. Bounded retry; only fail if none appears.
         if [ -z "$DEPLOY_ID" ]; then
-          echo "::error::doctl apps update did not populate in_progress_deployment.id after 3 attempts"
+          echo "::warning::in_progress_deployment.id empty after 3 attempts; recovering via apps list-deployments"
+          for attempt in 1 2 3 4 5 6; do
+            LIST_JSON=$(doctl apps list-deployments "$APP_ID" --output json 2>/dev/null) || LIST_JSON="[]"
+            echo "$LIST_JSON" | jq empty 2>/dev/null || LIST_JSON="[]"
+            # Newest deployment whose cause is the spec update and which was created
+            # at/after kickoff (60s slack for clock skew) — avoids grabbing a prior
+            # deploy or a DO-initiated rollback (different cause).
+            DEPLOY_ID=$(echo "$LIST_JSON" | jq -r --argjson start "$DEPLOY_KICKOFF_EPOCH" '
+              [ .[]
+                | select((.cause // "") | test("app spec updated"; "i"))
+                | select(((.created_at // "1970-01-01T00:00:00Z") | fromdateiso8601) >= ($start - 60)) ]
+              | sort_by(.created_at) | last | (.id // "")')
+            [ -n "$DEPLOY_ID" ] && { echo "::notice::recovered deployment id via list-deployments (attempt $attempt)"; break; }
+            [ "$attempt" -eq 6 ] && break
+            sleep 5
+          done
+        fi
+
+        if [ -z "$DEPLOY_ID" ]; then
+          echo "::error::doctl apps update did not populate in_progress_deployment.id (and list-deployments recovery found no matching deployment)"
           echo "$UPDATE_JSON" | jq '.[0] | {id, phase: .phase, in_progress: .in_progress_deployment, active: .active_deployment}' 2>/dev/null || true
           fail "NO_DEPLOY_ID"
         fi
