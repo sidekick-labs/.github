@@ -250,6 +250,13 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # This step is checkout-free, so gh has no git remote to infer the
+          # repo from. The `gh release {view,list,create}` calls below take no
+          # --repo (unlike the `gh api repos/${GITHUB_REPOSITORY}/...` probe),
+          # so without GH_REPO they fail with "fatal: not a git repository" and
+          # NO release is cut. ai-foundations-brain#144 surfaced the symptom and
+          # guessed a token scope; the actual cause is this missing repo context.
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           DATE=$(date -u +%Y.%m.%d)
@@ -299,7 +306,7 @@ jobs:
             {
               echo "### ⚠️ Release tag not created"
               echo ""
-              echo "\`gh release create ${TAG}\` exited **${RC}** at \`${DEPLOY_SHA:0:7}\`. The production deploy reached **ACTIVE**, but the release tag + auto-notes were **skipped**. Create the tag manually and investigate (likely a token scope — consider the RELEASE_BOT app token, as promote-production does)."
+              echo "\`gh release create ${TAG}\` exited **${RC}** at \`${DEPLOY_SHA:0:7}\`. The production deploy reached **ACTIVE**, but the release tag + auto-notes were **skipped**. Create the tag manually and investigate (first confirm GH_REPO is set — this step is checkout-free; otherwise a token scope issue — consider the RELEASE_BOT app token, as promote-production does)."
               echo ""
               echo '```'
               echo "${STDERR:-(no stderr captured)}"
