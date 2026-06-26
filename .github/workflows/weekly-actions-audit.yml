@@ -8,11 +8,13 @@ name: Weekly Actions Audit
 # this repo's own reusable workflows), and files ONE deduped `ci-audit` issue per
 # finding in the central sidekick-labs/sre-brain tracker.
 #
-# ISSUE-ONLY (sensor): this workflow opens NO PRs. EVERY actionable finding —
+# ISSUE-ONLY (sensor): this workflow opens NO PRs. Issue-worthy findings —
 # including the missing-`concurrency:` pattern that used to be an inline auto-fix
-# PR here — is now a `ci-audit` issue. The fix moved to the ACTUATOR: sre-brain's
-# ci-fix-sweep + ci-fix-engine read these issues, propose a guarded workflow fix,
-# and open a ready-for-review PR that links back to the issue (a human closes it).
+# PR here — become `ci-audit` issues; low-severity findings go to the digest only.
+# The fix moved to the ACTUATOR: sre-brain's ci-fix-sweep + ci-fix-engine read
+# these issues, propose a guarded workflow fix, and open a ready-for-review PR that
+# links back. The audit's own reconcile pass auto-closes an issue once its finding
+# clears (scoped to scanned repos) — the tracker self-heals, no manual close.
 # Each `ci-audit` issue carries the TARGET REPO + offending workflow file in a
 # machine-parseable `ci-target` block (see audit/open_issues.py) so the engine
 # knows exactly what to fix. This keeps the sensor deterministic (no LLM/OAuth
@@ -161,41 +163,60 @@ jobs:
           set -euo pipefail
           python3 audit/recommendations.py "$GITHUB_WORKSPACE/tmp/audit/audit.json" \
             --output "$GITHUB_WORKSPACE/tmp/audit/recommendations.json"
-          JUDG_COUNT=$(jq '.judgment | length' "$GITHUB_WORKSPACE/tmp/audit/recommendations.json")
-          FP_COUNT=$(jq '.false_positives | length' "$GITHUB_WORKSPACE/tmp/audit/recommendations.json")
+          RECS="$GITHUB_WORKSPACE/tmp/audit/recommendations.json"
+          JUDG_COUNT=$(jq '.judgment | length' "$RECS")
+          DIGEST_COUNT=$(jq '.digest | length' "$RECS")
+          FP_COUNT=$(jq '.false_positives | length' "$RECS")
           {
             echo "judgment_count=$JUDG_COUNT"
+            echo "digest_count=$DIGEST_COUNT"
             echo "fp_count=$FP_COUNT"
           } >> "$GITHUB_OUTPUT"
           {
             echo "## Findings partition"
-            echo "- Findings (-> ci-audit issues): $JUDG_COUNT"
+            echo "- Issue-worthy (-> ci-audit issues): $JUDG_COUNT"
+            echo "- Digest-only (informational, no issue): $DIGEST_COUNT"
             echo "- False positives (already fixed): $FP_COUNT"
+            if [ "$DIGEST_COUNT" -gt 0 ]; then
+              echo ""
+              echo "### Digest (informational — not filed as issues)"
+              jq -r '.digest[] | "- **\(.repo)/\(.workflow_name)**: \(.category) — \(.note)"' "$RECS"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ----- issue sink: open/refresh a ci-audit issue per finding (the sensor's output) -----
+      # ----- issue sink + reconcile: open issue-worthy findings, close cleared ones -----
       #
-      # EVERY finding (concurrency, flakes, slow failures, burners) becomes a
-      # deduped `ci-audit` issue in the CENTRAL sidekick-labs/sre-brain tracker (the
-      # infra/CI-health brain — NOT the audited source repos), NOT committed
-      # markdown, NOT Linear (retired). Each body carries the machine-parseable
-      # `ci-target` block (target repo + workflow path) the ci-fix engine reads, and
-      # a hidden `<!-- actions-audit:<rec_id> -->` dedup marker; open_issues.py
-      # searches for it before creating and skips if present. Uses the minted
-      # release-bot token (issues:write org-wide).
+      # ISSUE-WORTHY findings (concurrency + over-threshold severe — see
+      # recommendations.py) become deduped `ci-audit` issues in the CENTRAL
+      # sidekick-labs/sre-brain tracker (NOT the source repos, NOT Linear). Each body
+      # carries the machine-parseable `ci-target` block + a hidden
+      # `<!-- actions-audit:<rec_id> -->` dedup marker; open_issues.py skips if an
+      # open issue already bears the marker. Low-severity findings go to the digest,
+      # never an issue. AFTER creating, open_issues.py RECONCILES — closing
+      # marker-bearing issues whose finding cleared this run (scoped to scanned
+      # repos so a partial scan never mass-closes). Runs on every non-dry-run,
+      # INCLUDING zero-new-finding runs, because that's exactly when closes happen.
+      # Uses the minted release-bot token (issues:write org-wide).
 
-      - name: Open/refresh ci-audit issues for findings
+      - name: Open + reconcile ci-audit issues
         id: issues
-        if: ${{ steps.recs.outputs.judgment_count != '0' && inputs.dry-run != true }}
+        if: ${{ inputs.dry-run != true }}
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
           RECS_FILE: ${{ github.workspace }}/tmp/audit/recommendations.json
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          ISSUE_COUNT=$(python3 audit/open_issues.py "$RECS_FILE" --run-url "$RUN_URL")
-          echo "issue_count=$ISSUE_COUNT" >> "$GITHUB_OUTPUT"
-          echo "Created $ISSUE_COUNT GitHub ci-audit issue(s) (existing skipped)." >> "$GITHUB_STEP_SUMMARY"
+          LOG=$(mktemp)
+          ISSUE_COUNT=$(python3 audit/open_issues.py "$RECS_FILE" --run-url "$RUN_URL" 2>"$LOG")
+          cat "$LOG" >&2
+          CLOSED_COUNT=$(grep -oE 'closed=[0-9]+' "$LOG" | tail -1 | cut -d= -f2 || true)
+          [ -z "$CLOSED_COUNT" ] && CLOSED_COUNT=0
+          {
+            echo "issue_count=$ISSUE_COUNT"
+            echo "closed_count=$CLOSED_COUNT"
+          } >> "$GITHUB_OUTPUT"
+          echo "Opened $ISSUE_COUNT new ci-audit issue(s); reconcile closed $CLOSED_COUNT cleared (existing kept)." >> "$GITHUB_STEP_SUMMARY"
 
       # ----- artifacts -----
 
@@ -221,8 +242,10 @@ jobs:
           OCTO_INTERNAL_CHANNEL: C0B81ERAXCP   # #octo-internal (private)
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           JUDG_COUNT: ${{ steps.recs.outputs.judgment_count }}
+          DIGEST_COUNT: ${{ steps.recs.outputs.digest_count }}
           FP_COUNT: ${{ steps.recs.outputs.fp_count }}
           ISSUE_COUNT: ${{ steps.issues.outputs.issue_count }}
+          CLOSED_COUNT: ${{ steps.issues.outputs.closed_count }}
           DRY_RUN: ${{ inputs.dry-run }}
         run: |
           set -euo pipefail
@@ -233,8 +256,8 @@ jobs:
           MODE="live"
           [ "${DRY_RUN:-false}" = "true" ] && MODE="DRY-RUN (no issues)"
 
-          TEXT=$(printf ':broom: *Weekly Actions Audit* (sensor, %s)\n*Run:* %s\nFindings: %s · False positives skipped: %s · *ci-audit issues created:* %s\n\nFixes are opened by the `ci-fix` actuator in sre-brain (sre-brain#109).' \
-            "$MODE" "$RUN_URL" "${JUDG_COUNT:-0}" "${FP_COUNT:-0}" "${ISSUE_COUNT:-0}")
+          TEXT=$(printf ':broom: *Weekly Actions Audit* (sensor, %s)\n*Run:* %s\nIssue-worthy: %s · Digest-only: %s · False positives skipped: %s\n*ci-audit issues opened:* %s · *reconcile closed:* %s\n\nFixes are opened by the `ci-fix` actuator in sre-brain (sre-brain#109); low-severity findings stay in this digest, not the tracker.' \
+            "$MODE" "$RUN_URL" "${JUDG_COUNT:-0}" "${DIGEST_COUNT:-0}" "${FP_COUNT:-0}" "${ISSUE_COUNT:-0}" "${CLOSED_COUNT:-0}")
 
           # chat.postMessage returns HTTP 200 even on logical errors (e.g.
           # not_in_channel) — so don't rely on curl -f; parse `.ok`.
