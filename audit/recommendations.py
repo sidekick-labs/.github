@@ -16,13 +16,30 @@ so `concurrency` is now just another `judgment` finding category like flakes /
 failed-minutes / burners. The `auto_pr`/`false_positives` lists are retained in the
 output for shape stability but `auto_pr` is always empty.)
 
-Findings (all routed to `ci-audit` issues):
+Findings split TWO ways (noise control — sre-brain optimisation):
+  - `judgment`  — ISSUE-WORTHY findings that become standing `ci-audit` issues:
+                  `concurrency` (always — the engine's most common fix) PLUS any
+                  flakes/failed-minutes/burners that clear a real SEVERITY
+                  threshold (see ISSUE_* constants). These are actionable.
+  - `digest`    — everything else (low-severity flakes/failed-minutes and the
+                  informational top-burner list). These go to the Slack digest +
+                  run summary ONLY, never an individual issue. ~90% of weekly
+                  findings are these "needs-judgment-but-nobody-acts" rows; filing
+                  them as perpetual issues was the bulk of the tracker noise.
+
+The four lenses are unchanged:
   - concurrency:    a workflow with a >=10% cancel rate (>=3 cancels) and NO
-                    top-level `concurrency:` block (the audit's Lens-4 threshold) —
-                    the engine's most common fix.
+                    top-level `concurrency:` block (the audit's Lens-4 threshold).
   - flakes:         same-SHA retry-then-success flake(s); needs root-cause.
   - failed-minutes: failures that burn real minutes before failing.
-  - burners:        top minute-consumers worth a human/engine look.
+  - burners:        top minute-consumers worth a human look.
+
+Org-shared workflows (e.g. the `Claude Code Review` reusable defined here and
+called by every repo) are COALESCED in the digest: one systemic root cause that
+used to fan out into one issue per caller repo (e.g. 10 identical Claude Code
+Review issues) is now a SINGLE digest line listing the affected repos. Coalescing
+applies to the digest only — issue-worthy findings stay per-repo because the
+ci-fix engine fixes exactly one workflow file per issue.
 
 Each rec carries a STABLE rec id = short hash(repo, workflow file, category). The
 workflow embeds a hidden `<!-- actions-audit:<rec-id> -->` marker in the `ci-audit`
@@ -39,7 +56,8 @@ DROP the rec as a false positive before it ever becomes an issue. The engine
 prompt repeats this verification at edit time; this is the inexpensive first gate.
 
 Output: a single JSON object on stdout:
-  {"auto_pr": [], "judgment": [...], "false_positives": [...]}
+  {"auto_pr": [], "judgment": [...], "digest": [...],
+   "false_positives": [...], "scanned_repos": ["repo", ...]}
 Diagnostics go to stderr. Auth: GH_TOKEN env (read by `gh`), same as audit.py.
 
 The workflow's scope INCLUDES sidekick-labs/.github itself (locked decision), so
@@ -60,6 +78,25 @@ ORG = os.environ.get("AUDIT_ORG", "sidekick-labs")
 # Lens-4 thresholds (mirror audit.py's cancellation lens exactly).
 CANCEL_RATE_MIN = 0.10
 CANCEL_COUNT_MIN = 3
+
+# ---- Issue-worthiness thresholds (sre-brain noise-control optimisation) -------
+# `concurrency` is ALWAYS issue-worthy (the ci-fix engine auto-fixes it). The
+# other three categories only become a standing `ci-audit` issue when they clear
+# a real severity bar; otherwise they go to the digest. Tune here, never in code
+# elsewhere. Set deliberately high — the goal is to file an issue only when a
+# human (or the engine) would actually act on it.
+FAILED_MINUTES_ISSUE_MIN = 60.0    # failed-minutes: only an issue if >=60 wasted min...
+FAILURE_RATE_ISSUE_MIN = 0.50      # ...OR the workflow fails >=50% of the time.
+FLAKE_ISSUE_MIN = 3                # flakes: only an issue at >=3 same-SHA flakes.
+BURNER_ISSUE_MINUTES = 1000.0      # burners are informational; issue only if enormous.
+
+# Org-shared workflows defined as reusables HERE (sidekick-labs/.github) and rolled
+# out org-wide, so one systemic failure shows up identically across many caller
+# repos. These (and only these) are COALESCED in the digest — independent
+# same-named workflows (each repo's own `CI`) are NOT, because they are genuinely
+# separate problems. Tunable: add a name here when a new reusable goes org-wide.
+ORG_SHARED_WORKFLOW_NAMES = {"Claude Code Review"}
+COALESCE_MIN_REPOS = 2             # collapse a shared (name, category) group at >=2 repos.
 
 # Finding category for the missing-concurrency pattern. The ci-fix engine reads
 # the `suggested_fix` snippet below as a strong hint (it re-verifies before editing).
@@ -102,10 +139,77 @@ def has_concurrency_block(yaml_text: str) -> bool:
     return bool(_TOP_LEVEL_CONCURRENCY.search(yaml_text))
 
 
+def is_issue_worthy(finding: dict) -> bool:
+    """Should this finding become a standing `ci-audit` issue (vs. digest-only)?
+
+    `concurrency` always (engine-fixable). The other categories only when severe
+    enough that a human/engine would act — otherwise they belong in the digest.
+    Thresholds live in the ISSUE_* constants above."""
+    cat = finding["category"]
+    m = finding.get("metrics", {})
+    if cat == CAT_CONCURRENCY:
+        return True
+    if cat == "flakes":
+        return m.get("flake_count", 0) >= FLAKE_ISSUE_MIN
+    if cat == "failed-minutes":
+        return (m.get("failed_minutes", 0) >= FAILED_MINUTES_ISSUE_MIN
+                or m.get("failure_rate", 0) >= FAILURE_RATE_ISSUE_MIN)
+    if cat == "burners":
+        return m.get("total_minutes", 0) >= BURNER_ISSUE_MINUTES
+    return False
+
+
+def stamp_rec_id(finding: dict) -> dict:
+    """Stamp the stable dedup id. A coalesced org-shared finding keys on
+    (workflow_name, category) so it's one id across all caller repos; a normal
+    finding keys on (repo, workflow_file, category) as before."""
+    if finding.get("coalesced_repos"):
+        finding["rec_id"] = rec_id(finding["workflow_name"], "",
+                                   f"{finding['category']}:org-shared")
+    else:
+        finding["rec_id"] = rec_id(finding["repo"],
+                                   finding.get("workflow_file", ""),
+                                   finding["category"])
+    return finding
+
+
+def coalesce_digest(findings: list[dict]) -> list[dict]:
+    """Collapse org-shared-workflow findings (same name+category across many
+    caller repos) into ONE digest row. Non-shared findings pass through untouched.
+    Digest-only, so there is no ci-fix-engine single-target contract to honour."""
+    shared_groups: dict[tuple[str, str], list[dict]] = {}
+    passthrough: list[dict] = []
+    for f in findings:
+        if f["workflow_name"] in ORG_SHARED_WORKFLOW_NAMES:
+            shared_groups.setdefault((f["workflow_name"], f["category"]), []).append(f)
+        else:
+            passthrough.append(f)
+
+    out = list(passthrough)
+    for (name, category), group in shared_groups.items():
+        repos = sorted({g["repo"] for g in group})
+        if len(repos) < COALESCE_MIN_REPOS:
+            out.extend(group)  # not enough fan-out to be worth coalescing
+            continue
+        out.append({
+            "repo": "(org-shared)",
+            "workflow_name": name,
+            "workflow_file": "",
+            "category": category,
+            "coalesced_repos": repos,
+            "note": (f"Org-shared workflow `{name}` shows `{category}` across "
+                     f"{len(repos)} repos: {', '.join(repos)}. Almost certainly ONE "
+                     f"systemic root cause (the shared reusable in .github) — "
+                     f"investigate once, not per-repo."),
+            "metrics": {"affected_repos": len(repos)},
+        })
+    return out
+
+
 def partition(data: dict) -> dict:
     workflows = data.get("workflows", [])
     auto_pr: list[dict] = []
-    judgment: list[dict] = []
+    findings: list[dict] = []
     false_positives: list[dict] = []
 
     for w in workflows:
@@ -129,7 +233,7 @@ def partition(data: dict) -> dict:
             if not wf_path:
                 # Can't locate the file (e.g. run.path was empty) -> still file a
                 # ci-audit issue, but flag that the engine must locate the workflow.
-                judgment.append({
+                findings.append({
                     "repo": repo,
                     "workflow_name": name,
                     "workflow_file": wf_path,
@@ -156,7 +260,7 @@ def partition(data: dict) -> dict:
                         "reason": "top-level `concurrency:` block already present",
                     })
                 else:
-                    judgment.append({
+                    findings.append({
                         "repo": repo,
                         "workflow_name": name,
                         "workflow_file": wf_path,
@@ -174,7 +278,7 @@ def partition(data: dict) -> dict:
 
         # ---- Judgment-call signal -> GitHub-issue tracker (not a committed report).
         if w.get("flake_count", 0) > 0:
-            judgment.append({
+            findings.append({
                 "repo": repo,
                 "workflow_name": name,
                 "workflow_file": wf_path,
@@ -187,7 +291,7 @@ def partition(data: dict) -> dict:
 
         # Slow-failing workflows: failures that burn real minutes before failing.
         if w.get("failure", 0) >= CANCEL_COUNT_MIN and w.get("failed_minutes", 0) > 0:
-            judgment.append({
+            findings.append({
                 "repo": repo,
                 "workflow_name": name,
                 "workflow_file": wf_path,
@@ -208,7 +312,7 @@ def partition(data: dict) -> dict:
     for w in burners:
         if w.get("total_minutes", 0) <= 0:
             continue
-        judgment.append({
+        findings.append({
             "repo": w["repo"],
             "workflow_name": w["name"],
             "workflow_file": w.get("path", ""),
@@ -225,13 +329,29 @@ def partition(data: dict) -> dict:
             },
         })
 
-    # Stamp every finding with a STABLE rec_id = hash(repo, workflow_file,
-    # category). The workflow embeds this id as a hidden
-    # `<!-- actions-audit:<rec-id> -->` marker in the `ci-audit` issue and dedups
-    # on it across runs (refresh, don't stack). Stamped here (one place) rather
-    # than at each of the append sites.
-    for j in judgment:
-        j["rec_id"] = rec_id(j["repo"], j.get("workflow_file", ""), j["category"])
+    # ---- Split issue-worthy (-> standing ci-audit issues) from digest-only -----
+    # ISSUE-WORTHY = concurrency (engine-fixable) + over-threshold severe findings.
+    # Everything else is informational and goes to the digest, never an individual
+    # issue — this is the noise control that stops the perpetual "needs-judgment"
+    # backlog. Digest findings then get org-shared coalescing so one systemic root
+    # cause is one digest line, not one per caller repo.
+    judgment = [f for f in findings if is_issue_worthy(f)]
+    digest = coalesce_digest([f for f in findings if not is_issue_worthy(f)])
+
+    # Stamp every finding with a STABLE rec_id (see stamp_rec_id). The workflow
+    # embeds this id as a hidden `<!-- actions-audit:<rec-id> -->` marker in the
+    # `ci-audit` issue and dedups on it across runs (refresh, don't stack); the
+    # reconcile pass in open_issues.py also keys closure on it.
+    for f in judgment:
+        stamp_rec_id(f)
+    for f in digest:
+        stamp_rec_id(f)
+
+    # scanned_repos = every repo that had a run in the window (healthy or not).
+    # The reconcile pass uses this to SAFELY close cleared findings only for repos
+    # actually scanned this run — a partial/errored scan that misses a repo leaves
+    # that repo's issues untouched rather than wrongly closing them.
+    scanned_repos = sorted({w["repo"] for w in workflows})
 
     return {
         "generated_at": data.get("generated_at"),
@@ -241,7 +361,9 @@ def partition(data: dict) -> dict:
         # the actuator (sre-brain ci-fix) now owns ALL fixes (sre-brain#109).
         "auto_pr": auto_pr,
         "judgment": judgment,
+        "digest": digest,
         "false_positives": false_positives,
+        "scanned_repos": scanned_repos,
     }
 
 
@@ -272,7 +394,9 @@ def main():
     print(
         f"[recommendations] auto_pr={len(result['auto_pr'])} "
         f"judgment={len(result['judgment'])} "
-        f"false_positives={len(result['false_positives'])}",
+        f"digest={len(result['digest'])} "
+        f"false_positives={len(result['false_positives'])} "
+        f"scanned_repos={len(result['scanned_repos'])}",
         file=sys.stderr,
     )
 
