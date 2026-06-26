@@ -1,0 +1,38 @@
+name: Test actions-audit logic
+
+# Regression gate for the deterministic actions-audit scripts (the SENSOR of the
+# CI self-healing loop): recommendations.py's issue-worthy/digest split + org-shared
+# coalescing, and open_issues.py's reconcile (auto-close) safety rails. These are
+# pure, network-free code paths (the test monkeypatches the gh shellouts), so they
+# are cheaply unit-testable — and they decide what lands in / leaves the sre-brain
+# tracker org-wide, so a regression here is high-blast-radius. Mirrors the
+# path-filtered, per-area pattern of test-release-thread.yml.
+on:
+  pull_request:
+    paths:
+      - 'audit/**'
+      - 'tests/audit-recommendations-reconcile-logic.py'
+      - '.github/workflows/test-audit-logic.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'audit/**'
+      - 'tests/audit-recommendations-reconcile-logic.py'
+      - '.github/workflows/test-audit-logic.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  audit-logic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.12'
+      - name: Compile audit scripts
+        run: python3 -m py_compile audit/*.py
+      - name: Run actions-audit logic tests
+        run: python3 tests/audit-recommendations-reconcile-logic.py
