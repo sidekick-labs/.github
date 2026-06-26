@@ -14,8 +14,8 @@ Run the existing `/actions-audit` skill on a weekly cadence across the sidekick-
 The original plan assumed we'd build the auto-PR machinery from scratch (`recommendations.py`, a bespoke `weekly-actions-audit.yml`, hand-rolled idempotency, committed dated reports). Most of that now **already exists** in `sidekick-labs/.github`:
 
 - **`.github/workflows/reusable-weekly-maintenance.yml`** (PR #5, ~670 lines) already does: AI-engine-driven fixes that open a signed PR, a **TODO/FIXME census with week-over-week deltas via `actions/cache`** (not committed reports), CodeQL alert review, and a **Linear fallback** for judgment-call items (`linear-fallback` input). It is **per-repo** — each repo's own workflow calls it with `secrets: inherit`.
-- The AI engine is now **configurable: `engine: claude | codex`** (Claude→Codex Actions migration in flight; the Codex path is merged but dormant behind `engine:claude` pending one live validation). Anything we build MUST take an `engine` input, not hardcode `anthropics/claude-code-action`.
-- Model is pinned via `CLAUDE_MODEL` / `CODEX_MODEL` Actions vars with literal fallbacks (`claude-opus-4-8`).
+- The AI engine is **`anthropics/claude-code-action`** + `CLAUDE_CODE_OAUTH_TOKEN`. (A prior Claude→Codex migration was reversed — Codex tooling has been removed org-wide.)
+- Model is pinned via the `CLAUDE_MODEL` Actions var with a literal fallback (`claude-opus-4-8`).
 
 **Implication:** don't rebuild primitives. The actions-audit is the one thing weekly-maintenance does NOT cover, because it is **org-level / cross-repo** (it analyses Actions *usage* across all repos), whereas weekly-maintenance is per-repo dependency/security hygiene. So actions-audit is a **separate org-level scheduled workflow** in `.github`, but it should **reuse weekly-maintenance's conventions and proven steps** rather than reinvent them.
 
@@ -39,7 +39,7 @@ sidekick-labs/.github  (org repo)
 
 | Concern | What weekly-maintenance already does — copy the pattern |
 |---|---|
-| AI engine | `engine: claude \| codex` input; validate-secrets step; `CLAUDE_MODEL`/`CODEX_MODEL` env with literal fallback. Actions-audit must be engine-agnostic too. |
+| AI engine | `anthropics/claude-code-action`; validate-secrets step; `CLAUDE_MODEL` env with literal fallback. |
 | Judgment-call items | `linear-fallback` input → opens a Linear issue instead of dropping risky/non-deterministic findings. This **replaces** the original "report-only markdown" idea — route report-only findings to Linear, not a committed `.md`. |
 | WoW deltas | `actions/cache` keyed by `github.repository_id` stores the previous census; diff against it. Use the same approach for audit metrics — **drop the committed dated `.md` report idea.** |
 | PR creation | Agent prompt (near its start) instructs "You MUST **attempt to** create a PR with fixes when changes are produced" — the "attempt to" is deliberate: the prompt later forbids opening a PR if verification fails. Commits as `github-actions[bot]`, GH-signed. |
@@ -61,7 +61,7 @@ actions-audit writes to *many* target repos, so it needs broader auth than weekl
    - Stable rec ID = hash(repo, workflow file, change type); branch `actions-audit/<rec-id>`.
    - Idempotency: skip if that branch OR an open PR with that head already exists.
    - Clone target repo with the installation token.
-   - Invoke the configured engine (`claude` or `codex`) with the recommendation + cloned repo.
+   - Invoke `anthropics/claude-code-action` with the recommendation + cloned repo.
    - **Required prompt instruction (Skill Rule #1):** read the current YAML; if the fix is already applied, abort and emit a "false positive" note; only edit when verifiably missing.
    - Open a GH-signed PR templated from the recommendation.
 6. WoW metrics deltas via `actions/cache` (mirror the census-cache step); surface in `$GITHUB_STEP_SUMMARY`.
@@ -73,7 +73,7 @@ actions-audit writes to *many* target repos, so it needs broader auth than weekl
 |---|---|
 | `sidekick-labs/.github` repo | **Exists** (verified 2026-06-02). |
 | GitHub App | `contents:write`, `pull-requests:write`, `actions:read`, `metadata:read`; installed org-wide. Check whether the weekly-maintenance rollout already created a suitable App before making a new one. |
-| Secrets in `.github` repo | `APP_ID`, `APP_PRIVATE_KEY`; engine creds (`CLAUDE_CODE_OAUTH_TOKEN` — always use the OAuth token for `claude-code-action`, never `ANTHROPIC_API_KEY`; or `CODEX_AUTH_JSON` for codex); `LINEAR_API_KEY`; `SLACK_WEBHOOK_URL`. |
+| Secrets in `.github` repo | `APP_ID`, `APP_PRIVATE_KEY`; engine creds (`CLAUDE_CODE_OAUTH_TOKEN` — always use the OAuth token for `claude-code-action`, never `ANTHROPIC_API_KEY`); `LINEAR_API_KEY`; `SLACK_WEBHOOK_URL`. |
 | Auto-PR allowlist | Start with `concurrency:` block addition only. Expand once a few weeks of clean output build trust. |
 | `audit.py` port | Parameterize paths (`$GITHUB_WORKSPACE`), use `GH_TOKEN` env instead of local `gh auth`. |
 

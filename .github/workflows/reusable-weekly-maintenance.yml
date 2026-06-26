@@ -108,11 +108,6 @@ on:
         required: false
         type: string
         default: './gradlew test'
-      engine:
-        description: 'AI engine: claude (default) uses anthropics/claude-code-action + CLAUDE_CODE_OAUTH_TOKEN; codex uses openai/codex-action + the CODEX_AUTH_JSON subscription credential. The assembled prompt, setup, and artifact steps are shared.'
-        required: false
-        type: string
-        default: 'claude'
       additional-allowed-tools:
         description: 'Comma-separated extra entries appended to claude_args --allowed-tools.'
         required: false
@@ -146,10 +141,7 @@ on:
 
     secrets:
       claude-code-oauth-token:
-        description: 'CLAUDE_CODE_OAUTH_TOKEN for the anthropics action. Required when engine=claude (the default).'
-        required: false
-      CODEX_AUTH_JSON:
-        description: 'Codex subscription auth.json (org secret). Required when engine=codex. Supplied via secrets: inherit.'
+        description: 'CLAUDE_CODE_OAUTH_TOKEN for the anthropics action.'
         required: false
 
 permissions: {}
@@ -159,9 +151,6 @@ env:
   # CLAUDE_MODEL Actions variable (resolved in the caller's context); the
   # literal is a safe fallback so an unset var can't yield an empty --model.
   CLAUDE_MODEL: "${{ vars.CLAUDE_MODEL || 'claude-opus-4-8' }}"
-  # Codex model. Empty lets codex-action pick its default; override org-wide
-  # via the CODEX_MODEL Actions variable. Only used when engine=codex.
-  CODEX_MODEL: "${{ vars.CODEX_MODEL || '' }}"
 
 jobs:
   maintenance:
@@ -180,8 +169,6 @@ jobs:
         env:
           STACK: ${{ inputs.stack }}
           STRATEGY: ${{ inputs.bundle-update-strategy }}
-          ENGINE: ${{ inputs.engine }}
-          ADDITIONAL_ALLOWED_TOOLS: ${{ inputs.additional-allowed-tools }}
         run: |
           set -euo pipefail
           case "$STACK" in
@@ -192,31 +179,15 @@ jobs:
             lock-update|conservative|none) ;;
             *) echo "::error::Invalid bundle-update-strategy: $STRATEGY"; exit 1 ;;
           esac
-          case "$ENGINE" in
-            claude|codex) ;;
-            *) echo "::error::Invalid engine: $ENGINE (expected claude or codex)"; exit 1 ;;
-          esac
-          if [ "$ENGINE" = "codex" ] && [ -n "${ADDITIONAL_ALLOWED_TOOLS:-}" ]; then
-            echo "::warning::additional-allowed-tools is ignored when engine=codex (the workspace-write sandbox governs tool access, not an allowlist)."
-          fi
 
       - name: Validate required secrets
         env:
-          ENGINE: ${{ inputs.engine }}
           CLAUDE_TOKEN: ${{ secrets.claude-code-oauth-token }}
-          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
         run: |
           set -euo pipefail
-          if [ "$ENGINE" = "codex" ]; then
-            if [ -z "${CODEX_AUTH_JSON:-}" ]; then
-              echo "::error::engine=codex but CODEX_AUTH_JSON secret is not set"
-              exit 1
-            fi
-          else
-            if [ -z "${CLAUDE_TOKEN:-}" ]; then
-              echo "::error::claude-code-oauth-token secret is not set"
-              exit 1
-            fi
+          if [ -z "${CLAUDE_TOKEN:-}" ]; then
+            echo "::error::claude-code-oauth-token secret is not set"
+            exit 1
           fi
 
       - name: Checkout repository
@@ -617,7 +588,6 @@ jobs:
 
       - name: Weekly maintenance
         id: maintenance
-        if: ${{ inputs.engine != 'codex' }}
         uses: anthropics/claude-code-action@2fee15510437d71399d9139ed60433470484a8fb # main@2.1.160 (thinking-block 400 fix; ahead of release v1.0.133 — see rarebit-one/rarebit-ops#119)
         timeout-minutes: ${{ inputs.claude-timeout-minutes }}
         with:
@@ -627,32 +597,6 @@ jobs:
           claude_args: >-
             --model ${{ env.CLAUDE_MODEL }}
             --allowed-tools "${{ steps.build-prompt.outputs.allowed-tools }}"
-
-      # Codex engine: a workspace-write sandbox with network enabled (dep
-      # updates, git push, and gh all need it). Reuses the SAME assembled prompt
-      # — it's engine-neutral task instructions plus the embedded commit/push/PR
-      # bash. No allowed-tools (the sandbox governs).
-      - name: Setup Codex auth (weekly)
-        id: codex-auth
-        if: ${{ inputs.engine == 'codex' }}
-        uses: sidekick-labs/.github/.github/actions/setup-codex-auth@main
-        with:
-          auth-json: ${{ secrets.CODEX_AUTH_JSON }}
-          enable-workspace-network: 'true'
-
-      - name: Weekly maintenance (Codex)
-        id: maintenance-codex
-        if: ${{ inputs.engine == 'codex' }}
-        uses: openai/codex-action@e0fdf01220eb9a88167c4898839d273e3f2609d1 # v1.8
-        timeout-minutes: ${{ inputs.claude-timeout-minutes }}
-        env:
-          # gh (pr/api) needs a token; git push uses the checkout credential.
-          GH_TOKEN: ${{ github.token }}
-        with:
-          codex-home: ${{ steps.codex-auth.outputs.codex-home }}
-          sandbox: workspace-write
-          model: ${{ env.CODEX_MODEL }}
-          prompt: ${{ steps.build-prompt.outputs.prompt }}
 
       # ----- artifacts -----
 
