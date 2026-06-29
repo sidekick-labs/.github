@@ -48,8 +48,10 @@ for a possible future redesign.)
 
 ## The `@v3` pin model — how to ship a change
 
-The production deploy/promote **callers** and the reusables' **inner composite** refs all
-pin the **moving `v3` tag**. So shipping a reusable/composite change is:
+The production **and staging** deploy/promote **callers** and the reusables' **inner
+composite** refs all pin the **moving `v3` tag** (staging joined `@v3` in core-platform-brain#108;
+before that staging callers were SHA-pinned and needed a 3-repo re-pin cascade). So shipping a
+reusable/composite change — production *or* staging — is:
 
 1. Edit the reusable/composite on a branch, open a PR, merge to `.github` `main`.
 2. Advance the tag: `git tag -f v3 <merge-sha> && git push -f origin v3`.
@@ -59,8 +61,9 @@ pin the **moving `v3` tag**. So shipping a reusable/composite change is:
 after the change is merged and you're ready for it to go live across all three repos.
 Third-party actions (checkout, create-github-app-token, upload-artifact) stay SHA-pinned.
 
-> Pin drift is moot under this model — all three callers pin `@v3`. To verify:
-> `for r in sidekick-web sidekick-harness sidekick-inference; do git -C $r grep -h 'reusable-\(promote\|deploy\)-production.yml@' origin/main; done` — all should read `@v3`.
+> Pin drift is moot under this model — all three callers pin `@v3` for both production and
+> staging. To verify:
+> `for r in sidekick-web sidekick-harness sidekick-inference; do git -C $r grep -h 'reusable-\(promote\|deploy\)-\(production\|staging\).yml@' origin/main; done` — all should read `@v3`.
 
 ## Config
 
