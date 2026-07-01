@@ -1,0 +1,279 @@
+name: Pin Sweep
+
+# Scheduled self-healer for the actions-pinning estate. Weekly (+ on demand) it
+# iterates every non-archived sidekick-labs repo, runs `pinact run` against a
+# runtime-synthesized config (NOT a committed .pinact.yaml), and — if that
+# produces a diff — opens an auto-mergeable PR on that repo with the fix.
+#
+# This is the ACTUATOR that keeps the estate pinned as new actions land and tags
+# drift; the `pin-check.yml` PR gate is the SENSOR that blocks drift on the way
+# in. Dependabot (github-actions ecosystem) bumps the already-pinned SHAs; this
+# sweep catches anything that slips in unpinned.
+#
+# Auth + cross-repo pattern mirrors sre-brain's ci-fix engine: a release-bot
+# GitHub App token (org var SIDEKICK_RELEASE_BOT_APP_ID + secret
+# SIDEKICK_RELEASE_BOT_PRIVATE_KEY), a repo matrix, per-target checkout, and a
+# server-signed commit via the API so the fix PR lands even on "require signed
+# commits" repos.
+#
+# Portability: nothing here is sidekick-labs-specific except the two lines wiring
+# the release-bot credentials — the rest derives from context (`owner:` is the
+# repository owner). The pinact ignore policy is synthesized at runtime from the
+# owner, so it never depends on a committed .pinact.yaml in the target repo.
+
+on:
+  schedule:
+    # 07:00 SGT Monday = 23:00 UTC Sunday. Weekly cadence: pinning drift isn't
+    # urgent, and this bounds the App-token / runner spend to one pass a week.
+    - cron: '0 23 * * 0'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'List the target repos but do NOT run pinact or open PRs.'
+        type: boolean
+        default: false
+      only_repo:
+        description: 'Restrict the sweep to ONE repo name (targeted validation). Empty = all non-archived repos.'
+        type: string
+        default: ''
+
+permissions: {}
+
+concurrency:
+  group: pin-sweep
+  cancel-in-progress: false
+
+env:
+  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+  PINACT_VERSION: '4.1.0'
+  PINACT_SHA256: '8fcbf1b3e95551c82fd995535e3c1defa70e23299ce36eb3afd6c98778de6ca0'
+
+jobs:
+  plan:
+    name: Plan target repos
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.repos.outputs.matrix }}
+      count: ${{ steps.repos.outputs.count }}
+    steps:
+      # Read-only mint over all installed repos, just to enumerate them.
+      - name: Mint release-bot token (enumerate)
+        id: tok
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.SIDEKICK_RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.SIDEKICK_RELEASE_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Build repo matrix
+        id: repos
+        env:
+          GH_TOKEN: ${{ steps.tok.outputs.token }}
+          ONLY_REPO: ${{ inputs.only_repo }}
+        run: |
+          set -euo pipefail
+          # Non-archived repos the release-bot App is installed on.
+          NAMES="$(gh api /installation/repositories --paginate \
+            --jq '.repositories[] | select(.archived == false) | .name')"
+          if [ -n "${ONLY_REPO:-}" ]; then
+            NAMES="$(printf '%s\n' "$NAMES" | grep -Fx "$ONLY_REPO" || true)"
+            if [ -z "$NAMES" ]; then
+              echo "::warning::only_repo='${ONLY_REPO}' matched no installed non-archived repo."
+            fi
+          fi
+          MATRIX="$(printf '%s\n' "$NAMES" | sed '/^$/d' \
+            | python3 -c 'import json,sys; print(json.dumps([{"repo": r.strip()} for r in sys.stdin if r.strip()]))')"
+          COUNT="$(printf '%s' "$MATRIX" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')"
+          echo "count=${COUNT}" >> "$GITHUB_OUTPUT"
+          echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Pin sweep — plan"
+            echo ""
+            echo "- **Target repos:** ${COUNT}$([ "${{ inputs.dry_run }}" = "true" ] && echo ' (dry-run — no fixes)')"
+            printf '%s\n' "$NAMES" | sed '/^$/d' | sed 's/^/- /'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  sweep:
+    name: Pin ${{ matrix.repo }}
+    needs: plan
+    if: ${{ needs.plan.outputs.count != '0' && inputs.dry_run != true }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    permissions:
+      contents: read
+    env:
+      TARGET_REPO: ${{ github.repository_owner }}/${{ matrix.repo }}
+    steps:
+      # Per-target write token: push the fix branch + open the PR. `workflows`
+      # is required to push changes to files under .github/workflows/**.
+      - name: Mint release-bot token (target)
+        id: tok
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.SIDEKICK_RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.SIDEKICK_RELEASE_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ matrix.repo }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-workflows: write
+
+      - name: Checkout target
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ env.TARGET_REPO }}
+          token: ${{ steps.tok.outputs.token }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install pinact (pinned + checksum-verified)
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}"
+          curl -fsSL -o pinact.tar.gz \
+            "https://github.com/suzuki-shunsuke/pinact/releases/download/v${PINACT_VERSION}/pinact_linux_amd64.tar.gz"
+          echo "${PINACT_SHA256}  pinact.tar.gz" | sha256sum -c -
+          tar -xzf pinact.tar.gz pinact
+          install -m 0755 pinact /usr/local/bin/pinact
+          pinact --version
+
+      - name: Synthesize pinact config (owner-scoped, runtime-only)
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          # Built from the owner at runtime — NEVER a committed .pinact.yaml — so
+          # the sweep behaves identically on every repo and the fix PR contains
+          # only pin changes (no config file churn).
+          cat > /tmp/pinact.yaml <<EOF
+          version: 3
+          ignore_actions:
+            # First-party org actions/reusables are consumed at a moving ref by design.
+            - name: ${OWNER}/.*
+              ref: .*
+            # Local composite actions have no upstream ref to pin.
+            - name: \\./.*
+              ref: .*
+            # Deliberately SHA-pinned to a main-branch commit; exempt from the
+            # semver-comment check only (still SHA-pinned). See octo-brain convention.
+            - name: anthropics/claude-code-action
+              ref: .*
+          EOF
+
+      - name: Run pinact
+        id: pinact
+        env:
+          GITHUB_TOKEN: ${{ steps.tok.outputs.token }}
+        run: |
+          set -euo pipefail
+          pinact run -c /tmp/pinact.yaml
+          if git diff --quiet && git diff --cached --quiet && [ -z "$(git status --porcelain)" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No unpinned actions in ${TARGET_REPO} — already in steady state."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "pinact produced changes in ${TARGET_REPO}:"
+            git --no-pager diff --stat
+          fi
+
+      - name: Open auto-merge fix PR
+        if: steps.pinact.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.tok.outputs.token }}
+        run: |
+          set -euo pipefail
+          DEFAULT_BRANCH="$(gh repo view "$TARGET_REPO" --json defaultBranchRef --jq '.defaultBranchRef.name')"
+          BRANCH="pin-fix/$(date -u +%Y%m%d)-${{ github.run_id }}"
+          MARKER="<!-- pin-sweep -->"
+
+          # Skip if an open pin-fix PR already exists (idempotent across runs).
+          EXISTING="$(gh pr list --repo "$TARGET_REPO" --state open --search "in:body $MARKER" --json number --jq '.[0].number // empty')"
+          if [ -n "$EXISTING" ]; then
+            echo "::notice::${TARGET_REPO} already has an open pin-fix PR (#${EXISTING}) — skipping."
+            exit 0
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+
+          COMMIT_MESSAGE="ci: SHA-pin third-party actions (pinact)
+
+          Automated fix from the org pin-sweep. Third-party GitHub Actions must be
+          pinned to a full commit SHA; pinact re-pinned the drift below.
+
+          Sweep run: ${RUN_URL}"
+
+          git add -A
+          git commit -m "$COMMIT_MESSAGE"
+
+          # Push the (unsigned) intermediate to the exempt pin-fix/* branch, then
+          # replace HEAD with a server-SIGNED commit via the API and re-point the
+          # ref — so the PR lands even on "require signed commits" repos. Push
+          # explicitly to the target with the scoped App token (never `origin`).
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${TARGET_REPO}.git" "$BRANCH"
+
+          TREE="$(git rev-parse HEAD^{tree})"
+          PARENT="$(git rev-parse HEAD^)"
+          SIGNED="$(gh api "repos/${TARGET_REPO}/git/commits" --method POST \
+            -f message="$COMMIT_MESSAGE" -f tree="$TREE" -f "parents[]=$PARENT" --jq '.sha')"
+          [ -z "$SIGNED" ] && { echo "ERROR: signed-commit creation failed" >&2; exit 1; }
+          gh api "repos/${TARGET_REPO}/git/refs/heads/${BRANCH}" --method PATCH -f sha="$SIGNED" -F force=true
+          UPDATED="$(gh api "repos/${TARGET_REPO}/git/refs/heads/${BRANCH}" --jq '.object.sha')"
+          [ "$UPDATED" != "$SIGNED" ] && { echo "ERROR: ref did not advance to signed SHA" >&2; exit 1; }
+
+          PR_BODY="## Auto-fix from the org pin-sweep
+
+          \`pinact run\` found third-party GitHub Actions that weren't SHA-pinned in this repo and re-pinned them (honoring the org-standard runtime pinact policy). This PR has squash auto-merge enabled and lands once CI is green.
+
+          - **Sweep run:** ${RUN_URL}
+          - **Why:** unpinned actions are a supply-chain risk (a mutable tag can be re-pointed to malicious code). The \`pin-check\` gate blocks new drift; this sweep heals anything already merged.
+
+          ${MARKER}"
+
+          URL="$(gh pr create --repo "$TARGET_REPO" \
+            --title 'ci: SHA-pin third-party actions (pinact)' \
+            --body "$PR_BODY" --base "$DEFAULT_BRANCH" --head "$BRANCH")"
+          echo "Opened: $URL"
+          gh pr merge --repo "$TARGET_REPO" --auto --squash "$URL" \
+            || echo "::warning::auto-merge not enabled for $URL — left open for manual merge"
+
+  # Crash-level visibility: if plan or any sweep leg dies (quota/runner/crash),
+  # make the missed sweep visible as one deduped issue; clear it on recovery.
+  alert:
+    needs: [plan, sweep]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Flag failure or clear on recovery
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          FAILED: ${{ needs.plan.result == 'failure' || needs.sweep.result == 'failure' }}
+        run: |
+          set -euo pipefail
+          WF="pin-sweep"
+          EXISTING="$(gh issue list --search "\"beat failure: ${WF}\" in:title" --state open --json number --jq '.[0].number // empty')"
+          if [ "${FAILED}" != "true" ]; then
+            if [ -n "$EXISTING" ]; then
+              gh issue close "$EXISTING" --comment "Recovered: ${WF} succeeded — ${RUN_URL}."
+            fi
+            exit 0
+          fi
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "Failed again: ${RUN_URL}"
+          else
+            gh issue create \
+              --title "beat failure: ${WF} ($(date -u +%F))" \
+              --body "Scheduled pin-sweep failed before finishing — some repos may still carry unpinned actions. Run: ${RUN_URL}"
+          fi
