@@ -73,6 +73,7 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.tok.outputs.token }}
           ONLY_REPO: ${{ inputs.only_repo }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
           # Non-archived repos the release-bot App is installed on.
@@ -92,7 +93,7 @@ jobs:
           {
             echo "## Pin sweep — plan"
             echo ""
-            echo "- **Target repos:** ${COUNT}$([ "${{ inputs.dry_run }}" = "true" ] && echo ' (dry-run — no fixes)')"
+            echo "- **Target repos:** ${COUNT}$([ "${DRY_RUN}" = "true" ] && echo ' (dry-run — no fixes)')"
             printf '%s\n' "$NAMES" | sed '/^$/d' | sed 's/^/- /'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -191,19 +192,25 @@ jobs:
         run: |
           set -euo pipefail
           DEFAULT_BRANCH="$(gh repo view "$TARGET_REPO" --json defaultBranchRef --jq '.defaultBranchRef.name')"
-          BRANCH="pin-fix/$(date -u +%Y%m%d)-${{ github.run_id }}"
+          # Deterministic head branch per target repo. A stable name is what makes
+          # the sweep idempotent: re-runs reuse (force-update) the same branch/PR
+          # rather than opening a new one each pass.
+          BRANCH="pin-fix/${TARGET_REPO##*/}"
           MARKER="<!-- pin-sweep -->"
 
-          # Skip if an open pin-fix PR already exists (idempotent across runs).
-          EXISTING="$(gh pr list --repo "$TARGET_REPO" --state open --search "in:body $MARKER" --json number --jq '.[0].number // empty')"
+          # Skip if an open pin-fix PR already exists on the deterministic head
+          # branch. Dedup by --head is reliable (a direct ref lookup); the previous
+          # body-marker search (in:body) depended on PR-body search indexing, which
+          # can lag and let duplicate fix PRs slip through at scale.
+          EXISTING="$(gh pr list --repo "$TARGET_REPO" --head "$BRANCH" --state open --json number --jq '.[0].number // empty')"
           if [ -n "$EXISTING" ]; then
-            echo "::notice::${TARGET_REPO} already has an open pin-fix PR (#${EXISTING}) — skipping."
+            echo "::notice::${TARGET_REPO} already has an open pin-fix PR (#${EXISTING}) on ${BRANCH} — skipping."
             exit 0
           fi
 
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -b "$BRANCH"
+          git checkout -B "$BRANCH"
 
           COMMIT_MESSAGE="ci: SHA-pin third-party actions (pinact)
 
@@ -219,7 +226,9 @@ jobs:
           # replace HEAD with a server-SIGNED commit via the API and re-point the
           # ref — so the PR lands even on "require signed commits" repos. Push
           # explicitly to the target with the scoped App token (never `origin`).
-          git push "https://x-access-token:${GH_TOKEN}@github.com/${TARGET_REPO}.git" "$BRANCH"
+          # Force-update: the head branch is deterministic and may linger from a
+          # prior merged/closed fix PR when no open PR exists to short-circuit above.
+          git push --force "https://x-access-token:${GH_TOKEN}@github.com/${TARGET_REPO}.git" "$BRANCH"
 
           TREE="$(git rev-parse HEAD^{tree})"
           PARENT="$(git rev-parse HEAD^)"

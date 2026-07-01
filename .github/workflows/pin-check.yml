@@ -106,13 +106,23 @@ jobs:
       - name: zizmor — full audit (informational, non-blocking)
         if: steps.prep.outputs.paths != ''
         continue-on-error: true
-        run: zizmor --persona pedantic ${{ steps.prep.outputs.config }} ${{ steps.prep.outputs.paths }}
+        env:
+          CONFIG: ${{ steps.prep.outputs.config }}
+          PATHS: ${{ steps.prep.outputs.paths }}
+        # $CONFIG / $PATHS are intentionally unquoted: CONFIG is a "--config <path>"
+        # word pair and PATHS is space-separated. Routing them through env (rather
+        # than templating step outputs straight into the shell) removes the
+        # script-injection surface; env expansion only word-splits, never executes.
+        run: zizmor --persona pedantic $CONFIG $PATHS
 
       - name: zizmor — pinning gate (blocks on unpinned-uses)
         if: steps.prep.outputs.paths != ''
+        env:
+          CONFIG: ${{ steps.prep.outputs.config }}
+          PATHS: ${{ steps.prep.outputs.paths }}
         run: |
           set -euo pipefail
-          zizmor --persona pedantic --format json ${{ steps.prep.outputs.config }} ${{ steps.prep.outputs.paths }} > "${RUNNER_TEMP}/zizmor.json" || true
+          zizmor --persona pedantic --format json $CONFIG $PATHS > "${RUNNER_TEMP}/zizmor.json" || true
           python3 - "${RUNNER_TEMP}/zizmor.json" <<'PY'
           import json, sys
           data = json.load(open(sys.argv[1]))
