@@ -29,4 +29,4 @@ jobs:
             actions: read
           # Pin the model so the interactive agent doesn't silently shift when
           # the action's default changes. Keep in lockstep with claude-code-review.yml.
-          claude_args: '--model ${{ env.CLAUDE_MODEL }}'
+          claude_args: '--model ${{ env.CLAUDE_MODEL }} --effort high'

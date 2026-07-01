@@ -597,6 +597,7 @@ jobs:
           claude_args: >-
             --model ${{ env.CLAUDE_MODEL }}
             --allowed-tools "${{ steps.build-prompt.outputs.allowed-tools }}"
+            --effort high
 
       # ----- artifacts -----
 

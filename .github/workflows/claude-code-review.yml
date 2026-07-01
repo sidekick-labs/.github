@@ -73,4 +73,4 @@ jobs:
           # reasoning from `gh pr diff` alone. Deliberately read-only — no Edit
           # or mutating Bash — so the workflow stays fork-safe and resistant to
           # prompt injection from untrusted PR content.
-          claude_args: '--model ${{ env.CLAUDE_MODEL }} --allowed-tools "Read,Glob,Grep,Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"'
+          claude_args: '--model ${{ env.CLAUDE_MODEL }} --allowed-tools "Read,Glob,Grep,Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)" --effort high'
