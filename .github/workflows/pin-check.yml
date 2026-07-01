@@ -1,0 +1,172 @@
+name: Pin Check
+
+# Reusable PR gate that FAILS when a third-party GitHub Action isn't SHA-pinned.
+# Two independent checks, both org-agnostic (everything derives from the caller):
+#
+#   1. zizmor (primary) — the GitHub Actions security auditor. We run its full
+#      audit for visibility, but BLOCK only on the `unpinned-uses` finding so the
+#      gate is specifically an actions-pinning gate (other zizmor findings are
+#      surfaced as informational log, not merge blockers). First-party org
+#      actions pinned at @main/@vN are allowed via the `unpinned-uses` policy:
+#      the repo's `.github/zizmor.yml` if present, else an owner-scoped policy
+#      synthesized from `github.repository_owner` (portable across every org).
+#
+#   2. pinact --check (secondary) — a tight, config-aware second opinion. It runs
+#      against a RUNTIME-SYNTHESIZED `/tmp/pinact.yaml` built from the caller's
+#      owner (first-party + local ignores + the anthropics/claude-code-action
+#      semver-comment exemption) — it deliberately does NOT rely on any committed
+#      `.pinact.yaml`, so the gate behaves identically on every repo regardless of
+#      whether one is checked in.
+#
+# Consume from a PR workflow:
+#
+#   jobs:
+#     pin-check:
+#       uses: sidekick-labs/.github/.github/workflows/pin-check.yml@main
+#
+# The reusable is org-agnostic — it derives everything from the caller's repo.
+
+on:
+  workflow_call:
+    inputs:
+      zizmor-version:
+        description: 'zizmor version to install (pinned for determinism).'
+        type: string
+        default: '1.26.1'
+      paths:
+        description: 'Space-separated paths to audit. Empty = auto-detect .github/workflows + .github/actions.'
+        type: string
+        default: ''
+
+permissions: {}
+
+env:
+  PINACT_VERSION: '4.1.0'
+  PINACT_SHA256: '8fcbf1b3e95551c82fd995535e3c1defa70e23299ce36eb3afd6c98778de6ca0'
+
+jobs:
+  pin-check:
+    name: Actions pinning gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Resolve audit paths + zizmor config
+        id: prep
+        env:
+          INPUT_PATHS: ${{ inputs.paths }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_PATHS}" ]; then
+            PATHS="${INPUT_PATHS}"
+          else
+            PATHS=""
+            [ -d .github/workflows ] && PATHS="${PATHS} .github/workflows"
+            [ -d .github/actions ] && PATHS="${PATHS} .github/actions"
+          fi
+          PATHS="$(echo "${PATHS}" | xargs || true)"
+          echo "paths=${PATHS}" >> "$GITHUB_OUTPUT"
+
+          # Prefer the repo's own zizmor config; else synthesize an owner-scoped
+          # policy so first-party @main/@vN refs are allowed but every third-party
+          # action must be hash-pinned. This keeps the gate portable to any org.
+          if [ -f .github/zizmor.yml ] || [ -f .github/zizmor.yaml ] || [ -f zizmor.yml ] || [ -f zizmor.yaml ]; then
+            echo "config=" >> "$GITHUB_OUTPUT"
+            echo "Using the repo's own zizmor config."
+          else
+            cat > "${RUNNER_TEMP}/zizmor.generated.yml" <<EOF
+          rules:
+            unpinned-uses:
+              config:
+                policies:
+                  ${OWNER}/*: ref-pin
+                  "*": hash-pin
+          EOF
+            echo "config=--config ${RUNNER_TEMP}/zizmor.generated.yml" >> "$GITHUB_OUTPUT"
+            echo "No repo zizmor config — synthesized owner policy: ${OWNER}/* ref-pin, * hash-pin."
+          fi
+
+          if [ -z "${PATHS}" ]; then
+            echo "::notice::No .github/workflows or .github/actions to audit — pin gate is a no-op."
+          fi
+
+      - name: Install zizmor
+        if: steps.prep.outputs.paths != ''
+        env:
+          ZIZMOR_VERSION: ${{ inputs.zizmor-version }}
+        run: pipx install "zizmor==${ZIZMOR_VERSION}"
+
+      - name: zizmor — full audit (informational, non-blocking)
+        if: steps.prep.outputs.paths != ''
+        continue-on-error: true
+        run: zizmor --persona pedantic ${{ steps.prep.outputs.config }} ${{ steps.prep.outputs.paths }}
+
+      - name: zizmor — pinning gate (blocks on unpinned-uses)
+        if: steps.prep.outputs.paths != ''
+        run: |
+          set -euo pipefail
+          zizmor --persona pedantic --format json ${{ steps.prep.outputs.config }} ${{ steps.prep.outputs.paths }} > "${RUNNER_TEMP}/zizmor.json" || true
+          python3 - "${RUNNER_TEMP}/zizmor.json" <<'PY'
+          import json, sys
+          data = json.load(open(sys.argv[1]))
+          unpinned = [f for f in data if f.get("ident") == "unpinned-uses"]
+          if not unpinned:
+              print("zizmor: all third-party actions are SHA-pinned.")
+              sys.exit(0)
+          lines = set()
+          for f in unpinned:
+              for loc in f.get("locations", []):
+                  feat = (loc.get("concrete") or {}).get("feature", "").strip()
+                  if feat:
+                      lines.add(feat)
+          print("::error::zizmor: the following action reference(s) are not SHA-pinned:")
+          for l in sorted(lines):
+              print(f"  - {l}")
+          print("Pin each to a full commit SHA (run `pinact run` locally to auto-fix). "
+                "File:line locations are in the full-audit step above.")
+          sys.exit(1)
+          PY
+
+      # Secondary, config-aware check. Honors a RUNTIME-SYNTHESIZED config (built
+      # from the caller's owner) rather than any committed .pinact.yaml, so the
+      # gate is deterministic across every repo: first-party + local composites
+      # are ignored, and anthropics/claude-code-action is exempt from the
+      # semver-comment nit only (it stays SHA-pinned — zizmor still enforces that).
+      - name: pinact — verify pins (runtime-synthesized config)
+        if: steps.prep.outputs.paths != ''
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}"
+          curl -fsSL -o pinact.tar.gz \
+            "https://github.com/suzuki-shunsuke/pinact/releases/download/v${PINACT_VERSION}/pinact_linux_amd64.tar.gz"
+          echo "${PINACT_SHA256}  pinact.tar.gz" | sha256sum -c -
+          tar -xzf pinact.tar.gz pinact
+          install -m 0755 pinact /usr/local/bin/pinact
+          pinact --version
+
+          cat > /tmp/pinact.yaml <<EOF
+          version: 3
+          ignore_actions:
+            # First-party org actions/reusables are consumed at a moving ref by design.
+            - name: ${OWNER}/.*
+              ref: .*
+            # Local composite actions have no upstream ref to pin.
+            - name: \\./.*
+              ref: .*
+            # Deliberately SHA-pinned to a main-branch commit; exempt from the
+            # semver-comment check only (still SHA-pinned). See octo-brain convention.
+            - name: anthropics/claude-code-action
+              ref: .*
+          EOF
+
+          cd "$GITHUB_WORKSPACE"
+          pinact run --check -c /tmp/pinact.yaml

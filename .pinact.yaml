@@ -1,6 +1,13 @@
 version: 3
 ignore_actions:
+  # First-party org actions/reusables are consumed at a moving ref by design.
   - name: sidekick-labs/.*
     ref: .*
+  # Local composite actions have no upstream ref to pin.
   - name: \./.*
+    ref: .*
+  # Deliberately SHA-pinned to a main-branch commit; exempt from the
+  # semver-comment check only (still SHA-pinned). Mirrors the runtime pinact
+  # policy the pin-check gate / pin-sweep synthesize (octo-brain convention).
+  - name: anthropics/claude-code-action
     ref: .*

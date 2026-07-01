@@ -14,6 +14,9 @@ Available reusable workflows:
 
 - **`reusable-weekly-maintenance.yml`** — weekly dependency-update / lint /
   test / CodeQL-alert sweep across every stack.
+- **`pin-check.yml`** — reusable PR gate that fails when a third-party action
+  isn't SHA-pinned (the actions-pinning self-healer's SENSOR). See
+  [Actions pinning self-healer](#actions-pinning-self-healer).
 
 > **Removed:** `reusable-sentry-autofix.yml` — the Sentry autofix moved to the
 > one-workflow-per-org model: `sidekick-labs/sre-brain`'s `sentry-sweep.yml` +
@@ -195,3 +198,64 @@ jobs:
 The `v2` tag carries the reusable workflows. New input contracts will
 land on `v2`; breaking changes will publish under `v3`. Pin to a SHA if
 you need stricter immutability.
+
+## Actions pinning self-healer
+
+Two workflows keep every third-party GitHub Action across the org SHA-pinned
+(a mutable tag can be re-pointed to malicious code — a supply-chain risk). They
+mirror the reference impl in `rarebit-one/.github` and are org-agnostic: the
+only sidekick-labs-specific wiring is the release-bot credential in the sweep.
+
+- **`pin-check.yml`** (SENSOR) — a `workflow_call` PR gate. Runs **zizmor**
+  (blocks only on `unpinned-uses`; other findings are informational) plus a
+  **pinact `--check`**. First-party `sidekick-labs/*` actions at `@main`/`@vN`
+  are allowed; every third-party action must be hash-pinned. The pinact check
+  uses a **runtime-synthesized** `/tmp/pinact.yaml` derived from
+  `github.repository_owner` — it deliberately does **not** rely on a committed
+  `.pinact.yaml`, so it behaves identically on every repo.
+- **`pin-sweep.yml`** (ACTUATOR) — weekly (+ `workflow_dispatch`) self-healer.
+  Enumerates non-archived org repos via the **release-bot App token**
+  (`vars.SIDEKICK_RELEASE_BOT_APP_ID` + `secrets.SIDEKICK_RELEASE_BOT_PRIVATE_KEY`),
+  runs `pinact run` against the same runtime-synthesized config, and opens a
+  **squash auto-merge** fix PR (server-signed via the API, so it lands on
+  require-signed-commits repos). Idempotent (skips repos with an open `pin-fix`
+  PR). Dispatch inputs: `dry_run` and `only_repo`.
+
+Dependabot (`github-actions` ecosystem, already enabled in each repo's
+`.github/dependabot.yml`) bumps the already-pinned SHAs forward; the sweep pins
+anything that slips in unpinned. The two are complementary: Dependabot
+freshens, pin-sweep pins, pin-check blocks new drift.
+
+### `anthropics/claude-code-action` exemption
+
+We SHA-pin `anthropics/claude-code-action` to a **main-branch commit** (ahead
+of release), annotated `# main@<ver>`. `pinact --check` flags that as a missing
+semver comment, so both the runtime config and the committed `.pinact.yaml`
+ignore it. It **stays SHA-pinned** — this only silences pinact's semver-comment
+nit; zizmor's `unpinned-uses` still enforces the full SHA.
+
+### Per-repo adoption (fan-out)
+
+This PR wires the gate onto **`sidekick-labs/.github`'s own PRs** via
+`pin-check-caller.yml` and confines all new files to this repo (so nothing
+touches the `*-brain` `sync-check`ed workflow set). To adopt the gate in
+another repo — start with the busiest product repo, **`sidekick-web`** — add a
+thin caller pointing at this reusable:
+
+```yaml
+# .github/workflows/pin-gate.yml in the consumer repo
+name: Pin Gate
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions: {}
+jobs:
+  pin-check:
+    permissions:
+      contents: read
+    uses: sidekick-labs/.github/.github/workflows/pin-check.yml@main
+```
+
+Also ensure the consumer's `.github/dependabot.yml` has the `github-actions`
+weekly block. The `pin-sweep` covers every non-archived repo automatically —
+no per-repo wiring needed for the actuator.

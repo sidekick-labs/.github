@@ -1,0 +1,18 @@
+# zizmor configuration for the actions-pinning gate.
+#
+# The org-wide policy: EVERY third-party action must be hash-pinned (a full
+# commit SHA), but FIRST-PARTY org actions/reusables may be ref-pinned (a
+# moving @main / @vN tag) — they live in this org, so the tag-swap supply-chain
+# risk a SHA defends against doesn't apply. This mirrors the `.pinact.yaml`
+# ignore for `sidekick-labs/*`, expressed for zizmor's `unpinned-uses` audit.
+#
+# Portability: the `pin-check.yml` reusable auto-generates the equivalent policy
+# from the *consumer's* `github.repository_owner` when a repo ships no
+# `.github/zizmor.yml`, so this exact file only needs to exist where a repo
+# wants to override the default. Keep the `*: hash-pin` fallback last.
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        sidekick-labs/*: ref-pin
+        "*": hash-pin
