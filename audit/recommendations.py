@@ -90,6 +90,14 @@ FAILURE_RATE_ISSUE_MIN = 0.50      # ...OR the workflow fails >=50% of the time.
 FLAKE_ISSUE_MIN = 3                # flakes: only an issue at >=3 same-SHA flakes.
 BURNER_ISSUE_MINUTES = 1000.0      # burners are informational; issue only if enormous.
 
+# Burners whose spend has been REVIEWED and ACCEPTED as a costed decision —
+# suppress the standing ISSUE (the burner still appears in the digest/report, so
+# it stays visible; we just don't nag with a tracker issue nobody will action).
+# Key on "<repo>" (whole repo's CI spend) or "<repo>/<workflow name>" (one
+# workflow). sidekick-web/CI: duplication is load-bearing for promotion
+# (sre-brain#170). Tune here, never in code elsewhere.
+BURNER_ACCEPTED_SPEND = {"sidekick-web/CI"}
+
 # Org-shared workflows defined as reusables HERE (sidekick-labs/.github) and rolled
 # out org-wide, so one systemic failure shows up identically across many caller
 # repos. These (and only these) are COALESCED in the digest — independent
@@ -155,6 +163,10 @@ def is_issue_worthy(finding: dict) -> bool:
         return (m.get("failed_minutes", 0) >= FAILED_MINUTES_ISSUE_MIN
                 or m.get("failure_rate", 0) >= FAILURE_RATE_ISSUE_MIN)
     if cat == "burners":
+        repo = finding.get("repo", "")
+        if (repo in BURNER_ACCEPTED_SPEND
+                or f"{repo}/{finding.get('workflow_name', '')}" in BURNER_ACCEPTED_SPEND):
+            return False  # reviewed + accepted spend — digest only, no standing issue
         return m.get("total_minutes", 0) >= BURNER_ISSUE_MINUTES
     return False
 
