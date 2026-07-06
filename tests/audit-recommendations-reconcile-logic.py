@@ -72,6 +72,24 @@ def test_coalesce_shared():
     print("org-shared coalescing OK")
 
 
+def test_burner_accepted_spend():
+    # A burner on an ACCEPTED-spend workflow (sidekick-web/CI, sre-brain#170) is
+    # suppressed to the digest even when enormous; an equally large burner
+    # elsewhere still files a standing issue.
+    rec.gh_raw_workflow = lambda r, p: None
+    data = {"generated_at": "t", "window_days": 7, "scope": "all", "workflows": [
+        wf("sidekick-web", "CI", total_minutes=1542, runs=181, avg_minutes=8.5, p95_minutes=11.1),
+        wf("sidekick-harness", "CI", total_minutes=1712, runs=180, avg_minutes=9.5, p95_minutes=12.1),
+    ]}
+    out = rec.partition(data)
+    j = {f"{x['repo']}/{x['category']}" for x in out["judgment"]}
+    d = {f"{x['repo']}/{x['category']}" for x in out["digest"]}
+    assert "sidekick-web/burners" not in j, j       # accepted → no standing issue
+    assert "sidekick-web/burners" in d, d            # still visible in the digest
+    assert "sidekick-harness/burners" in j, j        # control: still files an issue
+    print("burner accepted-spend suppression OK")
+
+
 def test_reconcile_rails():
     closed = []
     oi.close_issue = lambda n, c: (closed.append(n) or True)
@@ -90,5 +108,6 @@ def test_reconcile_rails():
 if __name__ == "__main__":
     test_split_thresholds()
     test_coalesce_shared()
+    test_burner_accepted_spend()
     test_reconcile_rails()
     print("ALL TESTS PASSED")
