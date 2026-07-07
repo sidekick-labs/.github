@@ -598,12 +598,6 @@ jobs:
             --model ${{ env.CLAUDE_MODEL }}
             --allowed-tools "${{ steps.build-prompt.outputs.allowed-tools }}"
             --effort high
-          # Org-wide sidekick-workflows plugin for the weekly-maintenance agent (octo-brain#174,
-          # #135 Phase 2). CI channel = native action inputs (the managed-settings.json file is not
-          # read on ubuntu-latest runners). NOTE: sidekick-labs/claude-plugins is PRIVATE — verify
-          # the token's cross-repo read on claude-plugins before relying on it.
-          plugin_marketplaces: https://github.com/sidekick-labs/claude-plugins.git
-          plugins: sidekick-workflows@sidekick-ops
 
       # ----- artifacts -----
 

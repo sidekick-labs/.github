@@ -21,10 +21,38 @@ jobs:
         with:
           fetch-depth: 1
 
+      # Mint a sidekick-release-bot token that can read the PRIVATE claude-plugins
+      # marketplace so claude-code-action can clone it for the plugin below. Scoped to
+      # THIS repo (to preserve the action's current-repo context reads) + claude-plugins.
+      # Read-only: writes/@claude comments go through the Claude GitHub App (via the OAuth
+      # token), not this github_token — that's why the caller grants the job token only
+      # read perms and @claude still works. PREREQ: claude-plugins must be in the
+      # sidekick-release-bot app installation (contents:read). Callers already pass
+      # `secrets: inherit`, so the app private key is available here.
+      - name: Mint plugin-marketplace read token
+        id: plugin-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ vars.SIDEKICK_RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.SIDEKICK_RELEASE_BOT_PRIVATE_KEY }}
+          owner: sidekick-labs
+          repositories: |
+            ${{ github.event.repository.name }}
+            claude-plugins
+          permission-contents: read
+          permission-pull-requests: read
+          permission-issues: read
+
       - name: Run Claude Code
         uses: anthropics/claude-code-action@2fee15510437d71399d9139ed60433470484a8fb # v1.0.153
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Read token that can also read the private claude-plugins marketplace (above),
+          # so the plugin clone below authenticates. VALIDATE before broad rollout: confirm
+          # @claude still comments/pushes with this passed as github_token (writes should
+          # continue via the Claude App). If a write breaks, the action is using github_token
+          # for writes — bump this token's perms rather than reverting.
+          github_token: ${{ steps.plugin-token.outputs.token }}
           additional_permissions: |
             actions: read
           # Pin the model so the interactive agent doesn't silently shift when
@@ -34,7 +62,5 @@ jobs:
           # #135 Phase 2). claude-code-action does NOT read /etc/claude-code/managed-settings.json
           # on ubuntu-latest (no MDM context) — that file is the laptop/MDM channel only; CI uses
           # these native inputs. This is the primary CI lane for org skills (/ship, /land, …).
-          # NOTE: sidekick-labs/claude-plugins is PRIVATE — the marketplace clone must be able to
-          # auth; verify the token's cross-repo read on claude-plugins before relying on it.
           plugin_marketplaces: https://github.com/sidekick-labs/claude-plugins.git
           plugins: sidekick-workflows@sidekick-ops
