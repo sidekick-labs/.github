@@ -30,3 +30,11 @@ jobs:
           # Pin the model so the interactive agent doesn't silently shift when
           # the action's default changes. Keep in lockstep with claude-code-review.yml.
           claude_args: '--model ${{ env.CLAUDE_MODEL }} --effort high'
+          # Org-wide sidekick-workflows plugin for the interactive agent (octo-brain#174,
+          # #135 Phase 2). claude-code-action does NOT read /etc/claude-code/managed-settings.json
+          # on ubuntu-latest (no MDM context) — that file is the laptop/MDM channel only; CI uses
+          # these native inputs. This is the primary CI lane for org skills (/ship, /land, …).
+          # NOTE: sidekick-labs/claude-plugins is PRIVATE — the marketplace clone must be able to
+          # auth; verify the token's cross-repo read on claude-plugins before relying on it.
+          plugin_marketplaces: https://github.com/sidekick-labs/claude-plugins.git
+          plugins: sidekick-workflows@sidekick-ops
