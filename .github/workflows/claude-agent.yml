@@ -21,12 +21,43 @@ jobs:
         with:
           fetch-depth: 1
 
+      # Mint a read-only sidekick-release-bot token that can read the PRIVATE
+      # claude-plugins repo, used ONLY to authenticate the marketplace clone below.
+      # Callers pass `secrets: inherit` and the app private key is now scoped to these
+      # code repos, so the mint works here. Scoped to just claude-plugins, contents:read.
+      - name: Mint plugin-marketplace read token
+        id: plugin-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ vars.SIDEKICK_RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.SIDEKICK_RELEASE_BOT_PRIVATE_KEY }}
+          owner: sidekick-labs
+          repositories: claude-plugins
+          permission-contents: read
+
+      # claude-code-action clones the marketplace with an UNAUTHENTICATED `git clone`
+      # (it does NOT use github_token for that — verified via octo-brain#174 smoke test).
+      # Configure the ambient git credential with the read token so the private clone
+      # authenticates via url.insteadOf rewrite. Scoped to this job only.
+      - name: Configure git auth for private marketplace clone
+        run: |
+          git config --global url."https://x-access-token:${{ steps.plugin-token.outputs.token }}@github.com/".insteadOf "https://github.com/"
+
       - name: Run Claude Code
         uses: anthropics/claude-code-action@2fee15510437d71399d9139ed60433470484a8fb # v1.0.153
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # NB: github_token is deliberately NOT overridden — @claude's identity/writes stay
+          # on the Claude App via the OAuth token, unchanged. The clone auth is handled by the
+          # git-credential step above, not by github_token (the action ignores it for clones).
           additional_permissions: |
             actions: read
           # Pin the model so the interactive agent doesn't silently shift when
           # the action's default changes. Keep in lockstep with claude-code-review.yml.
           claude_args: '--model ${{ env.CLAUDE_MODEL }} --effort high'
+          # Org-wide sidekick-workflows plugin for the interactive agent (octo-brain#174,
+          # #135 Phase 2). claude-code-action does NOT read /etc/claude-code/managed-settings.json
+          # on ubuntu-latest (no MDM context) — that file is the laptop/MDM channel only; CI uses
+          # these native inputs. This is the primary CI lane for org skills (/ship, /land, …).
+          plugin_marketplaces: https://github.com/sidekick-labs/claude-plugins.git
+          plugins: sidekick-workflows@sidekick-ops
