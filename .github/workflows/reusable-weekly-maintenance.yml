@@ -592,6 +592,12 @@ jobs:
         timeout-minutes: ${{ inputs.claude-timeout-minutes }}
         with:
           claude_code_oauth_token: ${{ secrets.claude-code-oauth-token }}
+          # Weekly maintenance runs on `schedule` (the caller's cron), so the
+          # triggering actor can be a bot. claude-code-action v1.0.160+ rejects
+          # bot actors unless allow-listed; this reusable is now pinned at
+          # v1.0.168, so opt in or the beat fails on bot-initiated runs. Mirrors
+          # the inference fix (sidekick-inference#111). See ai-foundations-brain#298 / #299.
+          allowed_bots: "*"
           show_full_output: true
           prompt: ${{ steps.build-prompt.outputs.prompt }}
           claude_args: >-
