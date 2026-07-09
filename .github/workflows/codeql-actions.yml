@@ -22,6 +22,9 @@ jobs:
   analyze:
     name: Analyze Actions workflows
     runs-on: ubuntu-latest
+    # Runaway-hang cap. Normal run ~0.8 min; 15 leaves generous headroom for a
+    # cold CodeQL DB build while replacing the implicit 360-min (6h) default.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
       - uses: github/codeql-action/init@8aad20d150bbac5944a9f9d289da16a4b0d87c1e  # v4.36.2 (bundle 2.25.2)

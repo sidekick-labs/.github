@@ -31,6 +31,10 @@ jobs:
       startsWith(github.event.pull_request.head.ref, 'ci-fix/') ||
       startsWith(github.event.pull_request.head.ref, 'sentry-autofix/')
     runs-on: ubuntu-latest
+    # Runaway-hang cap. Only reads metadata + calls the gh API (no checkout/build);
+    # real runs finish in seconds. 5 replaces the implicit 360-min (6h) default and
+    # protects every repo that calls this reusable.
+    timeout-minutes: 5
     permissions:
       contents: write
       pull-requests: write
