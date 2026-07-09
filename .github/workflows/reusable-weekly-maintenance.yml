@@ -214,7 +214,7 @@ jobs:
 
       - name: Set up Ruby
         if: ${{ inputs.stack == 'rails' || inputs.stack == 'ruby-gem' }}
-        uses: ruby/setup-ruby@9eb537ca036ebaed86729dcb9309076e4c5c3b74 # v1.314.0
+        uses: ruby/setup-ruby@d45b1a4e94b71acab930e56e79c6aa188764e7f9 # v1.316.0
         with:
           ruby-version: ${{ inputs.ruby-version != '' && inputs.ruby-version || '' }}
           ruby-version-file: ${{ inputs.ruby-version == '' && inputs.ruby-version-file || '' }}
@@ -233,7 +233,7 @@ jobs:
 
       - name: Set up JDK
         if: ${{ inputs.stack == 'kmp' }}
-        uses: actions/setup-java@ad2b38190b15e4d6bdf0c97fb4fca8412226d287 # v5.3.0
+        uses: actions/setup-java@0f481fcb613427c0f801b606911222b5b6f3083a # v5.5.0
         with:
           distribution: 'zulu'
           java-version: ${{ inputs.jdk-version }}
@@ -244,7 +244,7 @@ jobs:
 
       - name: Set up Python
         if: ${{ inputs.stack == 'python-app' }}
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: ${{ inputs.python-version }}
           cache: pip
@@ -272,7 +272,7 @@ jobs:
 
       - name: Restore previous TODO/FIXME census
         id: census-cache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .maintenance-cache/todo-fixme.previous.txt
           key: weekly-maintenance-todo-fixme-${{ github.repository_id }}-${{ github.run_id }}
@@ -588,7 +588,7 @@ jobs:
 
       - name: Weekly maintenance
         id: maintenance
-        uses: anthropics/claude-code-action@ba0aafd4308cbba7165f9f2cdb0cfbed5a3c99ce # v1.0.168 (bundled CLI validates OAuth after 2026-07-07 Anthropic auth change; old pins 401)
+        uses: anthropics/claude-code-action@37b464ce72700f7b2c5ff8d2db7fa7b15df792f5 # v1.0.168 (bundled CLI validates OAuth after 2026-07-07 Anthropic auth change; old pins 401)
         timeout-minutes: ${{ inputs.claude-timeout-minutes }}
         with:
           claude_code_oauth_token: ${{ secrets.claude-code-oauth-token }}
