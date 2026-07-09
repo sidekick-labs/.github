@@ -261,6 +261,9 @@ jobs:
     needs: [plan, sweep]
     if: ${{ always() }}
     runs-on: ubuntu-latest
+    # Runaway-hang cap. Single gh-issue list/create/close notify step; finishes in
+    # seconds. 5 replaces the implicit 360-min (6h) default.
+    timeout-minutes: 5
     permissions:
       issues: write
     steps:
