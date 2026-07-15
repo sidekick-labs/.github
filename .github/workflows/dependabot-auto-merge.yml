@@ -46,11 +46,25 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Approve and enable auto-merge for patch/minor
+      - name: Approve and enable auto-merge (patch/minor any dep; major only dev-deps + Actions)
+        # Arm native squash auto-merge — the repo's required checks still gate the
+        # actual merge, so this only decides WHICH Dependabot PRs are allowed to
+        # land unattended. Policy:
+        #   * patch/minor — ANY dependency (unchanged).
+        #   * major — ONLY when the blast radius is low: a dev-dependency
+        #     (grouped dev-deps report dependency-type=direct:development) OR a
+        #     GitHub Actions bump (package-ecosystem=github_actions). Prod-runtime
+        #     majors are still left for a human — a lib that passes CI can still
+        #     break at runtime. For a GROUPED update, fetch-metadata reports the
+        #     group's HIGHEST semver bump + its highest-precedence dependency-type,
+        #     so a group carrying a prod major is correctly NOT armed here.
         if: >-
           github.actor == 'dependabot[bot]' && (
           steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
-          steps.metadata.outputs.update-type == 'version-update:semver-minor')
+          steps.metadata.outputs.update-type == 'version-update:semver-minor' || (
+          steps.metadata.outputs.update-type == 'version-update:semver-major' && (
+          steps.metadata.outputs.dependency-type == 'direct:development' ||
+          steps.metadata.outputs.package-ecosystem == 'github_actions')))
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_URL: ${{ github.event.pull_request.html_url }}
