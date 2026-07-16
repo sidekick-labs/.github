@@ -196,6 +196,34 @@ def run_minutes(run: dict) -> float:
     return max(0.0, (end - start).total_seconds() / 60)
 
 
+_EPOCH = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def wasted_failed_minutes(branch_group: list[dict]) -> float:
+    """Wasted failed/timed_out minutes for ONE (repo, workflow, head-branch)
+    group (sre-brain#211).
+
+    A failed run is genuine waste EXCEPT when it's a pull-request iteration that
+    the branch later cleared — the author pushed a fix and a subsequent run on
+    the same branch went green. That's pre-merge gating working as intended, not
+    burned minutes. Non-PR runs (push/schedule/main going red) always count, and
+    a PR branch that thrashes without ever going green still counts every failure.
+
+    Each entry is ``{"conclusion", "minutes", "started" (datetime|None),
+    "event"}``. Ordered by start time so "later" means chronologically after.
+    """
+    ordered = sorted(branch_group, key=lambda r: r.get("started") or _EPOCH)
+    wasted = 0.0
+    for i, r in enumerate(ordered):
+        if r["conclusion"] not in ("failure", "timed_out"):
+            continue
+        is_pr = str(r.get("event", "")).startswith("pull_request")
+        if is_pr and any(later["conclusion"] == "success" for later in ordered[i + 1:]):
+            continue  # fixed-then-green PR iteration — gating worked, not waste
+        wasted += r["minutes"]
+    return wasted
+
+
 def has_active_runs(repo: str, since: datetime) -> bool:
     iso = since.strftime("%Y-%m-%dT%H:%M:%SZ")
     path = f"/repos/{ORG}/{repo}/actions/runs?created=>={iso}&per_page=1"
@@ -227,6 +255,10 @@ def collect(scope: str, window_days: int, deep_failures: bool) -> dict:
 
     by_workflow: dict[tuple[str, int], WorkflowStats] = {}
     flake_groups: dict[tuple[str, int, str], list[dict]] = defaultdict(list)
+    # Runs grouped by (repo, workflow, head-branch) so failed-minutes can be
+    # attributed in a post-pass that knows each branch's LATER outcome
+    # (sre-brain#211) — a PR failure the branch later cleared isn't waste.
+    branch_runs: dict[tuple[str, int, str], list[dict]] = defaultdict(list)
     total_runs = 0
 
     for repo in repos:
@@ -253,15 +285,24 @@ def collect(scope: str, window_days: int, deep_failures: bool) -> dict:
                 stats.success += 1
             elif conclusion == "failure":
                 stats.failure += 1
-                stats.failed_minutes += minutes
             elif conclusion == "cancelled":
                 stats.cancelled += 1
                 stats.cancelled_minutes += minutes
             elif conclusion == "timed_out":
                 stats.timed_out += 1
-                stats.failed_minutes += minutes
             else:
                 stats.other += 1
+
+            # failed_minutes is deferred to the post-pass below (needs each
+            # branch's later outcome to drop fixed-then-green PR iterations).
+            branch = run.get("head_branch") or ""
+            branch_runs[(repo, wf_id, branch)].append({
+                "wf_key": key,
+                "conclusion": conclusion,
+                "minutes": minutes,
+                "started": parse_iso(run.get("run_started_at") or run.get("created_at")),
+                "event": run.get("event") or "",
+            })
 
             sha = run.get("head_sha")
             if sha:
@@ -270,6 +311,17 @@ def collect(scope: str, window_days: int, deep_failures: bool) -> dict:
                     "attempt": run.get("run_attempt", 1),
                     "conclusion": conclusion,
                 })
+
+    # Failed-minutes waste attribution (sre-brain#211). Sum per branch group,
+    # excluding PR-branch iterations the branch later cleared (see
+    # wasted_failed_minutes), and fold onto the owning workflow's stats.
+    for (repo, wf_id, _branch), group in branch_runs.items():
+        wasted = wasted_failed_minutes(group)
+        if not wasted:
+            continue
+        stats = by_workflow.get((repo, wf_id))
+        if stats:
+            stats.failed_minutes += wasted
 
     # Flake detection: same (repo, workflow, sha) with at least one failure and one later success
     for (repo, wf_id, sha), attempts in flake_groups.items():
@@ -413,7 +465,7 @@ Where the bill comes from. High-volume + long-running workflows. Reductions here
 
 ## Lens 2 — Failed minutes (wasted by failures)
 
-Failures × avg failed-run duration. The "long failures" are worst — they consume minutes before catching the problem.
+Failed-run duration for failures that are genuine waste — main going red, or a PR branch thrashing without ever going green. PR-branch iterations the branch later cleared (author pushed a fix, next run passed) are excluded: that's pre-merge gating working (sre-brain#211). The "long failures" are worst — they consume minutes before catching the problem.
 
 {md_table(failure_rows, ["repo", "workflow", "failed_min", "failures", "rate", "top failing jobs"])}
 

@@ -17,12 +17,16 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 def _load(name, path):
     spec = importlib.util.spec_from_file_location(name, os.path.join(ROOT, path))
     mod = importlib.util.module_from_spec(spec)
+    # Register before exec so dataclass introspection (audit.py) can resolve the
+    # module by name — required on 3.9, harmless on 3.12.
+    sys.modules[name] = mod
     spec.loader.exec_module(mod)
     return mod
 
 
 rec = _load("recommendations", "audit/recommendations.py")
 oi = _load("open_issues", "audit/open_issues.py")
+audit = _load("audit", "audit/audit.py")
 
 
 def wf(repo, name, **kw):
@@ -105,9 +109,49 @@ def test_reconcile_rails():
     print("reconcile safety rails OK")
 
 
+def _run(conclusion, minutes, mins_ago, event):
+    # `started` ordering only needs to be relative; smaller mins_ago = later.
+    from datetime import datetime, timedelta, timezone
+    return {"conclusion": conclusion, "minutes": minutes, "event": event,
+            "started": datetime.now(timezone.utc) - timedelta(minutes=mins_ago),
+            "wf_key": ("r", 1)}
+
+
+def test_wasted_failed_minutes():
+    # PR branch fails then goes green on the fix push → NOT waste (sre-brain#211).
+    fixed_then_green = [
+        _run("failure", 8, mins_ago=30, event="pull_request"),
+        _run("success", 8, mins_ago=10, event="pull_request"),
+    ]
+    assert audit.wasted_failed_minutes(fixed_then_green) == 0.0, "fixed-then-green PR must not count"
+
+    # PR branch that thrashes and never goes green → all failures count.
+    thrashing = [
+        _run("failure", 8, mins_ago=30, event="pull_request"),
+        _run("failure", 7, mins_ago=10, event="pull_request"),
+    ]
+    assert audit.wasted_failed_minutes(thrashing) == 15.0, "never-green PR branch is waste"
+
+    # Non-PR (push/main going red) always counts, even if a later push is green.
+    push_red_then_green = [
+        _run("failure", 9, mins_ago=30, event="push"),
+        _run("success", 9, mins_ago=10, event="push"),
+    ]
+    assert audit.wasted_failed_minutes(push_red_then_green) == 9.0, "push failure is always waste"
+
+    # timed_out counts like failure; the earlier green does not retroactively excuse it.
+    green_then_fail = [
+        _run("success", 5, mins_ago=30, event="pull_request"),
+        _run("timed_out", 6, mins_ago=10, event="pull_request"),
+    ]
+    assert audit.wasted_failed_minutes(green_then_fail) == 6.0, "trailing failure still waste"
+    print("wasted_failed_minutes (sre-brain#211) OK")
+
+
 if __name__ == "__main__":
     test_split_thresholds()
     test_coalesce_shared()
     test_burner_accepted_spend()
     test_reconcile_rails()
+    test_wasted_failed_minutes()
     print("ALL TESTS PASSED")
