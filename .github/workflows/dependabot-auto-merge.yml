@@ -23,13 +23,21 @@ on:
 
 jobs:
   auto-merge:
-    # Act on Dependabot's own PRs and on autonomous SRE engine PRs (identified
-    # by their head-ref prefix).
+    # Act on Dependabot's own PRs and on autonomous SRE engine PRs. The engine
+    # path gates on BOTH the release-bot actor AND the head-ref prefix: a branch
+    # prefix alone is spoofable (anyone who can push a ci-fix/* branch would
+    # otherwise get native auto-merge armed on their PR), so the actor gate is
+    # what actually restricts this path to the SRE engine.
     if: >-
       github.actor == 'dependabot[bot]' ||
-      startsWith(github.event.pull_request.head.ref, 'issue-worker/') ||
-      startsWith(github.event.pull_request.head.ref, 'ci-fix/') ||
-      startsWith(github.event.pull_request.head.ref, 'sentry-autofix/')
+      (
+        github.actor == 'sidekick-labs-bot[bot]' &&
+        (
+          startsWith(github.event.pull_request.head.ref, 'issue-worker/') ||
+          startsWith(github.event.pull_request.head.ref, 'ci-fix/') ||
+          startsWith(github.event.pull_request.head.ref, 'sentry-autofix/')
+        )
+      )
     runs-on: ubuntu-latest
     # Runaway-hang cap. Only reads metadata + calls the gh API (no checkout/build);
     # real runs finish in seconds. 5 replaces the implicit 360-min (6h) default and
@@ -73,7 +81,8 @@ jobs:
           gh pr merge --auto --squash "$PR_URL" || echo "::warning::auto-merge not enabled for $PR_URL"
 
       - name: Enable auto-merge — autonomous SRE engine PR
-        if: github.actor != 'dependabot[bot]'
+        # Actor-gated (not just branch-prefix) — closes head-ref spoofing.
+        if: github.actor == 'sidekick-labs-bot[bot]'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_URL: ${{ github.event.pull_request.html_url }}
