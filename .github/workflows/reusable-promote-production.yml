@@ -23,9 +23,11 @@ name: Reusable — Promote to Production
 #   Plus: the App installed on the caller repo + on the `production` ruleset
 #   bypass list, and the caller's production deploy workflow filename.
 #
-# DISPATCH CONTRACT: the deploy is dispatched with `--field ref=<sha>`, so the
-# caller's production deploy workflow (deploy_production_workflow) MUST live on
-# the default branch and expose a `workflow_dispatch` input named `ref`, then
+# DISPATCH CONTRACT: the deploy is dispatched on the default branch with
+# `--raw-field ref=<sha>`, so the caller's production deploy workflow
+# (deploy_production_workflow) MUST live on the default branch (also the only ref
+# the `production` environment allows) and expose a `workflow_dispatch` input
+# named `ref`, then
 # forward it to the production reusable's `deploy_sha`. A mismatch fails the
 # dispatch AFTER the FF-push (production advanced, deploy never started).
 #
@@ -447,10 +449,16 @@ jobs:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
           SHA: ${{ steps.target.outputs.sha }}
           DEPLOY_WORKFLOW: ${{ inputs.deploy_production_workflow }}
+          # The ref the deploy workflow RUNS ON (distinct from the SHA it deploys,
+          # which rides in the `ref` input). Must be the default branch: it is the
+          # only ref the `production` environment's deployment-branch policy allows,
+          # and it is where the deploy workflow file lives. Taken from the event
+          # payload (no API call) with a `main` fallback. See DEPLOY_REF use below.
+          DEPLOY_REF: ${{ github.event.repository.default_branch }}
           # Empty unless the Slack root was posted. Only forwarded when set, so
           # this reusable stays compatible with callers that don't yet declare
           # the deploy workflow's `slack_thread_ts` input (passing an unknown
-          # --field would 422 the dispatch *after* the FF-push — the one failure
+          # --raw-field would 422 the dispatch *after* the FF-push — the one failure
           # mode we must avoid).
           #
           # Note: only the thread ts crosses the workflow boundary here. The
@@ -461,15 +469,36 @@ jobs:
           THREAD_TS: ${{ steps.slack_root.outputs.thread_ts }}
         run: |
           set -euo pipefail
-          ARGS=(--field ref="$SHA")
+          REF="${DEPLOY_REF:-main}"
+          # Pin --ref explicitly. Omitting it makes `gh workflow run` resolve the
+          # default branch via an extra API call that has intermittently returned
+          # an empty ref → the dispatch POSTs `"ref": ""` → HTTP 400 "malformed
+          # request", FF-pushing production but never starting the rollout (the one
+          # failure mode this reusable must avoid — hit sidekick-web 2026-07-19
+          # while sidekick-harness/inference, identical calls, dispatched fine).
+          # Use --raw-field (not --field) so a float-shaped ts like
+          # `1784475800.923529` is sent as a string, never coerced to a JSON number.
+          ARGS=(--ref "$REF" --raw-field ref="$SHA")
           if [ -n "$THREAD_TS" ]; then
-            ARGS+=(--field slack_thread_ts="$THREAD_TS")
+            ARGS+=(--raw-field slack_thread_ts="$THREAD_TS")
           fi
           # Record dispatch time (backdated 30s for clock skew) so the watchdog
           # below can identify the run THIS dispatch created.
           echo "dispatched_after=$(date -u -d '-30 seconds' +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
-          gh workflow run "$DEPLOY_WORKFLOW" "${ARGS[@]}"
-          echo "Dispatched $DEPLOY_WORKFLOW for ${SHA:0:7}${THREAD_TS:+ (thread ${THREAD_TS})}"
+          # Retry: a FF-pushed-but-never-dispatched production is the worst state,
+          # so absorb a transient dispatch hiccup rather than fail the run.
+          for attempt in 1 2 3; do
+            if gh workflow run "$DEPLOY_WORKFLOW" "${ARGS[@]}"; then
+              echo "Dispatched $DEPLOY_WORKFLOW for ${SHA:0:7} on $REF${THREAD_TS:+ (thread ${THREAD_TS})}"
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "::warning::dispatch attempt $attempt failed; retrying in $((attempt * 5))s" >&2
+              sleep $((attempt * 5))
+            fi
+          done
+          echo "::error::could not dispatch $DEPLOY_WORKFLOW after 3 attempts — production is at ${SHA:0:7} but the rollout did NOT start" >&2
+          exit 1
 
       - name: Confirm the deploy actually started
         # Safety net for the deploy thread: if the dispatched deploy never runs
@@ -586,7 +615,7 @@ jobs:
           elif [ "${{ steps.ff_push.outcome }}" = "failure" ]; then
             STAGE="fast-forward push to production branch (non-FF history, or release-bot App missing from production ruleset bypass list?)"
           elif [ "${{ steps.dispatch_deploy.outcome }}" = "failure" ]; then
-            STAGE="dispatching production deploy (production branch advanced but deploy never started — manual dispatch may be needed; if the dispatch 403'd, the release-bot App install may need re-approval for Actions:write)"
+            STAGE="dispatching production deploy (production branch advanced but deploy never started — re-dispatch ${{ inputs.deploy_production_workflow }} on the default branch with the same SHA in the 'ref' input; the step retries 3x, so a persistent failure is usually a bad input, a workflow-file/env-branch-policy mismatch, or a GitHub API outage — NOT a token-permission issue, the deploy is dispatched with the release-bot App token which already holds actions:write)"
           else
             STAGE="environment setup (doctl install, registry auth, …)"
           fi
