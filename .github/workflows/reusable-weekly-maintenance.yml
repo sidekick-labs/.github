@@ -214,7 +214,7 @@ jobs:
 
       - name: Set up Ruby
         if: ${{ inputs.stack == 'rails' || inputs.stack == 'ruby-gem' }}
-        uses: ruby/setup-ruby@d45b1a4e94b71acab930e56e79c6aa188764e7f9 # v1.316.0
+        uses: ruby/setup-ruby@003a5c4d8d6321bd302e38f6f0ec593f77f06600 # v1.319.0
         with:
           ruby-version: ${{ inputs.ruby-version != '' && inputs.ruby-version || '' }}
           ruby-version-file: ${{ inputs.ruby-version == '' && inputs.ruby-version-file || '' }}
@@ -222,7 +222,7 @@ jobs:
 
       - name: Set up Node.js
         if: ${{ inputs.stack == 'rails' || inputs.stack == 'node-lib' || inputs.stack == 'node-app' }}
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ inputs.node-version }}
           cache: 'npm'
@@ -233,7 +233,7 @@ jobs:
 
       - name: Set up JDK
         if: ${{ inputs.stack == 'kmp' }}
-        uses: actions/setup-java@0f481fcb613427c0f801b606911222b5b6f3083a # v5.5.0
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
         with:
           distribution: 'zulu'
           java-version: ${{ inputs.jdk-version }}
@@ -244,7 +244,7 @@ jobs:
 
       - name: Set up Python
         if: ${{ inputs.stack == 'python-app' }}
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ inputs.python-version }}
           cache: pip
@@ -588,7 +588,7 @@ jobs:
 
       - name: Weekly maintenance
         id: maintenance
-        uses: anthropics/claude-code-action@e90deca47693f9457b72f2b53c17d7c445a87342 # v1.0.168 (bundled CLI validates OAuth after 2026-07-07 Anthropic auth change; old pins 401)
+        uses: anthropics/claude-code-action@af0559ee4f514d1ef21826982bed13f7edc3c35e # v1.0.168 (bundled CLI validates OAuth after 2026-07-07 Anthropic auth change; old pins 401)
         timeout-minutes: ${{ inputs.claude-timeout-minutes }}
         with:
           claude_code_oauth_token: ${{ secrets.claude-code-oauth-token }}
