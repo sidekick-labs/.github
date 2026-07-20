@@ -275,17 +275,25 @@ jobs:
         run: |
           set -euo pipefail
           WF="pin-sweep"
-          EXISTING="$(gh issue list --search "\"beat failure: ${WF}\" in:title" --state open --json number --jq '.[0].number // empty')"
+          # NB: this repo (sidekick-labs/.github) has ISSUES DISABLED, so every `gh
+          # issue` call here errors. The issue bookkeeping is therefore BEST-EFFORT
+          # (guarded with `|| true`) — otherwise `set -e` aborts this step on the very
+          # first `gh issue list` and a GREEN sweep shows red. The real failure signal
+          # is the `sweep` job's own red status; this tracking issue is a nicety that
+          # only works if/when issues are re-enabled here (on a real failure we still
+          # emit a ::warning:: so it's visible in the run).
+          EXISTING="$(gh issue list --search "\"beat failure: ${WF}\" in:title" --state open --json number --jq '.[0].number // empty' 2>/dev/null || true)"
           if [ "${FAILED}" != "true" ]; then
             if [ -n "$EXISTING" ]; then
-              gh issue close "$EXISTING" --comment "Recovered: ${WF} succeeded — ${RUN_URL}."
+              gh issue close "$EXISTING" --comment "Recovered: ${WF} succeeded — ${RUN_URL}." 2>/dev/null || true
             fi
             exit 0
           fi
           if [ -n "$EXISTING" ]; then
-            gh issue comment "$EXISTING" --body "Failed again: ${RUN_URL}"
+            gh issue comment "$EXISTING" --body "Failed again: ${RUN_URL}" 2>/dev/null || true
           else
             gh issue create \
               --title "beat failure: ${WF} ($(date -u +%F))" \
-              --body "Scheduled pin-sweep failed before finishing — some repos may still carry unpinned actions. Run: ${RUN_URL}"
+              --body "Scheduled pin-sweep failed before finishing — some repos may still carry unpinned actions. Run: ${RUN_URL}" 2>/dev/null \
+              || echo "::warning::pin-sweep FAILED and issues are unavailable on this repo — see ${RUN_URL}"
           fi
