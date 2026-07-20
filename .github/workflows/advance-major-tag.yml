@@ -1,0 +1,55 @@
+name: Advance major version tag
+
+# Keeps the floating major tag (vN) pointing at the latest `main`, so any consumer
+# that pins a reusable/action at `@vN` always rides current `main` and can never
+# freeze on stale, deleted-dependency code.
+#
+# Why this exists: the weekly-maintenance reusable was broken for ~4 weeks
+# (2026-06-28 → 2026-07-19) across 4 caller repos because the `v3` tag was left
+# pointing at a pre-#96 revision that still referenced the `setup-codex-auth@main`
+# composite — which #96 deleted from `main`. `@v3` consumers kept running the
+# deleted-dependency code and aborted at action-resolution. Auto-advancing the
+# major tag on every push to `main` removes that failure mode: the release line is
+# `main` (protected by the PR gate), and `@vN` tracks it atomically.
+#
+# API-only (no checkout, no third-party actions to SHA-pin): it lists the repo's
+# tags, finds the highest `vN`, and force-updates that ref to the pushed commit.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write   # update the tag ref
+
+concurrency:
+  group: advance-major-tag
+  cancel-in-progress: false
+
+jobs:
+  retag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Advance the highest vN major tag to this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # Highest existing bare major tag (v1, v2, v3, …). Ignores vN.M.P releases.
+          MAJOR="$(gh api "repos/$REPO/tags" --paginate --jq '.[].name' \
+            | grep -E '^v[0-9]+$' | sort -V | tail -1 || true)"
+          if [ -z "${MAJOR:-}" ]; then
+            echo "No bare vN major tag exists yet — nothing to advance."
+            exit 0
+          fi
+          CURRENT="$(gh api "repos/$REPO/git/refs/tags/$MAJOR" --jq '.object.sha' 2>/dev/null || true)"
+          if [ "$CURRENT" = "$SHA" ]; then
+            echo "$MAJOR already at $SHA — no move needed."
+            exit 0
+          fi
+          echo "Advancing $MAJOR: ${CURRENT:-<none>} → $SHA"
+          gh api -X PATCH "repos/$REPO/git/refs/tags/$MAJOR" \
+            -f sha="$SHA" -F force=true >/dev/null
+          echo "Done."
