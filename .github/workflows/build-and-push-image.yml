@@ -47,6 +47,18 @@ on:
         required: false
         type: number
         default: 20
+      free_disk_space:
+        description: |
+          Reclaim the ~20+ GB of preinstalled tooling (Android SDK, .NET, GHC,
+          CodeQL, …) on the ubuntu-latest runner BEFORE building. Off by default
+          — it adds ~1-2 min, only worth it for large images. Turn it on when a
+          build fails with a killed "Build and push image" step and no error
+          (the runner's ~14 GB free disk exhausted mid-build): e.g.
+          sidekick-inference's perception image is 7.25 GB with a 4.48 GB
+          install layer + 2.8 GB of baked model weights, which no longer fits.
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   build-and-push:
@@ -55,6 +67,22 @@ jobs:
     timeout-minutes: ${{ inputs.timeout }}
 
     steps:
+      # Runs first, before any layer is pulled, so the reclaimed space is
+      # available for the whole build. Opt-in — see the input description.
+      - name: Free up disk space
+        if: ${{ inputs.free_disk_space }}
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          # Toolchains only — keep the swap and the (fast) docker image cache so
+          # the build itself isn't slowed. This alone frees ~20+ GB.
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: false
+          docker-images: false
+
       - name: Checkout code
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
