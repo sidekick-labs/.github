@@ -46,7 +46,19 @@ jobs:
           fetch-depth: 1
 
       - name: Run Claude Code Review
+        id: review
         if: steps.token-check.outputs.skip != 'true' && github.event.pull_request.user.login != 'dependabot[bot]'
+        # continue-on-error so a MODEL-side blip can't red-flag an otherwise
+        # green PR. claude-code-action >= v1.0.168 hard-fails the step when the
+        # run's result record carries `is_error:true` ("Claude execution failed:
+        # result is_error:true"), which is exactly what a transient
+        # expired/rate-limited shared-account OAuth token looks like
+        # (`is_error` + `total_cost_usd: 0` + a fast-fail seconds in). The
+        # classifier step below decides whether the JOB fails: a model-level
+        # error is advisory, anything else (setup/auth/action bug) still fails
+        # loud. The step's own conclusion stays honest in the UI.
+        # See sidekick-labs/native-experiences-brain#463.
+        continue-on-error: true
         uses: anthropics/claude-code-action@af0559ee4f514d1ef21826982bed13f7edc3c35e # v1.0.168 (bundled CLI validates OAuth after 2026-07-07 Anthropic auth change; old pins 401)
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -74,3 +86,66 @@ jobs:
           # or mutating Bash — so the workflow stays fork-safe and resistant to
           # prompt injection from untrusted PR content.
           claude_args: '--model ${{ env.CLAUDE_MODEL }} --allowed-tools "Read,Glob,Grep,Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)" --effort high'
+
+      # Maps the review step's outcome onto the JOB conclusion. The review
+      # itself is advisory — findings are posted as a PR comment and never fail
+      # the step — so a failed step always means the reviewer could not run.
+      # Two very different causes, and only one of them is our problem:
+      #
+      #   * MODEL-side  — Claude started and the run ended with a `result`
+      #     record carrying `is_error:true` (expired/limited shared-account
+      #     token, provider blip, overload). Nothing in this repo or the PR can
+      #     fix it and it self-heals -> ::warning:: and stay GREEN.
+      #   * OUR side    — no result record at all: bad/missing credentials, a
+      #     prepare failure, a malformed `claude_args`, an action regression.
+      #     That is a real config bug -> fail the job loud.
+      #
+      # `execution_file` is set on both paths (the action calls
+      # setExecutionFileOutputIfPresent() from its error handler), with
+      # $RUNNER_TEMP/claude-execution-output.json as the documented location —
+      # used as a fallback in case the output is empty.
+      - name: Classify review failure
+        # Runs only if the review step failed. NOT continue-on-error, so the
+        # blocking branch below fails the job naturally.
+        if: steps.review.outcome == 'failure'
+        env:
+          EXECUTION_FILE: ${{ steps.review.outputs.execution_file }}
+        run: |
+          set -uo pipefail
+
+          exec_file="${EXECUTION_FILE:-}"
+          if [ -z "$exec_file" ] || [ ! -f "$exec_file" ]; then
+            exec_file="${RUNNER_TEMP:-/tmp}/claude-execution-output.json"
+          fi
+
+          model_error=false
+          if [ -f "$exec_file" ] \
+            && jq -e 'any(.[]?; .type == "result" and .is_error == true)' "$exec_file" >/dev/null 2>&1; then
+            model_error=true
+          fi
+
+          if [ "$model_error" = "true" ]; then
+            cost=$(jq -r 'map(select(.type == "result")) | last | .total_cost_usd // "?"' "$exec_file" 2>/dev/null || echo "?")
+            turns=$(jq -r 'map(select(.type == "result")) | last | .num_turns // "?"' "$exec_file" 2>/dev/null || echo "?")
+            echo "::warning title=Claude review unavailable::The model call failed (is_error, cost ${cost}, turns ${turns}). This is an Anthropic-side/transient failure, not a review finding — the check stays green. Re-run this job to get a review."
+            {
+              echo "### :warning: Claude Code Review did not run"
+              echo
+              echo "The model call returned \`is_error\` (cost \`${cost}\`, turns \`${turns}\`) — a transient"
+              echo "Anthropic-side failure (commonly an expired or rate-limited shared-account OAuth token)."
+              echo
+              echo "**No review was produced.** Treated as advisory so it does not block the PR."
+              echo "Re-run this job if you want the review. See \`sidekick-labs/native-experiences-brain#463\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "::error title=Claude review setup failure::The review step failed before/around the model call (no result record in the execution log) — likely credentials, inputs, or the action itself. Failing the job so it gets fixed."
+          {
+            echo "### :x: Claude Code Review failed to start"
+            echo
+            echo "The review step failed without producing a model \`result\` record, so this is a"
+            echo "configuration/credential failure rather than a transient model error. Check the"
+            echo "\`Run Claude Code Review\` step log."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
