@@ -354,11 +354,24 @@ jobs:
           # the sentry-release.yml reusable, which does set-commits) showed 1.
           # Diagnosed in sre-brain#278; the re-file loop it enables is #277.
           #
+          # Pin the head commit EXPLICITLY rather than using --auto. --auto reads
+          # the LOCAL git HEAD, and the checkout above is `ref: main` while this
+          # job can promote an older commit via inputs.ref. In that case --auto
+          # would attribute the range up to main's tip — commits that are NOT in
+          # the image being deployed — and could auto-resolve issues whose fixes
+          # have not actually shipped. Verified: on release 950e658 with main at
+          # 5526cde, --auto associated 5526cde; --commit associated 950e658.
+          # Sentry still derives the RANGE from the previous release; this only
+          # fixes where that range ends.
+          #
           # Requires the full history the checkout above already fetches
           # (fetch-depth: 0). --ignore-missing tolerates a commit Sentry can't
           # resolve (e.g. the first release, or history rewritten since).
           # Best-effort: a failure here must never fail a deploy that succeeded.
-          if sentry-cli releases set-commits "$SHA" --auto --ignore-missing; then
+          # Note the association is applied ASYNCHRONOUSLY — commitCount can read
+          # 0 for a few seconds after this returns, so don't assert on it here.
+          if sentry-cli releases set-commits "$SHA" \
+            --commit "${{ github.repository }}@$SHA" --ignore-missing; then
             echo "Associated commits with Sentry release $SHA"
           else
             echo "::warning::Could not associate commits with Sentry release $SHA — Fixes trailers in this range will NOT auto-resolve (see sre-brain#278)"
