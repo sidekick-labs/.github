@@ -121,6 +121,13 @@ permissions:
   actions: read
   # Allows the failure-notification step to comment on the source PR.
   pull-requests: write
+  # claude-code-action (the AI release-summary step) unconditionally requests an
+  # OIDC token at startup, even when authenticated by CLAUDE_CODE_OAUTH_TOKEN and
+  # even when it only touches local files. Without this it retried 3x, failed, and
+  # the summary silently fell back to the linked PR list on EVERY release. The
+  # other reusables that call the action (pr.yml, reusable-weekly-maintenance.yml)
+  # already grant it; this one was the outlier.
+  id-token: write
 
 jobs:
   promote:
@@ -350,9 +357,11 @@ jobs:
       - name: AI release summary
         # Best-effort human "what's shipping" blurb. continue-on-error + the
         # compose step's file check mean a missing token / failure / timeout
-        # falls back to the linked PR list — never blocks the release. No
-        # id-token granted: if the action needs OIDC it fails at runtime and is
-        # caught here, rather than a permissions startup_failure.
+        # falls back to the linked PR list — never blocks the release. The job
+        # grants id-token: write (see the permissions block) because the action
+        # requests an OIDC token at startup regardless of auth method; without it
+        # this step failed on every release and the fallback was the only path
+        # ever taken.
         id: ai_summary
         if: ${{ !inputs.dry_run && success() && steps.ff_push.outputs.already_at_target != 'true' && inputs.slack_channel != '' }}
         continue-on-error: true
