@@ -343,6 +343,27 @@ jobs:
 
           sentry-cli releases new "$SHA" 2>/dev/null || true
 
+          # Associate commits with the release. WITHOUT this the release is
+          # created empty (commitCount=0), and Sentry's resolve-via-commit —
+          # which scans commits ATTACHED TO A RELEASE — never sees the
+          # `Fixes <SHORT-CODE>` trailer. The trailer is the documented primary
+          # guard against re-filing trackers for already-fixed issues, and it
+          # had silently never worked for any repo deploying through here:
+          # sidekick-harness/-inference/-companion-kit all showed commitCount=0
+          # on every release, while sidekick-web (the one repo that also calls
+          # the sentry-release.yml reusable, which does set-commits) showed 1.
+          # Diagnosed in sre-brain#278; the re-file loop it enables is #277.
+          #
+          # Requires the full history the checkout above already fetches
+          # (fetch-depth: 0). --ignore-missing tolerates a commit Sentry can't
+          # resolve (e.g. the first release, or history rewritten since).
+          # Best-effort: a failure here must never fail a deploy that succeeded.
+          if sentry-cli releases set-commits "$SHA" --auto --ignore-missing; then
+            echo "Associated commits with Sentry release $SHA"
+          else
+            echo "::warning::Could not associate commits with Sentry release $SHA — Fixes trailers in this range will NOT auto-resolve (see sre-brain#278)"
+          fi
+
           if sentry-cli releases deploys "$SHA" new \
             -e production \
             --name "${{ steps.tag.outputs.tag }}"; then
