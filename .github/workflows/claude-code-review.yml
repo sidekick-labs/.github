@@ -182,24 +182,36 @@ jobs:
           fi
 
           # The action does not surface the underlying API error anywhere, which
-          # is why these outages are so hard to diagnose. Dump the last result
-          # record so the next debugger has something to work with. (The full
-          # JSON stream is already in this job's log — this adds no new exposure.)
+          # is why these outages are so hard to diagnose. Surface just enough to
+          # classify the failure.
+          #
+          # DELIBERATELY NARROW — do not widen this. This reusable runs in a
+          # PUBLIC repo (.github's own pr.yml self-test), so anything echoed here
+          # is world-readable. `api_error_status` + `terminal_reason` are enough
+          # to tell auth (401/403) from rate/spend limits (429) from an upstream
+          # outage (5xx). The `result` message text and `total_cost_usd` are
+          # NOT printed: they can carry account, billing and usage detail.
+          # A maintainer who needs the full record can read it from the run's
+          # artifacts, which are not public.
           if [ -f "$exec_file" ]; then
-            echo "Last result record from the execution log:"
-            jq -c 'map(select(.type == "result")) | last' "$exec_file" 2>/dev/null || echo "(unparseable)"
+            echo "Failure classification (redacted — see comment above):"
+            jq -c 'map(select(.type == "result")) | last
+                   | {subtype, is_error, api_error_status, terminal_reason, num_turns, duration_ms}' \
+              "$exec_file" 2>/dev/null || echo "(unparseable)"
           fi
 
           if [ "$model_error" = "true" ]; then
-            cost=$(jq -r 'map(select(.type == "result")) | last | .total_cost_usd // "?"' "$exec_file" 2>/dev/null || echo "?")
+            # Status only — no cost/usage figures, no API message text (public repo).
+            status=$(jq -r 'map(select(.type == "result")) | last | .api_error_status // "?"' "$exec_file" 2>/dev/null || echo "?")
             turns=$(jq -r 'map(select(.type == "result")) | last | .num_turns // "?"' "$exec_file" 2>/dev/null || echo "?")
-            echo "::error title=Claude review did not run::The model call failed on both attempts (is_error, cost ${cost}, turns ${turns}) — commonly an expired or usage-exhausted shared-account OAuth token, or an Anthropic-side outage. NO REVIEW WAS PRODUCED, so this check is red rather than a green tick over an ungated PR."
+            echo "::error title=Claude review did not run::The model call failed on both attempts (is_error, api status ${status}, turns ${turns}) — commonly an expired or usage-exhausted shared-account OAuth token, or an Anthropic-side outage. NO REVIEW WAS PRODUCED, so this check is red rather than a green tick over an ungated PR."
             {
               echo "### :x: Claude Code Review did not run"
               echo
               echo "The model call returned \`is_error\` on **both** the initial attempt and the retry"
-              echo "(cost \`${cost}\`, turns \`${turns}\`). Typical causes: an expired or usage-exhausted"
-              echo "\`CLAUDE_CODE_OAUTH_TOKEN\`, or an Anthropic-side outage."
+              echo "(api status \`${status}\`, turns \`${turns}\`). Typical causes: an expired or"
+              echo "usage-exhausted \`CLAUDE_CODE_OAUTH_TOKEN\`, an account-level limit, or an"
+              echo "Anthropic-side outage."
               echo
               echo "**No review was produced.** This check is red on purpose: a green"
               echo "\`Claude Code Review\` must mean a review actually happened, because the"
