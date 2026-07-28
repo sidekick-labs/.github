@@ -1,0 +1,39 @@
+name: Test review-gate logic
+
+# Regression gate for the Claude Code Review merge gate's exit-code contract.
+#
+# The review check is consumed by ~25 repos and, under the workspace merge
+# policy, a green `Claude Code Review` is read as "this PR was reviewed". It
+# once reported SUCCESS while the action had errored and posted nothing
+# (sidekick-labs/core-platform-brain#340) because the gate step ended a
+# model-side failure with `exit 0`. The behaviour that prevents that is a single
+# exit code, so it is worth pinning: "a review happened" -> 0, "no review
+# happened" -> 1, whatever the cause.
+#
+# The test executes the gate step's inline script against synthetic execution
+# logs. Network-free and cheap. Mirrors the path-filtered, per-area pattern of
+# test-audit-logic.yml / test-release-thread.yml.
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/claude-code-review.yml'
+      - 'tests/review-gate-exit-codes.py'
+      - '.github/workflows/test-review-gate.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/claude-code-review.yml'
+      - 'tests/review-gate-exit-codes.py'
+      - '.github/workflows/test-review-gate.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  review-gate-logic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - name: Run review-gate exit-code tests
+        run: python3 tests/review-gate-exit-codes.py
