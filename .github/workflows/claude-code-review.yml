@@ -24,19 +24,46 @@ jobs:
 
     steps:
       # Secrets aren't allowed in `if:` expressions, so route through env and
-      # short-circuit downstream steps when the token is missing. Lets the
-      # workflow run on repos / forks that haven't (yet) been wired up with
-      # the CLAUDE_CODE_OAUTH_TOKEN secret without producing a hard failure.
+      # short-circuit downstream steps when the token is missing.
+      #
+      # A MISSING TOKEN IS NOT ALWAYS BENIGN, and conflating the two cases was the
+      # second green-that-reviewed-nothing hole (core-platform-brain#370, sibling of
+      # #340). Every step below — INCLUDING the `Verify a review actually ran` gate
+      # added by #127 — is conditioned on `skip != 'true'`, so a blanket skip
+      # disarms the gate itself and the job reports SUCCESS with no review. That is
+      # the exact failure #127 exists to prevent, reached by a different branch.
+      #
+      # So the two cases are separated:
+      #
+      #   STRUCTURALLY tokenless — a fork PR (GitHub withholds secrets from forks)
+      #     or a dependabot PR (same-repo, but secrets are withheld from dependabot
+      #     by default). Nothing is wrong; skip and stay green. Hard-failing here
+      #     would make every fork PR unmergeable.
+      #
+      #   UNEXPECTEDLY tokenless — a same-repo, non-dependabot PR in a repo that
+      #     calls this reusable, i.e. one that is supposed to be wired. The secret
+      #     is unset, revoked, renamed or expired at org level. FAIL, because the
+      #     alternative is certifying a review that cannot happen — and an
+      #     org-level credential failure hits all calling repos at once, silently,
+      #     exactly as the spend cap did in #340.
       - name: Check for Claude OAuth token
         id: token-check
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # `head.repo.fork` is the discriminator, NOT the secret's absence — the
+          # absence is the symptom both cases share.
+          IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
         run: |
-          if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
-            echo "::warning::CLAUDE_CODE_OAUTH_TOKEN secret is not configured; skipping Claude review."
+          if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          elif [ "${IS_FORK:-}" = "true" ] || [ "${PR_AUTHOR:-}" = "dependabot[bot]" ]; then
+            echo "::warning::No CLAUDE_CODE_OAUTH_TOKEN available (fork or dependabot PR — secrets are withheld by design); skipping Claude review."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "::error::CLAUDE_CODE_OAUTH_TOKEN is unavailable on a same-repo, non-dependabot PR. This repo calls the shared review workflow, so the secret is expected to be present: it is unset, revoked, renamed or expired at org level. Failing rather than reporting a green check for a review that never ran (core-platform-brain#370)."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 1
           fi
 
       - name: Checkout repository

@@ -36,6 +36,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORKFLOW = os.path.join(ROOT, ".github", "workflows", "claude-code-review.yml")
 
 GATE_STEP = "Verify a review actually ran"
+TOKEN_STEP = "Check for Claude OAuth token"
 REVIEW_STEP = "Run Claude Code Review"
 
 failures = []
@@ -84,6 +85,43 @@ def gate_script(src):
     for line in body.split("\n"):
         lines.append(line[10:] if line.startswith(" " * 10) else line)
     return "\n".join(lines)
+
+
+def token_check_script(src):
+    """Extract the token-check step's `run: |` body, dedented to column 0."""
+    blk = step_block(src, TOKEN_STEP)
+    m = re.search(r"^        run: \|\n(.*)", blk, re.S | re.M)
+    if not m:
+        sys.exit(f"FATAL: no `run:` block in the '{TOKEN_STEP}' step.")
+    body = m.group(1)
+    if "${{" in body:
+        sys.exit("FATAL: the token-check script now contains GitHub expressions; "
+                 "this test executes it as plain shell and can no longer do so safely.")
+    lines = []
+    for line in body.split("\n"):
+        lines.append(line[10:] if line.startswith(" " * 10) else line)
+    return "\n".join(lines)
+
+
+def run_token_check(script, token="", is_fork="false", author="someone"):
+    """Execute the token-check script. Returns (exit_code, skip_value)."""
+    with tempfile.TemporaryDirectory() as d:
+        out = os.path.join(d, "gh_output")
+        open(out, "w").close()
+        env = dict(os.environ)
+        env.update({
+            "CLAUDE_CODE_OAUTH_TOKEN": token,
+            "IS_FORK": is_fork,
+            "PR_AUTHOR": author,
+            "GITHUB_OUTPUT": out,
+        })
+        proc = subprocess.run(["bash", "-c", script], env=env,
+                              capture_output=True, text=True)
+        skip = ""
+        for line in open(out):
+            if line.startswith("skip="):
+                skip = line.strip().split("=", 1)[1]
+        return proc.returncode, skip
 
 
 def run_gate(script, execution_log=None, retry_outcome="failure", write_file=True):
@@ -191,6 +229,28 @@ def main():
     review_blk = strip_comments(step_block(src, REVIEW_STEP))
     check("review step keeps continue-on-error (so the gate step runs)",
           "continue-on-error: true" in review_blk)
+
+    # core-platform-brain#370 — the token guard must distinguish STRUCTURALLY
+    # tokenless (fork / dependabot: skip green) from UNEXPECTEDLY tokenless
+    # (same-repo wired repo: fail). A blanket skip disarms the review gate itself,
+    # because every step including the gate is conditioned on skip != 'true'.
+    tok = token_check_script(src)
+
+    rc, skip = run_token_check(tok, token="tok-present")
+    check("token present -> skip=false, exit 0", rc == 0 and skip == "false",
+          f"rc={rc} skip={skip!r}")
+
+    rc, skip = run_token_check(tok, token="", is_fork="true")
+    check("fork PR without a token -> skip=true, exit 0 (forks never get secrets)",
+          rc == 0 and skip == "true", f"rc={rc} skip={skip!r}")
+
+    rc, skip = run_token_check(tok, token="", author="dependabot[bot]")
+    check("dependabot PR without a token -> skip=true, exit 0 (secrets withheld)",
+          rc == 0 and skip == "true", f"rc={rc} skip={skip!r}")
+
+    rc, skip = run_token_check(tok, token="", is_fork="false", author="a-human")
+    check("same-repo human PR without a token -> EXIT 1 (never certify a review "
+          "that cannot run)", rc == 1, f"rc={rc} skip={skip!r}")
 
     print()
     if failures:
