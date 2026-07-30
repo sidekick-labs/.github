@@ -48,16 +48,12 @@ jobs:
       - name: Run Claude Code Review
         id: review
         if: steps.token-check.outputs.skip != 'true' && github.event.pull_request.user.login != 'dependabot[bot]'
-        # continue-on-error so a MODEL-side blip can't red-flag an otherwise
-        # green PR. claude-code-action >= v1.0.168 hard-fails the step when the
-        # run's result record carries `is_error:true` ("Claude execution failed:
-        # result is_error:true"), which is exactly what a transient
-        # expired/rate-limited shared-account OAuth token looks like
-        # (`is_error` + `total_cost_usd: 0` + a fast-fail seconds in). The
-        # classifier step below decides whether the JOB fails: a model-level
-        # error is advisory, anything else (setup/auth/action bug) still fails
-        # loud. The step's own conclusion stays honest in the UI.
-        # See sidekick-labs/native-experiences-brain#463.
+        # continue-on-error only so the RETRY + verify steps below get to run —
+        # NOT because a failure here is acceptable. claude-code-action >=
+        # v1.0.168 hard-fails the step when the run's result record carries
+        # `is_error:true` ("Claude execution failed: result is_error:true").
+        # The step's own conclusion stays honest in the UI; the verify step
+        # decides the JOB conclusion.
         continue-on-error: true
         uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1.0.168 (bundled CLI validates OAuth after 2026-07-07 Anthropic auth change; old pins 401)
         with:
@@ -87,31 +83,92 @@ jobs:
           # prompt injection from untrusted PR content.
           claude_args: '--model ${{ env.CLAUDE_MODEL }} --allowed-tools "Read,Glob,Grep,Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)" --effort high'
 
-      # Maps the review step's outcome onto the JOB conclusion. The review
-      # itself is advisory — findings are posted as a PR comment and never fail
-      # the step — so a failed step always means the reviewer could not run.
-      # Two very different causes, and only one of them is our problem:
+      # ---------------------------------------------------------------------
+      # Retry once before giving up.
       #
-      #   * MODEL-side  — Claude started and the run ended with a `result`
-      #     record carrying `is_error:true` (expired/limited shared-account
-      #     token, provider blip, overload). Nothing in this repo or the PR can
-      #     fix it and it self-heals -> ::warning:: and stay GREEN.
-      #   * OUR side    — no result record at all: bad/missing credentials, a
-      #     prepare failure, a malformed `claude_args`, an action regression.
-      #     That is a real config bug -> fail the job loud.
+      # A genuinely transient upstream blip (rate limit, momentary 5xx,
+      # overload) should not red-flag a PR or stall the estate, so one failure
+      # buys a second attempt after a short pause rather than an immediate red
+      # check. What it does NOT buy is a green check — see the verify step.
+      # ---------------------------------------------------------------------
+      - name: Pause before review retry
+        # A skipped step's outcome is 'skipped', not 'failure', so this
+        # inherits the token-check / dependabot gate from the review step.
+        if: steps.review.outcome == 'failure'
+        run: sleep 60
+
+      - name: Run Claude Code Review (retry)
+        id: review_retry
+        if: steps.review.outcome == 'failure'
+        continue-on-error: true
+        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1.0.168 (bundled CLI validates OAuth after 2026-07-07 Anthropic auth change; old pins 401)
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          track_progress: true
+          allowed_bots: '*'
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            Please review this pull request and provide feedback on:
+            - Code quality and best practices
+            - Potential bugs or issues
+            - Performance considerations
+            - Security concerns
+            - Test coverage
+
+            Use the repository's CLAUDE.md for guidance on style and conventions.
+            Be constructive and helpful in your feedback.
+
+            Use `gh pr comment` with your Bash tool to leave your review as a comment on the PR.
+
+          claude_args: '--model ${{ env.CLAUDE_MODEL }} --allowed-tools "Read,Glob,Grep,Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)" --effort high'
+
+      # ---------------------------------------------------------------------
+      # Maps the review outcome onto the JOB conclusion.
+      #
+      # The review itself is advisory — findings are posted as a PR comment and
+      # never fail the step — so a failed step always means the reviewer could
+      # NOT RUN, and therefore that no review exists for this PR.
+      #
+      # This step used to treat a MODEL-side `is_error` as advisory and keep the
+      # check GREEN (sidekick-labs/native-experiences-brain#463, .github#122).
+      # That was wrong, and it is the bug this step now fixes: workspace
+      # CLAUDE.md rule #7 makes merging autonomous *because* the check coverage
+      # is dense — "the dense check coverage is the safeguard, not a human". A
+      # green check that reviewed nothing silently deletes one of the gates that
+      # policy relies on. Whose fault the failure was (Anthropic-side vs. our
+      # config) is the wrong question for a merge gate; the only question that
+      # matters is "did a review happen?", and in both branches the answer is no.
+      #
+      # So: both branches now FAIL, after the retry above has already absorbed
+      # the transient case. The classification is kept — it makes the annotation
+      # actionable (rotate the token vs. fix the workflow) — but it no longer
+      # changes the exit code.
+      #
+      # If Anthropic is genuinely down estate-wide, this WILL turn the check red
+      # everywhere and block autonomous merges. That is the intended behaviour:
+      # the gate being unavailable is exactly when a human should be deciding,
+      # not when a green tick should be manufactured.
       #
       # `execution_file` is set on both paths (the action calls
       # setExecutionFileOutputIfPresent() from its error handler), with
       # $RUNNER_TEMP/claude-execution-output.json as the documented location —
       # used as a fallback in case the output is empty.
-      - name: Classify review failure
-        # Runs only if the review step failed. NOT continue-on-error, so the
-        # blocking branch below fails the job naturally.
+      - name: Verify a review actually ran
+        # Runs only if the first attempt failed. NOT continue-on-error, so the
+        # failure branches below fail the job naturally.
         if: steps.review.outcome == 'failure'
         env:
-          EXECUTION_FILE: ${{ steps.review.outputs.execution_file }}
+          RETRY_OUTCOME: ${{ steps.review_retry.outcome }}
+          EXECUTION_FILE: ${{ steps.review_retry.outputs.execution_file || steps.review.outputs.execution_file }}
         run: |
           set -uo pipefail
+
+          if [ "${RETRY_OUTCOME:-}" = "success" ]; then
+            echo "::notice title=Claude review succeeded on retry::The first attempt failed and the retry produced a review. Treating as green."
+            exit 0
+          fi
 
           exec_file="${EXECUTION_FILE:-}"
           if [ -z "$exec_file" ] || [ ! -f "$exec_file" ]; then
@@ -124,28 +181,55 @@ jobs:
             model_error=true
           fi
 
-          if [ "$model_error" = "true" ]; then
-            cost=$(jq -r 'map(select(.type == "result")) | last | .total_cost_usd // "?"' "$exec_file" 2>/dev/null || echo "?")
-            turns=$(jq -r 'map(select(.type == "result")) | last | .num_turns // "?"' "$exec_file" 2>/dev/null || echo "?")
-            echo "::warning title=Claude review unavailable::The model call failed (is_error, cost ${cost}, turns ${turns}). This is an Anthropic-side/transient failure, not a review finding — the check stays green. Re-run this job to get a review."
-            {
-              echo "### :warning: Claude Code Review did not run"
-              echo
-              echo "The model call returned \`is_error\` (cost \`${cost}\`, turns \`${turns}\`) — a transient"
-              echo "Anthropic-side failure (commonly an expired or rate-limited shared-account OAuth token)."
-              echo
-              echo "**No review was produced.** Treated as advisory so it does not block the PR."
-              echo "Re-run this job if you want the review. See \`sidekick-labs/native-experiences-brain#463\`."
-            } >> "$GITHUB_STEP_SUMMARY"
-            exit 0
+          # The action does not surface the underlying API error anywhere, which
+          # is why these outages are so hard to diagnose. Surface just enough to
+          # classify the failure.
+          #
+          # DELIBERATELY NARROW — do not widen this. This reusable runs in a
+          # PUBLIC repo (.github's own pr.yml self-test), so anything echoed here
+          # is world-readable. `api_error_status` + `terminal_reason` are enough
+          # to tell auth (401/403) from rate/spend limits (429) from an upstream
+          # outage (5xx). The `result` message text and `total_cost_usd` are
+          # NOT printed: they can carry account, billing and usage detail.
+          # A maintainer who needs the full record can read it from the run's
+          # artifacts, which are not public.
+          if [ -f "$exec_file" ]; then
+            echo "Failure classification (redacted — see comment above):"
+            jq -c 'map(select(.type == "result")) | last
+                   | {subtype, is_error, api_error_status, terminal_reason, num_turns, duration_ms}' \
+              "$exec_file" 2>/dev/null || echo "(unparseable)"
           fi
 
-          echo "::error title=Claude review setup failure::The review step failed before/around the model call (no result record in the execution log) — likely credentials, inputs, or the action itself. Failing the job so it gets fixed."
+          if [ "$model_error" = "true" ]; then
+            # Status only — no cost/usage figures, no API message text (public repo).
+            status=$(jq -r 'map(select(.type == "result")) | last | .api_error_status // "?"' "$exec_file" 2>/dev/null || echo "?")
+            turns=$(jq -r 'map(select(.type == "result")) | last | .num_turns // "?"' "$exec_file" 2>/dev/null || echo "?")
+            echo "::error title=Claude review did not run::The model call failed on both attempts (is_error, api status ${status}, turns ${turns}) — commonly an expired or usage-exhausted shared-account OAuth token, or an Anthropic-side outage. NO REVIEW WAS PRODUCED, so this check is red rather than a green tick over an ungated PR."
+            {
+              echo "### :x: Claude Code Review did not run"
+              echo
+              echo "The model call returned \`is_error\` on **both** the initial attempt and the retry"
+              echo "(api status \`${status}\`, turns \`${turns}\`). Typical causes: an expired or"
+              echo "usage-exhausted \`CLAUDE_CODE_OAUTH_TOKEN\`, an account-level limit, or an"
+              echo "Anthropic-side outage."
+              echo
+              echo "**No review was produced.** This check is red on purpose: a green"
+              echo "\`Claude Code Review\` must mean a review actually happened, because the"
+              echo "workspace merge policy treats the check set as the safeguard in place of a"
+              echo "human reviewer."
+              echo
+              echo "To unblock: fix or rotate the org \`CLAUDE_CODE_OAUTH_TOKEN\` secret and re-run,"
+              echo "or merge with an explicit human review and a note saying why."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          echo "::error title=Claude review setup failure::The review step failed before/around the model call on both attempts (no result record in the execution log) — likely credentials, inputs, or the action itself. Failing the job so it gets fixed."
           {
             echo "### :x: Claude Code Review failed to start"
             echo
-            echo "The review step failed without producing a model \`result\` record, so this is a"
-            echo "configuration/credential failure rather than a transient model error. Check the"
-            echo "\`Run Claude Code Review\` step log."
+            echo "The review step failed on both attempts without producing a model \`result\`"
+            echo "record, so this is a configuration/credential failure rather than a model"
+            echo "error. Check the \`Run Claude Code Review\` step log."
           } >> "$GITHUB_STEP_SUMMARY"
           exit 1
