@@ -5,8 +5,14 @@ name: Test release-thread logic
 # (release-thread-logic.sh), the GitHub Deployment STATE decision +
 # do-app-deploy EXIT-trap phase guarantee (deployment-status-logic.sh), and
 # do-app-deploy's outcome-based reconciliation poll loop
-# (do-app-deploy-reconcile-logic.sh).
+# (do-app-deploy-reconcile-logic.sh), and the post-deploy triage DO-log fetch
+# gate (do-log-fetch-gate-logic.sh).
 # Several of these shipped bugs to live releases before these tests existed.
+#
+# The DO-log gate tests read step names out of reusable-deploy-staging.yml and
+# reusable-deploy-production.yml, so both are path triggers here: renaming a
+# deploy-gate step must fail this workflow rather than silently switching off
+# DO log fetching in triage.
 on:
   pull_request:
     paths:
@@ -18,6 +24,9 @@ on:
       - '.github/tests/release-thread-logic.sh'
       - '.github/tests/deployment-status-logic.sh'
       - '.github/tests/do-app-deploy-reconcile-logic.sh'
+      - '.github/workflows/reusable-deploy-staging.yml'
+      - '.github/actions/fetch-do-deploy-logs/**'
+      - '.github/tests/do-log-fetch-gate-logic.sh'
       - '.github/workflows/test-release-thread.yml'
   push:
     branches: [main]
@@ -30,6 +39,9 @@ on:
       - '.github/tests/release-thread-logic.sh'
       - '.github/tests/deployment-status-logic.sh'
       - '.github/tests/do-app-deploy-reconcile-logic.sh'
+      - '.github/workflows/reusable-deploy-staging.yml'
+      - '.github/actions/fetch-do-deploy-logs/**'
+      - '.github/tests/do-log-fetch-gate-logic.sh'
       - '.github/workflows/test-release-thread.yml'
 
 permissions:
@@ -47,3 +59,5 @@ jobs:
         run: bash .github/tests/deployment-status-logic.sh
       - name: Run do-app-deploy reconcile logic tests
         run: bash .github/tests/do-app-deploy-reconcile-logic.sh
+      - name: Run DO-log fetch gate logic tests
+        run: bash .github/tests/do-log-fetch-gate-logic.sh
