@@ -78,8 +78,21 @@ fi
 # token. `doctl auth init` validates against the OAuth token-info
 # endpoint, which ignores scopes, so auth appears green while this
 # probe fails: the fetch was skipped on every run.
-if ! doctl apps get "$APP_ID" >/dev/null 2>&1; then
-  echo "(doctl cannot read app ${APP_ID} — check DIGITALOCEAN_ACCESS_TOKEN is set and has app:read)" > "$OUT"
+#
+# Keep doctl's own stderr: a missing token, an expired token, a token
+# without app:read, a wrong-team token and a transient DO API blip all
+# reach this branch, and the placeholder is the only thing the next
+# person (or Claude) sees. Guessing at one cause in the message is how
+# the previous version sent triage chasing a doctl-auth problem that
+# didn't exist. `2>&1 >/dev/null` captures stderr only.
+if ! PROBE_ERR=$(doctl apps get "$APP_ID" 2>&1 >/dev/null); then
+  {
+    echo "(doctl could not read app ${APP_ID} — no DO logs for this failure.)"
+    echo "(Most often DIGITALOCEAN_ACCESS_TOKEN is missing/expired, lacks app:read,"
+    echo " or belongs to another DO team — but a transient API error lands here too."
+    echo " doctl reported:)"
+    printf '%s\n' "${PROBE_ERR:-<no stderr from doctl>}" | head -5
+  } > "$OUT"
   echo "doctl cannot read app $APP_ID — wrote placeholder to $OUT"
   exit 0
 fi

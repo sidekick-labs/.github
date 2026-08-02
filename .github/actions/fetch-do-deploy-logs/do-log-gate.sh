@@ -30,6 +30,12 @@
 # Matching bare "deploy"/"deployment" would false-match "Create GitHub
 # deployment", which runs no doctl at all.
 #
+# Note these are unanchored substrings, not exact step names — a future step
+# like "Skip deploy to DigitalOcean if unchanged" would match. That is the
+# deliberate trade: over-matching costs one wasted log fetch on the fallback
+# path, while under-matching silently loses the logs, which is the failure
+# we're here to prevent. Keep fragments specific enough to stay one-sided.
+#
 # The tests assert this pattern against the step names actually declared in
 # reusable-deploy-staging.yml / reusable-deploy-production.yml, so renaming a
 # gate step there fails CI here instead of silently disabling DO log fetching.
