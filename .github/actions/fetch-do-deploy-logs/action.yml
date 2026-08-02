@@ -1,0 +1,103 @@
+name: Fetch DO App Platform deploy logs
+description: >-
+  Fetch DigitalOcean App Platform deploy + run logs for a failed deployment and
+  write them to a markdown file for post-deploy triage to read. Hoisted from the
+  byte-identical `.github/scripts/fetch-do-deploy-logs.sh` copies that had
+  drifted independently in sidekick-web, sidekick-harness and sidekick-inference.
+
+  Identifying the right deployment is the hard part: DO auto-rolls back a failed
+  deploy by promoting a fresh ACTIVE deployment, which shadows the ERROR'd one in
+  `list-deployments`. So the caller's deploy workflow uploads the deployment ID it
+  tracked as an artifact, and this action reads it back (`deployment_id_file`,
+  written by reusable-deploy-*.yml's "Persist DO deployment ID for post-deploy
+  triage" step). Only when that artifact is missing — the upstream failed before
+  the deploy step ran — do we fall back to scanning for a recent ERROR/CANCELED
+  deployment, gated on a failed step name implicating the DO deploy.
+
+  PREREQUISITES (the caller must do these before invoking this action):
+    - `doctl` is installed and authenticated (`doctl auth init --access-token …`).
+      doctl persists auth under $HOME for the rest of the job, so this action's
+      doctl calls inherit it. The token needs `app:read` — and note that
+      `doctl auth init` validates against the OAuth token-info endpoint, which
+      ignores scopes, so an under-scoped token authenticates cleanly and only
+      fails here. This action probes `doctl apps get` up front and writes a
+      recognizable placeholder rather than failing silently.
+    - `jq` is on PATH (preinstalled on ubuntu-latest).
+    - `failed_steps_json` already exists — it gates the fallback path. In the
+      triage workflows that means running this action AFTER "Fetch failure
+      signals", which writes it.
+
+  This action NEVER exits non-zero: a missing app id, an unusable token, a
+  non-DO failure or an ACTIVE deployment all resolve to a placeholder in
+  `out_path` explaining the skip. Triage is best-effort context, so a failure to
+  gather it must not fail the triage job.
+
+inputs:
+  app_id:
+    description: >-
+      DigitalOcean App Platform app ID for the deployed environment (e.g.
+      vars.DO_STAGING_APP_ID). Empty is valid and means "no DO app configured
+      for this environment" — the action writes a placeholder and stops.
+    required: false
+    default: ""
+  out_path:
+    description: Markdown file to write the logs (or the skip placeholder) to.
+    required: false
+    default: /tmp/do-logs.md
+  failed_steps_json:
+    description: >-
+      JSON array of the upstream run's failed jobs/steps, used to gate the
+      fallback path when no deployment ID artifact is available.
+    required: false
+    default: /tmp/failed-steps.json
+  tail_lines:
+    description: How many trailing log lines to keep per log type.
+    required: false
+    default: "300"
+  deployment_id:
+    description: >-
+      DO deployment ID to fetch, when the caller already has it. Normally left
+      empty so the action reads `deployment_id_file` instead.
+    required: false
+    default: ""
+  deployment_id_file:
+    description: >-
+      File holding the DO deployment ID captured by the upstream deploy run,
+      downloaded from its `triage-context` artifact. Read only when
+      `deployment_id` is empty; a missing file triggers the phase-based fallback.
+    required: false
+    default: /tmp/triage-context/do-deployment-id.txt
+
+runs:
+  using: composite
+  steps:
+    - name: Fetch DO deploy logs
+      shell: bash
+      # Inputs go through env rather than `${{ }}` interpolation in the script
+      # body so a value containing shell metacharacters can't be executed.
+      env:
+        APP_ID: ${{ inputs.app_id }}
+        OUT_PATH: ${{ inputs.out_path }}
+        FAILED_STEPS_JSON: ${{ inputs.failed_steps_json }}
+        TAIL_LINES: ${{ inputs.tail_lines }}
+        DEPLOYMENT_ID: ${{ inputs.deployment_id }}
+        DEPLOYMENT_ID_FILE: ${{ inputs.deployment_id_file }}
+      run: |
+        set -euo pipefail
+
+        # Prefer an explicitly passed ID; otherwise read the one the upstream
+        # deploy run captured. Empty after both is fine — the script then falls
+        # back to a phase-based search, gated on the failed step names.
+        DO_DEPLOY_ID="$DEPLOYMENT_ID"
+        if [ -z "$DO_DEPLOY_ID" ] && [ -n "$DEPLOYMENT_ID_FILE" ] && [ -s "$DEPLOYMENT_ID_FILE" ]; then
+          DO_DEPLOY_ID=$(tr -d '[:space:]' < "$DEPLOYMENT_ID_FILE")
+        fi
+
+        if [ -n "$DO_DEPLOY_ID" ]; then
+          echo "Got upstream DO deployment ID: $DO_DEPLOY_ID"
+        else
+          echo "::notice::No upstream DO deployment ID — falling back to phase-based search"
+        fi
+
+        bash "$GITHUB_ACTION_PATH/fetch-do-deploy-logs.sh" \
+          "$APP_ID" "$OUT_PATH" "$FAILED_STEPS_JSON" "$TAIL_LINES" "$DO_DEPLOY_ID"
