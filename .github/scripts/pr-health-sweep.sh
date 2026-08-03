@@ -90,16 +90,50 @@ ROWS=$(gh search prs --owner "$ORG" --state open \
 echo "open non-dependabot PRs: $(printf '%s\n' "$ROWS" | grep -c . || true)"
 echo "::endgroup::"
 
-BEHIND=""; NOCHECKS=""; STALE_DRAFTS=""; CONFLICTED=""
+BEHIND=""; NOCHECKS=""; STALE_DRAFTS=""; CONFLICTED=""; UNREADABLE=""; INDETERMINATE=""
 
 while IFS= read -r row; do
   [ -n "$row" ] || continue
   repo="${row%%$'\t'*}"; n="${row##*$'\t'}"
 
-  IFS=$'\t' read -r armed state mergeable isdraft head updated < <(gh pr view "$n" -R "$repo" \
+  # LOUD, not silent. `2>/dev/null || continue` here meant any PR the token
+  # cannot read vanished from the sweep with no trace — and `gh search` DOES
+  # surface repos the App is not installed on, so the runner silently swept a
+  # narrower set than it reported counting. That is how a live run said
+  # `conflicted=0` while the same script on a laptop PAT said 2, at the same
+  # moment, with both PRs verifiably still DIRTY.
+  if ! _pr=$(gh pr view "$n" -R "$repo" \
     --json autoMergeRequest,mergeStateStatus,mergeable,isDraft,headRefOid,updatedAt \
     --jq '[(if .autoMergeRequest then "armed" else "no" end), .mergeStateStatus, .mergeable,
-           (.isDraft|tostring), .headRefOid, .updatedAt]|@tsv' 2>/dev/null) || continue
+           (.isDraft|tostring), .headRefOid, .updatedAt]|@tsv' 2>&1); then
+    echo "::warning::cannot read $repo#$n — skipped. Is the App installed on $repo? ($_pr)"
+    UNREADABLE="$UNREADABLE$repo#$n\n"
+    continue
+  fi
+  IFS=$'\t' read -r armed state mergeable isdraft head updated <<EOF2
+$_pr
+EOF2
+
+  # `mergeStateStatus` and `mergeable` are computed LAZILY by GitHub: the first
+  # read of a PR that has not been touched in a while returns UNKNOWN, and the
+  # request itself is what kicks off the computation. Classifying on a single
+  # read is therefore a coin flip — observed 2026-08-03: claude-plugins#6 landed
+  # in `conflicted` on one local run and `no-checks` on the next, with the PR
+  # verifiably unchanged, and a live runner reported conflicted=0 while a laptop
+  # reported 2 at the same moment. Re-read once, then refuse to guess.
+  if [ "$state" = "UNKNOWN" ] || [ "$mergeable" = "UNKNOWN" ]; then
+    sleep 3
+    if _pr2=$(gh pr view "$n" -R "$repo" \
+      --json mergeStateStatus,mergeable --jq '[.mergeStateStatus,.mergeable]|@tsv' 2>/dev/null); then
+      IFS=$'\t' read -r state mergeable <<EOF3
+$_pr2
+EOF3
+    fi
+  fi
+  if [ "$state" = "UNKNOWN" ] || [ "$mergeable" = "UNKNOWN" ]; then
+    INDETERMINATE="$INDETERMINATE$repo#$n\n"
+    continue
+  fi
 
   # --- Phase 2 signal: does the head commit have ANY check-run? -------------
   # Counts check-runs only (not commit statuses); a PR whose sole entry is the
@@ -164,6 +198,16 @@ done
 [ "$(printf "%b" "$NOCHECKS" | grep -c . || true)" -eq 0 ] && echo "none"
 echo "::endgroup::"
 
+echo "::group::INDETERMINATE — GitHub had not computed merge state after a retry ($(printf "%b" "$INDETERMINATE" | grep -c . || true))"
+printf "%b" "$INDETERMINATE" | while IFS= read -r e; do [ -n "$e" ] || continue; echo "indeterminate $e — not classified this pass; next pass will re-read"; done
+[ -z "$INDETERMINATE" ] && echo "none"
+echo "::endgroup::"
+
+echo "::group::UNREADABLE — skipped, token cannot see them ($(printf "%b" "$UNREADABLE" | grep -c . || true))"
+printf "%b" "$UNREADABLE" | while IFS= read -r e; do [ -n "$e" ] || continue; echo "unreadable $e"; done
+[ -z "$UNREADABLE" ] && echo "none"
+echo "::endgroup::"
+
 echo "::group::Conflicted — CI cannot run until rebased ($(printf "%b" "$CONFLICTED" | grep -c . || true)) — REPORT ONLY"
 printf "%b" "$CONFLICTED" | while IFS= read -r e; do [ -n "$e" ] || continue; echo "conflicted $e — DIRTY, so pull_request CI has no merge ref to run against"; done
 [ -z "$CONFLICTED" ] && echo "none"
@@ -182,6 +226,8 @@ echo "::endgroup::"
   echo "|---|---|"
   echo "| armed + BEHIND (updated one per repo) | $(printf "%b" "$BEHIND" | grep -c . || true) |"
   echo "| head commit with NO checks | $(printf "%b" "$NOCHECKS" | grep -c . || true) |"
+  echo "| indeterminate (merge state uncomputed) | $(printf "%b" "$INDETERMINATE" | grep -c . || true) |"
+  echo "| unreadable (token blind) | $(printf "%b" "$UNREADABLE" | grep -c . || true) |"
   echo "| conflicted (CI cannot run) | $(printf "%b" "$CONFLICTED" | grep -c . || true) |"
   echo "| stale drafts (>=${STALE_DRAFT_DAYS}d) | $(printf "%b" "$STALE_DRAFTS" | grep -c . || true) |"
   if [ "$(printf "%b" "$NOCHECKS" | grep -c . || true)" -gt 0 ]; then
@@ -191,4 +237,4 @@ echo "::endgroup::"
   fi
 } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
 
-echo "sweep complete (dry_run=$DRY_RUN): behind=$(printf "%b" "$BEHIND" | grep -c . || true) repos-updated=$(printf "%s" "$SEEN" | tr "|" "\n" | grep -c . || true) no-checks=$(printf "%b" "$NOCHECKS" | grep -c . || true) conflicted=$(printf "%b" "$CONFLICTED" | grep -c . || true) stale-drafts=$(printf "%b" "$STALE_DRAFTS" | grep -c . || true)"
+echo "sweep complete (dry_run=$DRY_RUN): behind=$(printf "%b" "$BEHIND" | grep -c . || true) repos-updated=$(printf "%s" "$SEEN" | tr "|" "\n" | grep -c . || true) no-checks=$(printf "%b" "$NOCHECKS" | grep -c . || true) conflicted=$(printf "%b" "$CONFLICTED" | grep -c . || true) unreadable=$(printf "%b" "$UNREADABLE" | grep -c . || true) indeterminate=$(printf "%b" "$INDETERMINATE" | grep -c . || true) stale-drafts=$(printf "%b" "$STALE_DRAFTS" | grep -c . || true)"
