@@ -344,18 +344,31 @@ jobs:
           set -euo pipefail
           mkdir -p tmp/maintenance
           # security-events read may be unavailable (e.g. private repo without
-          # GHAS, or code scanning never enabled); tolerate failure gracefully.
+          # GHAS, or code scanning never enabled).
+          #
+          # A FAILED READ IS NOT ZERO. This step used to set COUNT=0 whenever the
+          # API call failed, which is indistinguishable from a genuinely clean
+          # repo: the beat then reported "Open CodeQL alerts: 0" and looked green
+          # on repos where scanning had never run at all. That is a fabricated
+          # finding, and it is exactly the (untagged)-vs-(unknown) rule this
+          # estate applies everywhere else — unreadable is UNKNOWN, never 0.
+          #
           # tool_name=CodeQL keeps this strictly CodeQL (other SAST tools are
           # excluded by design); per_page caps the review at 100 open alerts.
           if gh api "repos/$REPO/code-scanning/alerts?state=open&per_page=100&tool_name=CodeQL" \
-               > tmp/maintenance/codeql-alerts.json 2>/dev/null; then
+               > tmp/maintenance/codeql-alerts.json 2>tmp/maintenance/codeql-read-error.txt; then
             COUNT=$(jq 'length' tmp/maintenance/codeql-alerts.json)
+            READABLE=true
+            echo "## Open CodeQL alerts: $COUNT" >> "$GITHUB_STEP_SUMMARY"
           else
             echo '[]' > tmp/maintenance/codeql-alerts.json
             COUNT=0
+            READABLE=false
+            echo "::warning::Could not read CodeQL alerts for $REPO (GHAS disabled, code scanning never enabled, or insufficient permission). Reporting UNKNOWN, not 0 — see tmp/maintenance/codeql-read-error.txt."
+            echo "## Open CodeQL alerts: UNKNOWN (read failed — not a clean bill of health)" >> "$GITHUB_STEP_SUMMARY"
           fi
           echo "count=$COUNT" >> "$GITHUB_OUTPUT"
-          echo "## Open CodeQL alerts: $COUNT" >> "$GITHUB_STEP_SUMMARY"
+          echo "readable=$READABLE" >> "$GITHUB_OUTPUT"
 
       # ----- assemble prompt + allowed-tools (shell is much easier than expressions) -----
 
@@ -383,6 +396,7 @@ jobs:
           TODO_DELTA: ${{ steps.census.outputs.delta }}
           REVIEW_SECURITY_ALERTS: ${{ inputs.review-security-alerts }}
           CODEQL_ALERT_COUNT: ${{ steps.security-alerts.outputs.count }}
+          CODEQL_READABLE: ${{ steps.security-alerts.outputs.readable }}
         run: |
           set -euo pipefail
           mkdir -p tmp/maintenance
@@ -458,7 +472,11 @@ jobs:
             if [ "${REVIEW_SECURITY_ALERTS:-}" = "true" ]; then
               echo
               echo "## Security findings (code scanning)"
-              echo "- Open CodeQL alerts: ${CODEQL_ALERT_COUNT:-0} (full details in \`tmp/maintenance/codeql-alerts.json\`)."
+              if [ "${CODEQL_READABLE:-}" = "false" ]; then
+                echo "- Open CodeQL alerts: **UNKNOWN** — the code-scanning read FAILED (GHAS disabled, scanning never enabled, or insufficient permission). Report this as a DATA GAP in the PR body. Do NOT state or imply that there are zero alerts, and do NOT treat this as a clean security result."
+              else
+                echo "- Open CodeQL alerts: ${CODEQL_ALERT_COUNT:-0} (full details in \`tmp/maintenance/codeql-alerts.json\`)."
+              fi
               echo "- For each open alert: if it is genuinely actionable and a safe, minimal fix exists, apply it in this PR. Otherwise summarise it in the PR body (rule id, file:line, and why it's deferred — e.g. false positive / by design)."
               echo "- Do NOT dismiss code-scanning alerts — dismissal is a human decision."
             fi
