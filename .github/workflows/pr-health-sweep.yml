@@ -57,6 +57,13 @@ jobs:
           owner: sidekick-labs
           permission-contents: write
           permission-pull-requests: write
+          # actions:read is REQUIRED, not optional. `repo_runs_ci` calls
+          # repos/{repo}/actions/workflows to tell "this repo has no CI" apart
+          # from "this repo's CI did not run". Without it that call 403s, the
+          # count reads 0, every repo looks CI-less, and Phase 2 reports nothing
+          # forever — the first live run did exactly that (conflicted=0 on the
+          # runner vs 2 locally).
+          permission-actions: read
 
       - name: Checkout (sweep script)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

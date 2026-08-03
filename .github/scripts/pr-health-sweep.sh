@@ -58,7 +58,16 @@ CI_REPOS=""; NOCI_REPOS=""
 repo_runs_ci() {
   case "$NOCI_REPOS" in *"|$1|"*) return 1 ;; esac
   case "$CI_REPOS"   in *"|$1|"*) return 0 ;; esac
-  _wf=$(gh api "repos/$1/actions/workflows" --jq '.total_count' 2>/dev/null || echo 0)
+  # Distinguish "API said 0" from "API call FAILED". Swallowing a 403 into 0 is
+  # what silently disabled this whole phase on the first live run: the token
+  # lacked actions:read, every repo scored 0 workflows, and the sweep reported a
+  # confident all-clear. On an unreadable API we fail toward REPORTING (assume
+  # the repo runs CI) — a false positive is visible and cheap; a false all-clear
+  # is invisible and cost six days on companion-kit#370.
+  if ! _wf=$(gh api "repos/$1/actions/workflows" --jq ".total_count" 2>&1); then
+    echo "::warning::cannot read actions/workflows for $1 ($_wf) — assuming it runs CI; check the token has actions:read"
+    CI_REPOS="$CI_REPOS|$1|"; return 0
+  fi
   _db=$(gh api "repos/$1" --jq '.default_branch' 2>/dev/null || echo main)
   _c=$(gh api "repos/$1/commits/$_db/check-runs" --jq '.total_count' 2>/dev/null || echo 0)
   if [ "${_wf:-0}" -gt 0 ] && [ "${_c:-0}" -gt 0 ]; then CI_REPOS="$CI_REPOS|$1|"; return 0
