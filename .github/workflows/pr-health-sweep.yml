@@ -1,0 +1,73 @@
+name: PR-health sweep
+
+# Org-level companion to dependabot-sweep.yml, for the PRs that workflow cannot
+# see. dependabot-sweep gates on `--author app/dependabot` and rebases via a
+# `@dependabot rebase` comment; human- and agent-authored PRs hit the same two
+# walls with nothing behind them:
+#
+#   1. Native auto-merge NEVER updates a branch, so on a strict "branches must be
+#      up to date" repo an ARMED PR that falls BEHIND stalls forever — green,
+#      mergeable, going nowhere. On 2026-08-03 three companion-kit PRs each
+#      needed a manual `gh pr update-branch`.
+#   2. A head commit can end up with NO check-runs at all, so the PR shows the
+#      PREVIOUS commit's red X and nothing pending. companion-kit#370's fix sat
+#      correct and invisible for six days that way.
+#
+# One cron for the whole org — not a per-repo workflow — to keep Actions minutes
+# down, matching dependabot-sweep.yml's design. See scripts/pr-health-sweep.sh
+# for the full rationale and the one-update-per-repo-per-pass pacing.
+#
+# This workflow never merges. Phase 1 hands a PR back to native auto-merge, which
+# lands it once CI is green; Phases 2 and 3 are report-only.
+
+on:
+  schedule:
+    - cron: '30 */6 * * *'   # offset 30min from dependabot-sweep (0 */6) so the two never race
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: 'Log decisions without updating any branch'
+        type: boolean
+        default: false
+      stale-draft-days:
+        description: 'Days a draft may sit untouched before it is reported'
+        type: string
+        default: '5'
+
+permissions: {}
+
+concurrency:
+  group: pr-health-sweep
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    name: Sweep PR health
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read   # job token only checks out this repo; updates use the minted App token
+    steps:
+      - name: Mint app token (contents + PRs write across the org)
+        id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.SIDEKICK_RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.SIDEKICK_RELEASE_BOT_PRIVATE_KEY }}
+          owner: sidekick-labs
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Checkout (sweep script)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Sweep
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          ORG: sidekick-labs
+          # schedule has no inputs → live; dispatch honours the dry-run toggle.
+          DRY_RUN: ${{ inputs.dry-run && 'true' || 'false' }}
+          STALE_DRAFT_DAYS: ${{ inputs.stale-draft-days || '5' }}
+        run: bash .github/scripts/pr-health-sweep.sh
