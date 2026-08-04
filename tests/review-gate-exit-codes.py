@@ -39,6 +39,7 @@ GATE_STEP = "Verify a review actually ran"
 MECHANICAL_STEP = "Classify \u2014 is this a MECHANICAL pull request?"
 TOKEN_STEP = "Check for Claude OAuth token"
 REVIEW_STEP = "Run Claude Code Review"
+CHECKOUT_STEP = "Checkout repository"
 
 failures = []
 
@@ -152,10 +153,13 @@ def run_mechanical(script, author, ref, files):
         proc = subprocess.run(["bash", "-c", script], env=env,
                               capture_output=True, text=True)
         skip = None
-        for line in open(out):
-            if line.startswith("skip="):
-                skip = line.strip().split("=", 1)[1]
-        return proc.returncode, skip, open(summary).read()
+        with open(out) as fh:
+            for line in fh:
+                if line.startswith("skip="):
+                    skip = line.strip().split("=", 1)[1]
+        with open(summary) as fh:
+            summary_text = fh.read()
+        return proc.returncode, skip, summary_text
 
 
 def run_token_check(script, token="", is_fork="false", author="someone"):
@@ -333,10 +337,14 @@ def main():
           "mechanical" in summary.lower() and "sync-check" in summary,
           f"summary={summary[:120]!r}")
 
-    rc, skip, _ = run_mechanical(
-        mech, "octo-brain-bot", "weekly/2026-W31", "reports/weekly.md")
-    check("bot + beat-regenerated branch -> skip=true",
-          rc == 0 and skip == "true", f"rc={rc} skip={skip!r}")
+    # Every beat prefix, not just one: they share a code path today, but the loop they
+    # share is a literal list, and a coverage claim that rests on "the others are the
+    # same" stops being true the moment one is handled specially.
+    for ref in ("weekly/2026-W31", "cycle/2026-C5", "quarterly/2026-Q3",
+                "direction/2026-Q3-okrs"):
+        rc, skip, _ = run_mechanical(mech, "octo-brain-bot", ref, "reports/out.md")
+        check(f"bot + beat-regenerated branch '{ref}' -> skip=true",
+              rc == 0 and skip == "true", f"rc={rc} skip={skip!r}")
 
     rc, skip, _ = run_mechanical(
         mech, "a-human", "sync/shared-tools", "tools/cadence.mjs")
@@ -371,10 +379,19 @@ def main():
     # Structural: the review attempts must actually consult the classifier.
     # Without this, deleting the `steps.mechanical...` condition would silently
     # restore full spend, or worse, a future edit could gate the wrong way.
+    COND = "steps.mechanical.outputs.skip != 'true'"
     review_blk = strip_comments(step_block(src, REVIEW_STEP))
     check("the review step is gated on the classifier",
-          "steps.mechanical.outputs.skip != 'true'" in review_blk,
-          "condition missing from the review step")
+          COND in review_blk, "condition missing from the review step")
+
+    # Pinned separately rather than assumed to follow: the two steps carry the condition
+    # independently, so dropping it from checkout while keeping it on review would leave
+    # this suite green. The consequence is only wasted compute on a skipped PR, not an
+    # unreviewed merge — but every other structural property here is pinned, and a gap
+    # that is "low impact today" is how the next refactor gets a foothold.
+    checkout_blk = strip_comments(step_block(src, CHECKOUT_STEP))
+    check("the checkout step is gated on the classifier too",
+          COND in checkout_blk, "condition missing from the checkout step")
 
     print()
     if failures:
