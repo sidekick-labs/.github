@@ -36,8 +36,10 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORKFLOW = os.path.join(ROOT, ".github", "workflows", "claude-code-review.yml")
 
 GATE_STEP = "Verify a review actually ran"
+MECHANICAL_STEP = "Classify \u2014 is this a MECHANICAL pull request?"
 TOKEN_STEP = "Check for Claude OAuth token"
 REVIEW_STEP = "Run Claude Code Review"
+CHECKOUT_STEP = "Checkout repository"
 
 failures = []
 
@@ -101,6 +103,63 @@ def token_check_script(src):
     for line in body.split("\n"):
         lines.append(line[10:] if line.startswith(" " * 10) else line)
     return "\n".join(lines)
+
+
+
+def mechanical_script(src):
+    """Extract the mechanical-classifier step's `run: |` body, dedented to column 0."""
+    blk = step_block(src, MECHANICAL_STEP)
+    m = re.search(r"^        run: \|\n(.*)", blk, re.S | re.M)
+    if not m:
+        sys.exit(f"FATAL: no `run:` block in the '{MECHANICAL_STEP}' step.")
+    body = m.group(1)
+    if "${{" in body:
+        sys.exit("FATAL: the classifier script now contains GitHub expressions; this "
+                 "test executes it as plain shell and can no longer do so safely.")
+    lines = []
+    for line in body.split("\n"):
+        lines.append(line[10:] if line.startswith(" " * 10) else line)
+    return "\n".join(lines)
+
+
+def run_mechanical(script, author, ref, files):
+    """Execute the classifier. `files` is the stubbed `gh pr diff --name-only`
+    output; pass None to simulate an unreadable diff (gh exiting non-zero).
+    Returns (exit_code, skip_value)."""
+    with tempfile.TemporaryDirectory() as d:
+        out = os.path.join(d, "gh_output")
+        open(out, "w").close()
+        summary = os.path.join(d, "summary")
+        open(summary, "w").close()
+        bindir = os.path.join(d, "bin")
+        os.makedirs(bindir)
+        gh = os.path.join(bindir, "gh")
+        with open(gh, "w") as fh:
+            if files is None:
+                fh.write("#!/bin/sh\nexit 1\n")
+            else:
+                fh.write("#!/bin/sh\ncat <<'EOF'\n" + files + "\nEOF\n")
+        os.chmod(gh, 0o755)
+        env = dict(os.environ)
+        env.update({
+            "PATH": bindir + os.pathsep + env["PATH"],
+            "GITHUB_OUTPUT": out,
+            "GITHUB_STEP_SUMMARY": summary,
+            "PR_AUTHOR": author,
+            "HEAD_REF": ref,
+            "REPO": "sidekick-labs/example",
+            "PR": "1",
+        })
+        proc = subprocess.run(["bash", "-c", script], env=env,
+                              capture_output=True, text=True)
+        skip = None
+        with open(out) as fh:
+            for line in fh:
+                if line.startswith("skip="):
+                    skip = line.strip().split("=", 1)[1]
+        with open(summary) as fh:
+            summary_text = fh.read()
+        return proc.returncode, skip, summary_text
 
 
 def run_token_check(script, token="", is_fork="false", author="someone"):
@@ -251,6 +310,88 @@ def main():
     rc, skip = run_token_check(tok, token="", is_fork="false", author="a-human")
     check("same-repo human PR without a token -> EXIT 1 (never certify a review "
           "that cannot run)", rc == 1, f"rc={rc} skip={skip!r}")
+
+    # ---------------------------------------------------------------------
+    # The MECHANICAL-PR classifier.
+    #
+    # This step lets a PR skip review entirely, so it is a gate in its own right
+    # and fails in the same direction as everything else here: a wrong `skip=true`
+    # produces a green `Claude Code Review` over a PR nobody looked at. Two
+    # properties are load-bearing and pinned below.
+    #
+    #   FAIL-CLOSED. Missing information must resolve to *review*, never to skip.
+    #   NOT AUTHORISED BY A BRANCH NAME. A prefix is attacker-chosen; bot
+    #     authorship and the changed paths must agree too, or "name your branch
+    #     sync/" becomes a route to unreviewed code.
+    # ---------------------------------------------------------------------
+    mech = mechanical_script(src)
+
+    rc, skip, summary = run_mechanical(
+        mech, "sidekick-labs-bot[bot]", "sync/shared-tools",
+        "tools/cadence.mjs\ntools/issue.mjs")
+    check("bot + sync/ + tools-only -> skip=true (sync-check already asserts "
+          "byte-identity with the reviewed canonical)",
+          rc == 0 and skip == "true", f"rc={rc} skip={skip!r}")
+    check("a skip EXPLAINS itself in the step summary (an unexplained green is "
+          "indistinguishable from a review that never ran)",
+          "mechanical" in summary.lower() and "sync-check" in summary,
+          f"summary={summary[:120]!r}")
+
+    # Every beat prefix, not just one: they share a code path today, but the loop they
+    # share is a literal list, and a coverage claim that rests on "the others are the
+    # same" stops being true the moment one is handled specially.
+    for ref in ("weekly/2026-W31", "cycle/2026-C5", "quarterly/2026-Q3",
+                "direction/2026-Q3-okrs"):
+        rc, skip, _ = run_mechanical(mech, "octo-brain-bot", ref, "reports/out.md")
+        check(f"bot + beat-regenerated branch '{ref}' -> skip=true",
+              rc == 0 and skip == "true", f"rc={rc} skip={skip!r}")
+
+    rc, skip, _ = run_mechanical(
+        mech, "a-human", "sync/shared-tools", "tools/cadence.mjs")
+    check("HUMAN on a sync/ branch -> skip=false (a branch name is not an "
+          "authorisation token)", skip == "false", f"rc={rc} skip={skip!r}")
+
+    rc, skip, _ = run_mechanical(
+        mech, "sidekick-labs-bot[bot]", "feat/whatever", "tools/cadence.mjs")
+    check("bot on a non-mechanical branch -> skip=false",
+          skip == "false", f"rc={rc} skip={skip!r}")
+
+    rc, skip, _ = run_mechanical(
+        mech, "sidekick-labs-bot[bot]", "sync/shared-tools",
+        ".github/workflows/claude-code-review.yml")
+    check("touching .github/ is NEVER mechanical -> skip=false (the workflow IS "
+          "the gate; reviewing the checker is where review is irreplaceable)",
+          skip == "false", f"rc={rc} skip={skip!r}")
+
+    rc, skip, _ = run_mechanical(
+        mech, "sidekick-labs-bot[bot]", "sync/shared-tools",
+        "tools/cadence.mjs\nteams.yaml")
+    check("sync/ touching a path outside tools/ -> skip=false (sync-shared-tools "
+          "can only copy files under tools/, so the guarantee does not cover it)",
+          skip == "false", f"rc={rc} skip={skip!r}")
+
+    rc, skip, _ = run_mechanical(
+        mech, "sidekick-labs-bot[bot]", "sync/shared-tools", None)
+    check("UNREADABLE diff -> skip=false (fail-closed: spend money rather than "
+          "skip a gate on missing information)",
+          skip == "false", f"rc={rc} skip={skip!r}")
+
+    # Structural: the review attempts must actually consult the classifier.
+    # Without this, deleting the `steps.mechanical...` condition would silently
+    # restore full spend, or worse, a future edit could gate the wrong way.
+    COND = "steps.mechanical.outputs.skip != 'true'"
+    review_blk = strip_comments(step_block(src, REVIEW_STEP))
+    check("the review step is gated on the classifier",
+          COND in review_blk, "condition missing from the review step")
+
+    # Pinned separately rather than assumed to follow: the two steps carry the condition
+    # independently, so dropping it from checkout while keeping it on review would leave
+    # this suite green. The consequence is only wasted compute on a skipped PR, not an
+    # unreviewed merge — but every other structural property here is pinned, and a gap
+    # that is "low impact today" is how the next refactor gets a foothold.
+    checkout_blk = strip_comments(step_block(src, CHECKOUT_STEP))
+    check("the checkout step is gated on the classifier too",
+          COND in checkout_blk, "condition missing from the checkout step")
 
     print()
     if failures:
