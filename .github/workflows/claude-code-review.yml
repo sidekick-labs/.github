@@ -101,6 +101,12 @@ jobs:
       # default is to spend money, not to skip a gate (octo-brain#295 — a check that
       # cannot say "I don't know" eventually says "fine"; here it must say "review").
       #
+      # Note the step-gating is LOAD-BEARING, not merely prudent: `Claude Code Review /
+      # Claude Code Review` is a REQUIRED status check on THIS repo's own `main`. A
+      # job-level `if:` here would report that context as skipped, which GitHub treats as
+      # not-satisfied, and every PR to this repo would sit forever-pending — the failure
+      # the note at the top of this job already warns about.
+      #
       # Rationale: measured over 7d, PR review is the estate's single largest consumer of
       # shared Claude capacity, and mechanical PRs are the lowest-value slice of it. Figures
       # deliberately omitted — this reusable lives in a PUBLIC repo (see the redaction note
