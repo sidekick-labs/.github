@@ -1,7 +1,7 @@
 name: Pin Check
 
 # Reusable PR gate that FAILS when a third-party GitHub Action isn't SHA-pinned.
-# Two independent checks, both org-agnostic (everything derives from the caller):
+# Three independent checks, both org-agnostic (everything derives from the caller):
 #
 #   1. zizmor (primary) — the GitHub Actions security auditor. We run its full
 #      audit for visibility, but BLOCK only on the `unpinned-uses` finding so the
@@ -18,6 +18,15 @@ name: Pin Check
 #      `.pinact.yaml`, so the gate behaves identically on every repo regardless of
 #      whether one is checked in.
 #
+#
+#   3. pin integrity (third) — resolves every third-party pin against the action's
+#      own repository. The first two checks only prove a ref is SHAPED like a
+#      commit SHA; neither resolves it, so a well-formed pin to a SHA that does
+#      not exist upstream passes both and then fails at run time, on whichever
+#      path uses it. Blocks when the SHA is not any object in that repo; warns
+#      when it is an annotated tag OBJECT rather than a commit, or when the
+#      `# vX.Y.Z` label disagrees with the tag upstream (expected for a moving
+#      tag that has advanced past the pinned commit).
 # Consume from a PR workflow:
 #
 #   jobs:
@@ -180,3 +189,216 @@ jobs:
 
           cd "$GITHUB_WORKSPACE"
           pinact run --check -c /tmp/pinact.yaml
+
+      # Third, independent check: pin INTEGRITY. zizmor and pinact both only prove
+      # a ref is SHAPED like a commit SHA -- neither resolves it. A well-formed pin
+      # to a SHA that does not exist upstream passes both and then fails at run
+      # time, on whichever path uses it (typically a release, long after merge).
+      # This resolves every third-party pin against the action's own repository.
+      #   FAIL: the SHA is not any object in that repo.
+      #   WARN: the SHA is an annotated tag OBJECT rather than a commit.
+      #   WARN: the `# vX.Y.Z` label disagrees with the tag upstream -- expected
+      #         whenever a moving tag like @v2 has advanced past the pinned commit.
+      - name: Pin integrity — resolve every third-party SHA upstream
+        if: steps.prep.outputs.paths != ''
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          PATHS: ${{ steps.prep.outputs.paths }}
+        # $PATHS is intentionally unquoted (a space-separated list); it is routed
+        # through env rather than templated into the shell, so expansion only
+        # word-splits and never executes.
+        run: |
+          set -euo pipefail
+          cat > "${RUNNER_TEMP}/pin_integrity.py" <<'PIN_INTEGRITY_EOF'
+          #!/usr/bin/env python3
+          """Pin INTEGRITY check: a well-formed 40-char SHA pin is not the same as a real one.
+
+          The pinning gate (zizmor + pinact) only proves a ref is SHAPED like a commit SHA.
+          It cannot tell a pin that resolves from one that does not. This resolves every
+          third-party pin against the upstream repo and:
+
+            FAIL  the SHA is not any object in the action's repository (a dead pin -- the
+                  workflow will fail at run time, and only on whichever path uses it)
+            WARN  the SHA is an annotated TAG OBJECT rather than a commit. Whether the
+                  runner resolves this is version-dependent, so it is reported, not failed.
+            WARN  the `# vX.Y.Z` label does not match the tag upstream (drifted label;
+                  legitimate when a moving tag like @v4 has advanced past the pinned commit)
+
+          First-party (same-owner) and local `./` actions are skipped: they are consumed at
+          a moving ref by design.
+          """
+
+          import json
+          import os
+          import re
+          import sys
+          import urllib.error
+          import urllib.request
+
+          API = "https://api.github.com"
+          TOKEN = os.environ.get("GITHUB_TOKEN", "")
+          OWNER = os.environ.get("REPO_OWNER", "").lower()
+
+          # owner/repo[/subpath]@<40-hex>  with an optional trailing "# label" comment.
+          USES = re.compile(
+              r"""^\s*-?\s*uses:\s*["']?
+                  (?P<owner>[A-Za-z0-9][\w.-]*)/(?P<repo>[\w.-]+)
+                  (?P<path>(?:/[^@\s"']+)?)
+                  @(?P<sha>[0-9a-fA-F]{40})["']?
+                  (?:\s*\#\s*(?P<label>\S+))?""",
+              re.VERBOSE,
+          )
+          # A version-ish label we can meaningfully resolve to a tag.
+          VERSIONISH = re.compile(r"^v?\d+(\.\d+)*$")
+
+
+          def api(path):
+              """GET a JSON API path. Returns (status, parsed_body_or_None).
+
+              NB: an error body is still non-empty JSON, so callers must inspect the
+              status and compare the returned value to what they asked for -- truthiness
+              of the body proves nothing.
+              """
+              req = urllib.request.Request(API + path, headers={
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+                  "User-Agent": "pin-integrity-check",
+                  **({"Authorization": f"Bearer {TOKEN}"} if TOKEN else {}),
+              })
+              try:
+                  with urllib.request.urlopen(req, timeout=20) as r:
+                      return r.status, json.load(r)
+              except urllib.error.HTTPError as e:
+                  return e.code, None
+              except Exception:
+                  return 0, None
+
+
+          def tag_sha(owner, repo, tag):
+              """Resolve a tag to the commit SHA it points at, dereferencing annotated tags."""
+              st, body = api(f"/repos/{owner}/{repo}/git/ref/tags/{tag}")
+              if st != 200 or not isinstance(body, dict):
+                  return None
+              obj = body.get("object") or {}
+              if obj.get("type") == "tag":  # annotated -- one more hop to the commit
+                  st2, body2 = api(f"/repos/{owner}/{repo}/git/tags/{obj.get('sha')}")
+                  if st2 != 200 or not isinstance(body2, dict):
+                      return None
+                  return ((body2.get("object") or {}).get("sha") or "").lower()
+              return (obj.get("sha") or "").lower()
+
+
+          def classify(owner, repo, sha):
+              """Classify a pinned SHA: ("commit"|"tag-object"|"dead", detail).
+
+              A pin must name a commit. Some pins instead name the annotated tag OBJECT
+              that a version tag points at -- a plausible-looking mistake, since
+              `git/ref/tags/vN` returns exactly that SHA for an annotated tag. It is
+              reported separately from a truly dead SHA because it is a different defect
+              with a different fix, and because whether the runner tolerates it is not
+              something this check should assume.
+              """
+              st, body = api(f"/repos/{owner}/{repo}/commits/{sha}")
+              # Compare the RETURNED sha to the one requested. A 200 carrying a different
+              # sha, or an error body (which is still non-empty JSON), is not success.
+              got = (body or {}).get("sha", "") if isinstance(body, dict) else ""
+              if st == 200 and got.lower() == sha:
+                  return ("commit", got.lower())
+
+              st2, body2 = api(f"/repos/{owner}/{repo}/git/tags/{sha}")
+              if st2 == 200 and isinstance(body2, dict):
+                  target = ((body2.get("object") or {}).get("sha") or "").lower()
+                  if target:
+                      return ("tag-object", target)
+
+              return ("dead", "")
+
+
+          def collect(paths):
+              """Map (owner, repo, sha, label) -> sorted list of "file:line" sites."""
+              seen = {}
+              for root in paths:
+                  for dirpath, _, files in os.walk(root):
+                      for fn in files:
+                          if not fn.endswith((".yml", ".yaml")):
+                              continue
+                          fp = os.path.join(dirpath, fn)
+                          try:
+                              lines = open(fp, encoding="utf-8", errors="replace").read().splitlines()
+                          except OSError:
+                              continue
+                          for i, line in enumerate(lines, 1):
+                              m = USES.match(line)
+                              if not m:
+                                  continue
+                              if m.group("owner").lower() == OWNER:
+                                  continue  # first-party: moving ref by design
+                              key = (m.group("owner"), m.group("repo"),
+                                     m.group("sha").lower(), m.group("label") or "")
+                              seen.setdefault(key, []).append(f"{fp}:{i}")
+              return seen
+
+
+          def main():
+              paths = [p for p in sys.argv[1:] if os.path.isdir(p)]
+              if not paths:
+                  print("No workflow/action directories to check -- integrity check is a no-op.")
+                  return 0
+
+              pins = collect(paths)
+              if not pins:
+                  print("No third-party SHA pins found.")
+                  return 0
+
+              dead, drifted, ok = [], [], 0
+              resolved_cache = {}
+
+              for (owner, repo, sha, label), sites in sorted(pins.items()):
+                  ck = (owner, repo, sha)
+                  if ck not in resolved_cache:
+                      resolved_cache[ck] = classify(owner, repo, sha)
+                  kind, detail = resolved_cache[ck]
+                  if kind == "dead":
+                      dead.append((owner, repo, sha, label, sites))
+                      continue
+                  ok += 1
+                  if kind == "tag-object":
+                      # Already the more specific finding; the label check below would only
+                      # restate it, since the tag is exactly what this SHA is.
+                      drifted.append((owner, repo, sha, label, sites,
+                                      "it is an annotated TAG OBJECT, not a commit; "
+                                      f"re-pin to {detail[:12]}"))
+                  elif label and VERSIONISH.match(label):
+                      real = tag_sha(owner, repo, label)
+                      if real is None:
+                          drifted.append((owner, repo, sha, label, sites, "tag does not exist upstream"))
+                      elif real != sha:
+                          drifted.append((owner, repo, sha, label, sites,
+                                          f"tag {label} points at {real[:12]}"))
+
+              for owner, repo, sha, label, sites, why in drifted:
+                  print(f"::warning::{owner}/{repo}@{sha[:12]} is labelled '# {label}' but {why}. "
+                        f"({', '.join(sites)})")
+
+              for owner, repo, sha, label, sites in dead:
+                  print(f"::error::{owner}/{repo}@{sha} DOES NOT EXIST in that repository"
+                        + (f" (labelled '# {label}')" if label else "")
+                        + f". Referenced at: {', '.join(sites)}")
+
+              print(f"\npin integrity: {ok} pin(s) resolved, {len(drifted)} label warning(s), "
+                    f"{len(dead)} dead pin(s).")
+
+              if dead:
+                  print("\nA dead pin is invisible to the pinning gate -- the ref is correctly "
+                        "SHA-shaped, it just isn't a real commit. The job using it fails only "
+                        "when that path runs, which is typically a release. Re-pin to a SHA that "
+                        "exists upstream (`pinact run` will fetch the correct one for the tag).")
+                  return 1
+              return 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PIN_INTEGRITY_EOF
+          python3 "${RUNNER_TEMP}/pin_integrity.py" $PATHS
