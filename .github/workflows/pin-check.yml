@@ -1,7 +1,7 @@
 name: Pin Check
 
 # Reusable PR gate that FAILS when a third-party GitHub Action isn't SHA-pinned.
-# Three independent checks, both org-agnostic (everything derives from the caller):
+# Four independent checks, both org-agnostic (everything derives from the caller):
 #
 #   1. zizmor (primary) — the GitHub Actions security auditor. We run its full
 #      audit for visibility, but BLOCK only on the `unpinned-uses` finding so the
@@ -27,6 +27,13 @@ name: Pin Check
 #      when it is an annotated tag OBJECT rather than a commit, or when the
 #      `# vX.Y.Z` label disagrees with the tag upstream (expected for a moving
 #      tag that has advanced past the pinned commit).
+#
+#   4. workflow_run chain integrity (fourth) — asserts every `workflow_run`
+#      listener in the repo names a workflow that actually exists there. The
+#      deploy -> triage -> smoke chains are wired by exact `name:` strings, and a
+#      listener naming a missing workflow is not an error to GitHub: it simply
+#      never fires. A rename therefore severs the chain silently while every run
+#      stays green. Offline and repo-local — no API calls.
 # Consume from a PR workflow:
 #
 #   jobs:
@@ -402,3 +409,122 @@ jobs:
               sys.exit(main())
           PIN_INTEGRITY_EOF
           python3 "${RUNNER_TEMP}/pin_integrity.py" $PATHS
+
+      # Fourth check: workflow_run CHAIN integrity. The deploy -> triage -> smoke
+      # chains in this estate are wired by exact `name:` strings. A `workflow_run`
+      # trigger naming a workflow that does not exist is not an error to GitHub --
+      # it simply never fires. So a rename silently severs the chain while every
+      # run stays green, which is the worst failure shape a safety net can have.
+      # Cheap, offline, and repo-local: no API calls, just the checked-out tree.
+      - name: Workflow-chain integrity — every workflow_run names a real workflow
+        if: steps.prep.outputs.paths != ''
+        run: |
+          set -euo pipefail
+          cat > "${RUNNER_TEMP}/wfrun_check.py" <<'WFRUN_CHECK_EOF'
+          #!/usr/bin/env python3
+          """Assert every `workflow_run` listener names a workflow that actually exists.
+
+          The deploy -> triage -> smoke -> withheld chain is wired by exact `name:` strings.
+          A `workflow_run` trigger naming a workflow that does not exist is not an error to
+          GitHub -- it simply never fires. So a rename silently severs the chain and every
+          run stays green, which is the worst possible failure shape for a safety net.
+
+          Usage: wfrun_check.py <dir-containing-.github/workflows> [...]
+          Exit 1 if any listener names a workflow not present in the same repo.
+          """
+
+          import os
+          import sys
+
+          import yaml
+
+
+          def workflow_files(root):
+              d = os.path.join(root, ".github", "workflows")
+              if not os.path.isdir(d):
+                  return []
+              return [
+                  os.path.join(d, f)
+                  for f in sorted(os.listdir(d))
+                  if f.endswith((".yml", ".yaml"))
+              ]
+
+
+          def load(path):
+              try:
+                  with open(path, encoding="utf-8") as fh:
+                      return yaml.safe_load(fh)
+              except Exception:
+                  return None
+
+
+          def triggers(doc):
+              """`on:` is parsed by YAML as the boolean True, not the string 'on'."""
+              if not isinstance(doc, dict):
+                  return {}
+              on = doc.get("on", doc.get(True))
+              if isinstance(on, str):
+                  return {on: None}
+              if isinstance(on, list):
+                  return {k: None for k in on}
+              return on if isinstance(on, dict) else {}
+
+
+          def check(root):
+              files = workflow_files(root)
+              if not files:
+                  return [], 0
+
+              # Map every declared workflow name -> file. A workflow with no `name:` is
+              # displayed by path, which cannot be targeted by workflow_run at all.
+              names = {}
+              for p in files:
+                  doc = load(p)
+                  if isinstance(doc, dict) and isinstance(doc.get("name"), str):
+                      names[doc["name"]] = os.path.basename(p)
+
+              problems = []
+              listeners = 0
+              for p in files:
+                  doc = load(p)
+                  wr = triggers(doc).get("workflow_run")
+                  if not isinstance(wr, dict):
+                      continue
+                  wanted = wr.get("workflows") or []
+                  if isinstance(wanted, str):
+                      wanted = [wanted]
+                  for w in wanted:
+                      listeners += 1
+                      if w not in names:
+                          problems.append((os.path.basename(p), w))
+              return problems, listeners
+
+
+          def main():
+              roots = [r for r in sys.argv[1:] if os.path.isdir(r)]
+              if not roots:
+                  print("No repo directories given.")
+                  return 0
+
+              bad = 0
+              total = 0
+              for root in roots:
+                  problems, listeners = check(root)
+                  total += listeners
+                  for src, want in problems:
+                      bad += 1
+                      print(
+                          f"::error::{os.path.basename(root)}: {src} listens for a workflow "
+                          f"named {want!r}, which does not exist in this repo. A workflow_run "
+                          f"trigger naming a missing workflow never fires -- the chain is "
+                          f"silently severed and every run stays green."
+                      )
+
+              print(f"\nworkflow_run integrity: {total} listener(s) checked, {bad} dangling.")
+              return 1 if bad else 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          WFRUN_CHECK_EOF
+          python3 "${RUNNER_TEMP}/wfrun_check.py" .
