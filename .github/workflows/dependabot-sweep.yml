@@ -58,3 +58,50 @@ jobs:
           # schedule has no inputs → live; dispatch honours the dry-run toggle.
           DRY_RUN: ${{ inputs.dry-run && 'true' || 'false' }}
         run: bash .github/scripts/dependabot-sweep.sh
+
+  # Crash-heartbeat (house pattern, mirrors the actuator sweeps). The beat's own
+  # fail-loud only helps if the job REACHED it. When a run dies earlier — token
+  # mint, runner death, quota — the missed beat would otherwise be invisible and
+  # only a red run in the Actions tab would remain. This lands the miss somewhere
+  # durable instead. Dedupes into ONE open issue, and auto-closes it on the next
+  # genuinely-successful run so a recovered beat doesn't leave litter.
+  #
+  # NB: issues are DISABLED on this repo, so (as in pin-sweep) the `gh issue`
+  # bookkeeping is BEST-EFFORT — otherwise `set -e` would abort on the very first
+  # `gh issue list` and a GREEN run would show red. On a real failure we still
+  # emit a ::warning::, and the sweep job's own red status is the signal.
+  alert:
+    needs: [sweep]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Flag failure or clear on recovery
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }} # this job has no checkout, so pin the repo for gh
+          FAILED: ${{ contains(needs.*.result, 'failure') }}
+          SUCCEEDED: ${{ contains(needs.*.result, 'success') }}
+        run: |
+          set -euo pipefail
+          WF="dependabot-sweep"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          EXISTING="$(gh issue list --search "\"beat failure: ${WF}\" in:title" --state open --json number --jq '.[0].number // empty' 2>/dev/null || true)"
+          if [ "${FAILED}" != "true" ]; then
+            # Nothing failed. Close any open failure issue only on a run that actually
+            # succeeded — an all-skipped run is not evidence of recovery.
+            if [ "${SUCCEEDED}" = "true" ] && [ -n "$EXISTING" ]; then
+              gh issue close "$EXISTING" --comment "Recovered: ${WF} succeeded — ${RUN_URL}." 2>/dev/null || true
+            fi
+            exit 0
+          fi
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "Failed again: ${RUN_URL}" 2>/dev/null || true
+          else
+            gh issue create \
+              --title "beat failure: ${WF} ($(date -u +%F))" \
+              --body "The \`${WF}\` beat failed before it could report — see ${RUN_URL}" 2>/dev/null \
+              || echo "::warning::${WF} FAILED and issues are unavailable on this repo — see ${RUN_URL}"
+          fi
