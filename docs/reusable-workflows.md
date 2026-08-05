@@ -80,6 +80,18 @@ A run does the following:
 - All third-party actions are SHA-pinned (checkout, ruby/setup-ruby,
   setup-node, anthropics/claude-code-action). KMP-only setup-java and
   setup-gradle remain on floating major tags pending org-wide pinning.
+- **Crash heartbeat.** A second job, `alert`, runs `if: always()` after
+  `maintenance` and turns a *missed* beat into a durable record: it opens ONE
+  deduped `beat failure: weekly-maintenance` issue and closes it on recovery
+  (recovery is gated on an actual `success`, so an all-skipped run is not read as
+  recovery). It exists because the maintenance job's own reporting only helps if
+  the job REACHED it — a run that dies at token mint, `npm ci` or a runner death
+  would otherwise be invisible.
+  **This makes `issues: write` a mandatory caller grant** (see the note above the
+  examples): a reusable's token is capped by the caller's, so a caller missing it
+  lands in `startup_failure`. Every `gh issue` call is best-effort (`|| true`)
+  because most consumer repos have Issues DISABLED — there the miss degrades to a
+  `::warning::` annotation rather than turning a green run red.
 - TODO/FIXME census uses `actions/cache` to keep the previous run's snapshot
   scoped per `repository_id`; week-over-week delta surfaces in `$GITHUB_STEP_SUMMARY`
   and in the PR body.
@@ -97,6 +109,15 @@ permissions: {}
 
 jobs:
   maintenance:
+    # A reusable workflow's token is capped by the CALLER's permissions. A
+    # job-level block fully replaces the top-level one for this job, so every
+    # permission the reusable needs must be listed HERE.
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write         # crash-heartbeat `alert` job
+      id-token: write
+      security-events: read
     uses: sidekick-labs/.github/.github/workflows/reusable-weekly-maintenance.yml@v1
     with:
       stack: rails
@@ -127,6 +148,15 @@ permissions: {}
 
 jobs:
   maintenance:
+    # A reusable workflow's token is capped by the CALLER's permissions. A
+    # job-level block fully replaces the top-level one for this job, so every
+    # permission the reusable needs must be listed HERE.
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write         # crash-heartbeat `alert` job
+      id-token: write
+      security-events: read
     uses: sidekick-labs/.github/.github/workflows/reusable-weekly-maintenance.yml@v1
     with:
       stack: ruby-gem
@@ -152,6 +182,15 @@ permissions: {}
 
 jobs:
   maintenance:
+    # A reusable workflow's token is capped by the CALLER's permissions. A
+    # job-level block fully replaces the top-level one for this job, so every
+    # permission the reusable needs must be listed HERE.
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write         # crash-heartbeat `alert` job
+      id-token: write
+      security-events: read
     uses: sidekick-labs/.github/.github/workflows/reusable-weekly-maintenance.yml@v1
     with:
       stack: node-lib
@@ -179,6 +218,15 @@ permissions: {}
 
 jobs:
   maintenance:
+    # A reusable workflow's token is capped by the CALLER's permissions. A
+    # job-level block fully replaces the top-level one for this job, so every
+    # permission the reusable needs must be listed HERE.
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write         # crash-heartbeat `alert` job
+      id-token: write
+      security-events: read
     uses: sidekick-labs/.github/.github/workflows/reusable-weekly-maintenance.yml@v1
     with:
       stack: node-app

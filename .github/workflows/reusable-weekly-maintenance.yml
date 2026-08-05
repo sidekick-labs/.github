@@ -7,6 +7,7 @@ name: Reusable Weekly Maintenance
 #   permissions:
 #     contents: write
 #     pull-requests: write
+#     issues: write           # required by the crash-heartbeat `alert` job
 #     id-token: write
 #     security-events: read   # required for the CodeQL alert review (read-only)
 #   jobs:
@@ -18,6 +19,12 @@ name: Reusable Weekly Maintenance
 #         run-sorbet-rbi: true
 #       secrets:
 #         claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+#
+# A reusable workflow's token is CAPPED BY THE CALLER's permissions, so a caller
+# that omits `issues: write` puts the whole workflow into `startup_failure` — the
+# grant is not optional. Where the caller declares `permissions:` on the job that
+# `uses:` this workflow, put it THERE: a job-level block fully replaces the
+# top-level one for that job.
 #
 # See docs/reusable-workflows.md for the full input contract.
 
@@ -634,3 +641,63 @@ jobs:
             tmp/maintenance/
           if-no-files-found: ignore
           retention-days: 90
+
+  # ── CRASH HEARTBEAT (house pattern, mirrors pin-sweep / the -ops beats).
+  # The maintenance job's own reporting only helps if the job REACHED it. When a
+  # run dies earlier — OIDC/token mint, runner death, quota, `bundle install`,
+  # `npm ci`, the Claude action timing out — the missed beat is invisible: nobody
+  # watches the Actions tab of a gem repo weekly. This lands the miss somewhere
+  # durable instead. Dedupes into ONE open issue per workflow slug, and closes it
+  # on recovery.
+  #
+  # NB: MOST repos calling this reusable have ISSUES DISABLED (the gem repos, the
+  # web apps, the sidekick repos — 18 of 20 callers as of 2026-08). Every `gh
+  # issue` call is therefore BEST-EFFORT (`|| true`), because a bare call under
+  # `set -euo pipefail` would abort on the very first `gh issue list` and turn a
+  # GREEN run RED. Where issues are unavailable the failure still surfaces as a
+  # `::warning::` annotation on the run — and the maintenance job's own red status
+  # remains the primary signal either way.
+  #
+  # CALLER CONTRACT: a reusable workflow's token is capped by the CALLER's
+  # permissions, so every caller must grant `issues: write` (top-level, or on the
+  # job that `uses:` this workflow when that job declares its own block).
+  # A caller that does not grant it lands in `startup_failure`.
+  alert:
+    needs: [maintenance]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    # Runaway-hang cap. A single gh issue list/create/comment/close step; finishes
+    # in seconds. 5 replaces the implicit 360-min (6h) default.
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Flag failure or clear on recovery
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # This job has no checkout, so pin the repo for gh explicitly.
+          GH_REPO: ${{ github.repository }}
+          FAILED: ${{ contains(needs.*.result, 'failure') }}
+          # Recovery is gated on an ACTUAL success: an all-skipped or all-cancelled
+          # run is not evidence that the beat came back, and closing on it would
+          # silently clear a still-broken beat.
+          SUCCEEDED: ${{ contains(needs.*.result, 'success') }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          WF="weekly-maintenance"
+          EXISTING="$(gh issue list --search "\"beat failure: ${WF}\" in:title" --state open --json number --jq '.[0].number // empty' 2>/dev/null || true)"
+          if [ "${FAILED}" != "true" ]; then
+            if [ "${SUCCEEDED}" = "true" ] && [ -n "$EXISTING" ]; then
+              gh issue close "$EXISTING" --comment "Recovered: ${WF} succeeded — ${RUN_URL}." 2>/dev/null || true
+            fi
+            exit 0
+          fi
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "Failed again: ${RUN_URL}" 2>/dev/null || true
+          else
+            gh issue create \
+              --title "beat failure: ${WF} ($(date -u +%F))" \
+              --body "The \`${WF}\` beat failed before it could report — the weekly dependency/security pass did NOT run to completion. See ${RUN_URL}" 2>/dev/null \
+              || echo "::warning::${WF} FAILED and issues are unavailable on this repo — see ${RUN_URL}"
+          fi
