@@ -169,6 +169,16 @@ jobs:
         if: steps.prep.outputs.paths != ''
         env:
           OWNER: ${{ github.repository_owner }}
+          # pinact resolves each pinned SHA back to its tags through the GitHub
+          # API. UNAUTHENTICATED that is ~60 requests/hour shared by every job
+          # running on the runner's public IP, so on a busy IP it 403s with
+          # "API rate limit exceeded for <ip>" and exits 3 — while the workflow
+          # being audited is perfectly pinned. The failure is random, says
+          # nothing about the repo it fails on, and since this became a REQUIRED
+          # status check it blocks every merge in that repo until someone
+          # re-runs it. Authenticated, the same calls draw on the 5,000/hour
+          # bucket. Read-only: the job keeps permissions contents:read.
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           cd "${RUNNER_TEMP}"
