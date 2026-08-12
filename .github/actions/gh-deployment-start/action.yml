@@ -76,18 +76,36 @@ runs:
           exit 1
         fi
 
+        # RETRY on failure. This step is deployment TRACKING, but a failure here
+        # aborts the whole deploy before the rollout — so a transient blip on the
+        # Deployments API stops an image reaching staging. That is backwards, and
+        # it happened twice on sidekick-web (sre-brain#417) with a green retry
+        # immediately after, which is the signature of a transient.
+        #
+        # Retrying is preferred over `continue-on-error`: it keeps the deployment
+        # RECORD (which gh-deployment-finish needs, and which is the point of the
+        # step) instead of silently proceeding without one. Semantics are
+        # unchanged — a persistent failure still fails the step, loudly.
+        #
         # Capture the WHOLE response rather than projecting with `--jq .id`, so a
         # 4xx/5xx body (the actual reason) survives into the log instead of being
         # thrown away by the projection.
-        if ! RESP=$(echo "$BODY" | gh api "repos/${{ github.repository }}/deployments" \
-          --method POST --input - 2>&1); then
-          echo "::error::GitHub Deployments API call failed: ${RESP}"
-          exit 1
-        fi
+        DEPLOY_ID=""
+        for attempt in 1 2 3; do
+          if RESP=$(echo "$BODY" | gh api "repos/${{ github.repository }}/deployments" \
+            --method POST --input - 2>&1); then
+            DEPLOY_ID=$(echo "$RESP" | jq -r '.id // empty' 2>/dev/null || true)
+            [ -n "$DEPLOY_ID" ] && break
+            echo "::warning::Deployments API returned no id on attempt ${attempt}/3. Response: ${RESP}"
+          else
+            echo "::warning::Deployments API call failed on attempt ${attempt}/3: ${RESP}"
+          fi
+          # No sleep after the final attempt — it would just pad the step.
+          [ "$attempt" -lt 3 ] && sleep $((attempt * 5))
+        done
 
-        DEPLOY_ID=$(echo "$RESP" | jq -r '.id // empty' 2>/dev/null || true)
         if [ -z "$DEPLOY_ID" ]; then
-          echo "::error::Deployments API returned no id. Response: ${RESP}"
+          echo "::error::Failed to create a GitHub Deployment after 3 attempts. Last response: ${RESP}"
           exit 1
         fi
         echo "deployment_id=$DEPLOY_ID" >> "$GITHUB_OUTPUT"
@@ -101,14 +119,25 @@ runs:
         LOG_URL: ${{ inputs.log_url }}
       run: |
         # Same reasoning as the step above — report the API's own error instead
-        # of dying on `set -e` with an empty log (sre-brain#417).
+        # of dying on `set -e` with an empty log, and retry a transient rather
+        # than aborting a deploy over a tracking blip (sre-brain#417).
         set -uo pipefail
         RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-        if ! RESP=$(gh api "repos/${{ github.repository }}/deployments/${{ steps.create.outputs.deployment_id }}/statuses" \
-          -f state="in_progress" \
-          -f environment="$ENVIRONMENT" \
-          -f description="Deploy started" \
-          -f log_url="${LOG_URL:-$RUN_URL}" 2>&1); then
-          echo "::error::Failed to mark deployment ${{ steps.create.outputs.deployment_id }} in_progress: ${RESP}"
+        OK=""
+        for attempt in 1 2 3; do
+          if RESP=$(gh api "repos/${{ github.repository }}/deployments/${{ steps.create.outputs.deployment_id }}/statuses" \
+            -f state="in_progress" \
+            -f environment="$ENVIRONMENT" \
+            -f description="Deploy started" \
+            -f log_url="${LOG_URL:-$RUN_URL}" 2>&1); then
+            OK="yes"
+            break
+          fi
+          echo "::warning::Marking deployment in_progress failed on attempt ${attempt}/3: ${RESP}"
+          [ "$attempt" -lt 3 ] && sleep $((attempt * 5))
+        done
+
+        if [ -z "$OK" ]; then
+          echo "::error::Failed to mark deployment ${{ steps.create.outputs.deployment_id }} in_progress after 3 attempts. Last response: ${RESP}"
           exit 1
         fi
