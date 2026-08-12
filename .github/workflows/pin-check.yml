@@ -212,7 +212,9 @@ jobs:
       # to a SHA that does not exist upstream passes both and then fails at run
       # time, on whichever path uses it (typically a release, long after merge).
       # This resolves every third-party pin against the action's own repository.
-      #   FAIL: the SHA is not any object in that repo.
+      #   FAIL: the SHA is a confirmed 404 in that repo (a genuinely dead pin).
+      #   WARN: the SHA could not be VERIFIED -- the API did not answer after retries.
+      #         Reported, never failed: unverifiable is not evidence of wrong.
       #   WARN: the SHA is an annotated tag OBJECT rather than a commit.
       #   WARN: the `# vX.Y.Z` label disagrees with the tag upstream -- expected
       #         whenever a moving tag like @v2 has advanced past the pinned commit.
@@ -235,8 +237,11 @@ jobs:
           It cannot tell a pin that resolves from one that does not. This resolves every
           third-party pin against the upstream repo and:
 
-            FAIL  the SHA is not any object in the action's repository (a dead pin -- the
+            FAIL  the SHA is a CONFIRMED 404 in the action's repository (a dead pin -- the
                   workflow will fail at run time, and only on whichever path uses it)
+            WARN  the SHA could not be verified: the API returned 403/5xx or never answered,
+                  after retries. Distinguishing this from a 404 is the difference between a
+                  real finding and blocking a PR over an upstream hiccup -- see classify()
             WARN  the SHA is an annotated TAG OBJECT rather than a commit. Whether the
                   runner resolves this is version-dependent, so it is reported, not failed.
             WARN  the `# vX.Y.Z` label does not match the tag upstream (drifted label;
@@ -250,6 +255,7 @@ jobs:
           import os
           import re
           import sys
+          import time
           import urllib.error
           import urllib.request
 
@@ -283,13 +289,27 @@ jobs:
                   "User-Agent": "pin-integrity-check",
                   **({"Authorization": f"Bearer {TOKEN}"} if TOKEN else {}),
               })
-              try:
-                  with urllib.request.urlopen(req, timeout=20) as r:
-                      return r.status, json.load(r)
-              except urllib.error.HTTPError as e:
-                  return e.code, None
-              except Exception:
-                  return 0, None
+              # Retry only what is worth retrying. A 404 is an ANSWER and must not be
+              # retried into ambiguity; a 403/5xx/timeout is the API failing to answer,
+              # and retrying is the difference between a real finding and a false one.
+              # Status 0 means the request never completed (timeout, DNS, reset).
+              last = (0, None)
+              for attempt in range(3):
+                  try:
+                      with urllib.request.urlopen(req, timeout=20) as r:
+                          return r.status, json.load(r)
+                  except urllib.error.HTTPError as e:
+                      # 404 and 401 are both ANSWERS: the ref is absent, or the token is
+                      # not valid. Neither becomes true on a retry, and retrying a
+                      # definite answer into ambiguity would be this bug in miniature.
+                      if e.code in (404, 401):
+                          return e.code, None
+                      last = (e.code, None)
+                  except Exception:
+                      last = (0, None)
+                  if attempt < 2:
+                      time.sleep(1.5 * (attempt + 1))
+              return last
 
 
           def tag_sha(owner, repo, tag):
@@ -307,7 +327,7 @@ jobs:
 
 
           def classify(owner, repo, sha):
-              """Classify a pinned SHA: ("commit"|"tag-object"|"dead", detail).
+              """Classify a pinned SHA: ("commit"|"tag-object"|"dead"|"unknown", detail).
 
               A pin must name a commit. Some pins instead name the annotated tag OBJECT
               that a version tag points at -- a plausible-looking mistake, since
@@ -329,7 +349,37 @@ jobs:
                   if target:
                       return ("tag-object", target)
 
-              return ("dead", "")
+              # "Absent" and "could not ask" are different answers, and conflating them
+              # is how a CORRECT pin gets reported as DOES NOT EXIST. Observed on
+              # sidekick-web#1753: one transient failure convicted
+              # actions/github-script@3a2844b7 — the real, dereferenced commit of the
+              # annotated v9.0.0 tag and the head of that repo's main branch. Re-running
+              # the identical job passed with no change, and 16 other pins resolved in the
+              # same run, so it was one blip rather than an outage.
+              #
+              # Only a definite 404 from BOTH probes is a dead pin. Anything else is
+              # unknown, which is a warning to look at and not a gate to fail: an
+              # unverifiable pin is not evidence of a bad pin. This mirrors the rule
+              # /release-all already states -- an unreadable probe is UNKNOWN, never a
+              # clean bill of health -- applied in the other direction.
+              # DEAD means both probes gave a DEFINITE answer and neither confirms the
+              # sha. A 404 is definite; so is a 200 that came back describing something
+              # else. What is not definite is 403/5xx/no-response — that is the whole
+              # point of this function.
+              def answered(status):
+                  return status in (200, 401, 404)
+
+              if answered(st) and answered(st2):
+                  return ("dead", "")
+              # `200` in this string would read as success to whoever is triaging the
+              # warning, so a 200 that carried no usable object sha is labelled for what
+              # it was rather than for its status code.
+              def described(status):
+                  if status == 0:
+                      return "no-response"
+                  return "200-no-usable-body" if status == 200 else str(status)
+
+              return ("unknown", f"commits={described(st)} git/tags={described(st2)}")
 
 
           def collect(paths):
@@ -368,7 +418,7 @@ jobs:
                   print("No third-party SHA pins found.")
                   return 0
 
-              dead, drifted, ok = [], [], 0
+              dead, unknown, drifted, ok = [], [], [], 0
               resolved_cache = {}
 
               for (owner, repo, sha, label), sites in sorted(pins.items()):
@@ -378,6 +428,9 @@ jobs:
                   kind, detail = resolved_cache[ck]
                   if kind == "dead":
                       dead.append((owner, repo, sha, label, sites))
+                      continue
+                  if kind == "unknown":
+                      unknown.append((owner, repo, sha, label, sites, detail))
                       continue
                   ok += 1
                   if kind == "tag-object":
@@ -398,13 +451,25 @@ jobs:
                   print(f"::warning::{owner}/{repo}@{sha[:12]} is labelled '# {label}' but {why}. "
                         f"({', '.join(sites)})")
 
+              for owner, repo, sha, label, sites, detail in unknown:
+                  print(f"::warning::{owner}/{repo}@{sha[:12]} COULD NOT BE VERIFIED upstream "
+                        f"after retries ({detail})"
+                        + (f", labelled '# {label}'" if label else "")
+                        + f". This is NOT evidence the pin is wrong -- the API did not answer. "
+                        f"({', '.join(sites)})")
+
               for owner, repo, sha, label, sites in dead:
                   print(f"::error::{owner}/{repo}@{sha} DOES NOT EXIST in that repository"
                         + (f" (labelled '# {label}')" if label else "")
                         + f". Referenced at: {', '.join(sites)}")
 
               print(f"\npin integrity: {ok} pin(s) resolved, {len(drifted)} label warning(s), "
-                    f"{len(dead)} dead pin(s).")
+                    f"{len(unknown)} unverifiable, {len(dead)} dead pin(s).")
+
+              if unknown:
+                  print("\nAn unverifiable pin is reported, not failed. The check could not reach "
+                        "a verdict, and failing the gate on that turns an upstream hiccup into a "
+                        "blocked PR pointing at a pin that is very likely fine. Re-run to retry.")
 
               if dead:
                   print("\nA dead pin is invisible to the pinning gate -- the ref is correctly "
