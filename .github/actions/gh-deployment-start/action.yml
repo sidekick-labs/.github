@@ -52,22 +52,42 @@ runs:
         PROD_ENV: ${{ inputs.production_environment }}
         DESCRIPTION: ${{ inputs.description }}
       run: |
-        set -euo pipefail
+        # NOT `set -e`. It was, and that made this step fail SILENTLY: a non-zero
+        # jq or gh inside a command substitution killed the step BEFORE the
+        # `::error::` guard below could run, so the guard was unreachable for
+        # every likely failure mode and only fired on the one that never happens
+        # (HTTP 200 carrying an empty id). A real failure on sidekick-web
+        # produced a 0.34s step with no jq error, no gh error, and no `::error::`
+        # line at all — undiagnosable from the log. See sre-brain#417.
+        set -uo pipefail
         DESC="${DESCRIPTION:-Deploy for $SHA}"
+
         # `required_contexts` must be a JSON array and `production_environment`
         # a JSON boolean, so build the body with jq and pipe it to gh.
-        BODY=$(jq -n \
+        # PROD_ENV is echoed QUOTED on failure: an empty value and a literal
+        # `false` are the two candidates here and they must be distinguishable.
+        if ! BODY=$(jq -n \
           --arg ref "$SHA" \
           --arg env "$ENVIRONMENT" \
           --argjson prod "$PROD_ENV" \
           --arg desc "$DESC" \
-          '{ref: $ref, environment: $env, production_environment: $prod, auto_merge: false, required_contexts: [], description: $desc}')
+          '{ref: $ref, environment: $env, production_environment: $prod, auto_merge: false, required_contexts: [], description: $desc}' 2>&1); then
+          echo "::error::Failed to build the deployment payload (production_environment='${PROD_ENV}', environment='${ENVIRONMENT}'): ${BODY}"
+          exit 1
+        fi
 
-        DEPLOY_ID=$(echo "$BODY" | gh api repos/${{ github.repository }}/deployments \
-          --method POST --input - --jq '.id')
+        # Capture the WHOLE response rather than projecting with `--jq .id`, so a
+        # 4xx/5xx body (the actual reason) survives into the log instead of being
+        # thrown away by the projection.
+        if ! RESP=$(echo "$BODY" | gh api "repos/${{ github.repository }}/deployments" \
+          --method POST --input - 2>&1); then
+          echo "::error::GitHub Deployments API call failed: ${RESP}"
+          exit 1
+        fi
 
-        if [ -z "$DEPLOY_ID" ] || [ "$DEPLOY_ID" = "null" ]; then
-          echo "::error::Failed to create GitHub deployment"
+        DEPLOY_ID=$(echo "$RESP" | jq -r '.id // empty' 2>/dev/null || true)
+        if [ -z "$DEPLOY_ID" ]; then
+          echo "::error::Deployments API returned no id. Response: ${RESP}"
           exit 1
         fi
         echo "deployment_id=$DEPLOY_ID" >> "$GITHUB_OUTPUT"
@@ -80,10 +100,15 @@ runs:
         ENVIRONMENT: ${{ inputs.environment }}
         LOG_URL: ${{ inputs.log_url }}
       run: |
-        set -euo pipefail
+        # Same reasoning as the step above — report the API's own error instead
+        # of dying on `set -e` with an empty log (sre-brain#417).
+        set -uo pipefail
         RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-        gh api "repos/${{ github.repository }}/deployments/${{ steps.create.outputs.deployment_id }}/statuses" \
+        if ! RESP=$(gh api "repos/${{ github.repository }}/deployments/${{ steps.create.outputs.deployment_id }}/statuses" \
           -f state="in_progress" \
           -f environment="$ENVIRONMENT" \
           -f description="Deploy started" \
-          -f log_url="${LOG_URL:-$RUN_URL}"
+          -f log_url="${LOG_URL:-$RUN_URL}" 2>&1); then
+          echo "::error::Failed to mark deployment ${{ steps.create.outputs.deployment_id }} in_progress: ${RESP}"
+          exit 1
+        fi
