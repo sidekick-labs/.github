@@ -91,9 +91,6 @@ jobs:
         with:
           token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
 
-      - name: Log in to DOCR
-        run: doctl registry login --expiry-seconds 1200
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
@@ -119,6 +116,49 @@ jobs:
             echo "$TAGS"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
+
+      # Deliberately the LAST step before the build, and deliberately derived
+      # from the job's own timeout budget rather than a fixed number.
+      #
+      # This was `--expiry-seconds 1200` — exactly 20 minutes — while the
+      # perception-image caller (sidekick-inference build-perception.yml) passes
+      # `timeout: 40`. A ~7.25 GB image routinely takes longer than the token
+      # lived, and because docker/build-push-action builds AND pushes in a single
+      # action invocation, the credential minted before the build is the one the
+      # blob upload has to use at the end. It expired mid-push:
+      #
+      #   ERROR: failed to build: failed to solve: failed to fetch oauth token:
+      #   unexpected status from GET request to
+      #   https://api.digitalocean.com/v2/registry/auth?...: 401 Unauthorized
+      #
+      # Measured on this step: failures at 33.2 / 28.3 / 22.8 / 22.4 min,
+      # successes at 14.3 / 10.8 min. Every failure crossed 20 minutes; every
+      # success came in under it. (sidekick-labs/sre-brain#400)
+      #
+      # Why the credential lifetime and not a re-login: there is no seam to
+      # re-authenticate in. Build and push are one step, so a "log in again just
+      # before pushing" step cannot exist without splitting the action. Moving
+      # this step to sit immediately before the build reclaims the buildx-setup
+      # and tag-generation time, but that is a minute or two — only a credential
+      # that outlives the whole build actually fixes it.
+      #
+      # `timeout + 15` minutes bounds it by the thing that already bounds the
+      # job: if the credential outlives the job timeout, it cannot expire while
+      # the job is still running, and the failure mode becomes a clean timeout
+      # instead of a confusing 401. The 30-minute floor covers callers that
+      # leave the default. DOCR's documented ceiling is 1576800000s (~50 years;
+      # the API rejects 1576800001 with "cannot set an expiration greater than
+      # 50 years"), and GitHub caps a job at 6 hours (21600s), so any value we
+      # can reach here is orders of magnitude inside the limit.
+      - name: Log in to DOCR
+        env:
+          JOB_TIMEOUT_MINUTES: ${{ inputs.timeout }}
+        run: |
+          set -euo pipefail
+          EXPIRY=$(( (JOB_TIMEOUT_MINUTES + 15) * 60 ))
+          if [ "$EXPIRY" -lt 1800 ]; then EXPIRY=1800; fi
+          echo "Minting DOCR credentials valid for ${EXPIRY}s (job timeout ${JOB_TIMEOUT_MINUTES}m)."
+          doctl registry login --expiry-seconds "$EXPIRY"
 
       - name: Build and push image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
