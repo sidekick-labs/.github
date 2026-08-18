@@ -109,6 +109,41 @@ def fetch_workflow_paths(repo: str) -> dict[int, str]:
     return {w["id"]: w.get("path", "") for w in workflows}
 
 
+def failed_runs_path(repo: str, workflow_id: int, iso: str, per_page: int = 20) -> str:
+    """API path for a WORKFLOW-SCOPED list of that workflow's failed runs.
+
+    LOAD-BEARING: the workflow scoping must live in the PATH
+    (``/actions/workflows/{workflow_id}/runs``) and NOT in a ``?workflow_id=``
+    query parameter on ``/actions/runs``. ``workflow_id`` is not a supported
+    query parameter there — GitHub SILENTLY IGNORES it and returns 200 with the
+    repo-wide result set. So the query form looks correct, never errors, and
+    quietly answers a different question.
+
+    That is exactly what it did: ``top_failing_jobs`` (the "top failing jobs"
+    section every ``[ci-audit]`` issue leads with, and the field a human reads
+    first) was attributing whatever jobs failed anywhere in the REPO to one
+    named workflow. Positive control on ``sidekick-labs/sidekick-web``, 7-day
+    window, ``status=failure``, i.e. exactly the params below:
+
+        ?workflow_id=202404520   (real "CI" id)   -> total_count 40
+        ?workflow_id=257196481   (real "E2E" id)  -> total_count 40
+        ?workflow_id=999999999   (bogus id)       -> total_count 40
+        no workflow_id at all                     -> total_count 40
+        /actions/workflows/202404520/runs         -> total_count 19  <- CI
+        /actions/workflows/257196481/runs         -> total_count  5  <- E2E
+
+    A bogus id returning the same count as a real one is the tell. Do not
+    "simplify" this back onto ``/actions/runs``.
+
+    Note ``fetch_runs`` and ``has_active_runs`` below use bare ``/actions/runs``
+    deliberately — they WANT the repo-wide set and pass no ``workflow_id``.
+    """
+    return (
+        f"/repos/{ORG}/{repo}/actions/workflows/{workflow_id}/runs"
+        f"?status=failure&created=>={iso}&per_page={per_page}"
+    )
+
+
 def fetch_runs(repo: str, since: datetime) -> list[dict]:
     iso = since.strftime("%Y-%m-%dT%H:%M:%SZ")
     path = (
@@ -344,11 +379,9 @@ def collect(scope: str, window_days: int, deep_failures: bool) -> dict:
         )[:10]
         for stats in top_failing:
             iso = since.strftime("%Y-%m-%dT%H:%M:%SZ")
-            path = (
-                f"/repos/{ORG}/{stats.repo}/actions/runs"
-                f"?workflow_id={stats.workflow_id}&status=failure"
-                f"&created=>={iso}&per_page=20"
-            )
+            # Workflow-scoped by PATH, not by a ?workflow_id= query param that
+            # GitHub silently ignores — see failed_runs_path's docstring.
+            path = failed_runs_path(stats.repo, stats.workflow_id, iso)
             try:
                 data = gh_api(path)
                 failed_runs = data.get("workflow_runs", []) if isinstance(data, dict) else []
