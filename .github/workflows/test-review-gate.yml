@@ -14,17 +14,22 @@ name: Test review-gate logic
 # Network-free and cheap. Mirrors the path-filtered, per-area pattern of
 # test-audit-logic.yml / test-release-thread.yml.
 #
-# It watches THREE paths, and each one earns its place:
+# It watches FOUR paths, and each one earns its place:
 #   * the composite action — where the review logic actually lives;
 #   * claude-code-review.yml — the shim, asserted to stay thin (logic there is
 #     unmergeable to change, because claude-code-action validates that file
 #     against the default branch);
+#   * pr.yml — this repo's own caller, asserted to honour the caller contract
+#     (no path filter, `ready_for_review` present, no job-level `if:`), because
+#     the review context is a REQUIRED check here and a caller regression makes
+#     PRs unmergeable rather than merely unreviewed;
 #   * the test itself.
 on:
   pull_request:
     paths:
       - '.github/actions/claude-review/action.yml'
       - '.github/workflows/claude-code-review.yml'
+      - '.github/workflows/pr.yml'
       - 'tests/review-gate-exit-codes.py'
       - '.github/workflows/test-review-gate.yml'
   push:
@@ -32,6 +37,7 @@ on:
     paths:
       - '.github/actions/claude-review/action.yml'
       - '.github/workflows/claude-code-review.yml'
+      - '.github/workflows/pr.yml'
       - 'tests/review-gate-exit-codes.py'
       - '.github/workflows/test-review-gate.yml'
 

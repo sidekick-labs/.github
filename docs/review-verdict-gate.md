@@ -87,17 +87,18 @@ That gap is structural, not an oversight, and it is mitigated two ways:
    `secrets.`/`vars.` reference (those resolve to **empty** inside a composite
    rather than erroring, so a blank model id or a "missing" token would look like
    an outage), and asserts every `inputs.*` read is declared.
-2. **It is being landed as two PRs**, which removes the risk rather than bounding
-   it. **PR A** adds only the composite (leaving the workflow untouched, so
-   `claude-code-action` validates fine, the review lane reviews it normally, and
-   merging advances `v3` to a commit where the composite exists). **PR B** then
-   flips the shim to resolve it. Only B trips the guard, and only B needs the
-   admin merge.
+2. **It was landed as two PRs**, which removed the risk rather than bounding it.
+   **PR A** (`#149`, merged `b55b0e7`) added only the composite, leaving the
+   workflow untouched — so `claude-code-action` validated fine and the review lane
+   reviewed it normally: an 8m12s review, five ADVISORY findings, no BLOCKING.
+   Merging it advanced `v3` to `b55b0e7`, a commit where
+   `.github/actions/claude-review/action.yml` exists (verified by reading the file
+   at the tag, not by assuming the tag moved). **PR B** then flipped the shim.
 
-   Until B lands, the workflow carries its own duplicate copy of the
-   orchestration. That duplication is deliberate and short-lived — folding the
-   shim change into A would have made A unreviewable, which is the whole problem
-   being solved.
+   Only B trips the guard, and only B needs the admin merge. Between A and B the
+   workflow carried a duplicate copy of the orchestration — deliberate and
+   short-lived, because folding the shim change into A would have made A
+   unreviewable, which is the whole problem being solved.
 
 The no-op is now classified rather than lumped in with a missing marker: the
 verdict step reads the action's `conclusion` output, which the source shows is set
