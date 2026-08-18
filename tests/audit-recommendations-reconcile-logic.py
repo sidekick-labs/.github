@@ -5,9 +5,11 @@ Self-contained, no network: loads recommendations.py / open_issues.py directly,
 feeds synthetic findings, and asserts the issue-worthy/digest split, org-shared
 coalescing, and the reconcile pass's safety rails (marker-scoped + scanned-scoped).
 Run: `python3 tests/audit-recommendations-reconcile-logic.py` (exits non-zero on
-failure). Not wired into PR CI yet — see the PR for the follow-up suggestion.
+failure). Gated in PR CI by .github/workflows/test-audit-logic.yml, which
+path-filters on `audit/**` and on this file.
 """
 import importlib.util
+import inspect
 import os
 import sys
 
@@ -148,7 +150,43 @@ def test_wasted_failed_minutes():
     print("wasted_failed_minutes (sre-brain#211) OK")
 
 
+def test_failed_runs_path_is_workflow_scoped():
+    """The deep-inspection path must scope the workflow in the PATH.
+
+    ``?workflow_id=`` is not a supported query parameter on ``/actions/runs``:
+    GitHub returns 200 and silently ignores it, so the old form computed
+    "top failing jobs" repo-wide while presenting it as per-workflow. Verified
+    live against sidekick-web (see failed_runs_path's docstring): a BOGUS
+    workflow id returned the same total_count as either real id, and as no
+    param at all. This test fails against that old form.
+    """
+    iso = "2026-08-11T00:00:00Z"
+    path = audit.failed_runs_path("sidekick-web", 202404520, iso)
+
+    # The supported, actually-filtering form.
+    assert "/repos/sidekick-labs/sidekick-web/actions/workflows/202404520/runs" in path, path
+    # The silently-ignored form must be gone: both the param and the bare
+    # collection endpoint it hung off.
+    assert "workflow_id=" not in path, f"?workflow_id= is silently ignored by GitHub: {path}"
+    assert "/actions/runs" not in path, f"must not use the repo-wide collection: {path}"
+    # Filters we still rely on are query params (these ARE supported there).
+    for expected in ("status=failure", f"created=>={iso}", "per_page=20"):
+        assert expected in path, f"missing {expected} in {path}"
+
+    # per_page is a parameter, not a hardcode.
+    assert "per_page=5" in audit.failed_runs_path("sidekick-harness", 1, iso, per_page=5)
+
+    # Guard the deliberate exceptions: these two WANT the repo-wide set, so they
+    # must keep using /actions/runs and must never grow a ?workflow_id=.
+    for fn in (audit.fetch_runs, audit.has_active_runs):
+        src = inspect.getsource(fn)
+        assert "/actions/runs" in src, fn.__name__
+        assert "workflow_id" not in src, f"{fn.__name__} grew an ignored ?workflow_id="
+    print("failed_runs_path is workflow-scoped by path (fabricated attribution) OK")
+
+
 if __name__ == "__main__":
+    test_failed_runs_path_is_workflow_scoped()
     test_split_thresholds()
     test_coalesce_shared()
     test_burner_accepted_spend()
