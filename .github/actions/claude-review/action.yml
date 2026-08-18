@@ -1,0 +1,852 @@
+name: 'Claude review orchestration'
+description: >-
+  Runs the Claude Code review for a pull request and maps its VERDICT onto the
+  calling job's conclusion. All of the review orchestration lives here rather
+  than in the calling workflow — see the deadlock note below.
+
+# ---------------------------------------------------------------------------
+# WHY THIS LOGIC LIVES IN A COMPOSITE ACTION AND NOT IN THE WORKFLOW FILE
+#
+# `anthropics/claude-code-action` exchanges its OIDC token for a GitHub App token
+# at `api.anthropic.com/api/github/github-app-token-exchange`. That endpoint
+# VALIDATES, server-side, that the workflow file the job is running from exists on
+# the repository's DEFAULT BRANCH with IDENTICAL CONTENT. On a mismatch it returns
+# `workflow_not_found_on_default_branch`; the action catches it
+# (`WorkflowValidationSkipError`), logs "Skipping action due to workflow
+# validation", sets an internal `skipped_due_to_workflow_validation_mismatch`
+# output and RETURNS — leaving the step concluding SUCCESS having done nothing.
+#
+# That condition is FALSE BY CONSTRUCTION on any PR that edits the workflow file
+# containing the action. Before the verdict gate that was invisible: the step went
+# green, `Verify a review actually ran` only fires when the step FAILED, and the
+# job reported success over a review that never happened. `.github#127` merged
+# that way, carrying six "Claude encountered an error" comments and a green tick.
+# With fail-closed verdicts the same condition correctly turns the check RED —
+# which would have made every future edit to the review workflow unmergeable.
+#
+# Moving the orchestration into a composite action breaks the deadlock
+# permanently: editing the review LOGIC no longer edits the file the server
+# validates. The calling workflow is now a thin, near-frozen shim.
+#
+# WHAT WAS CONFIRMED, AND HOW (measured against real runs, not assumed):
+#   * The validation is server-side, keyed on the OIDC claims — read from the
+#     action's own `src/github/token.ts` at the pinned SHA.
+#   * It is NOT "any changed workflow file". `.github#146` changed
+#     `.github/workflows/pin-check.yml` and its review ran normally: zero
+#     validation failures in the run log, two real review comments posted.
+#   * It IS the workflow carrying the action step. `.github#127` changed only
+#     `claude-code-review.yml` (not the caller `pr.yml`) and hit the guard, so the
+#     validated artefact is that workflow, not the top-level caller.
+#   * COMPOSITE ACTIONS ARE NOT VALIDATED. `.github#145` and `#147` both changed
+#     `.github/actions/gh-deployment-start/action.yml` and their reviews ran
+#     normally — zero validation failures, real review comments posted. That pair
+#     is the direct evidence this refactor rests on.
+#
+# CONSEQUENCE TO KEEP IN MIND: the calling workflow references this action at a
+# moving major tag, so a PR that edits THIS file is reviewed by the version
+# currently on `main`, not by its own. The deterministic suite
+# (`tests/review-gate-exit-codes.py`) is what gates changes to this file, and it
+# runs against the PR's copy. Do not weaken it.
+# ---------------------------------------------------------------------------
+
+inputs:
+  claude_code_oauth_token:
+    description: >-
+      The shared Claude OAuth token. Deliberately NOT `required` — it is legitimately
+      absent on fork and Dependabot PRs, and the token-check step below distinguishes
+      that from an org-level credential failure.
+    required: false
+    default: ''
+  github_token:
+    description: 'Token used for `gh` reads and the skip/verdict comment writes.'
+    required: true
+  claude_model:
+    description: >-
+      Model id. Resolved by the CALLER, because the `vars` context is not available
+      inside a composite action.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # ---------------------------------------------------------------------
+    # IS THERE ANYTHING HERE A REVIEW COULD ACT ON?
+    #
+    # This step is the relocated `paths-ignore:` list. It is NOT a new policy —
+    # it reproduces, byte for byte in effect, the exclusions the thin callers
+    # already applied, and it exists because those exclusions were applied in
+    # the WRONG PLACE once the context became required: a `paths-ignore` match
+    # suppresses the TRIGGER, so no check run is created and the PR hangs. Three
+    # docs-only PRs merged into sidekick-companion-kit in the last 30, and three
+    # into sidekick-inference in the last 50, would have been unmergeable.
+    #
+    # Moving the list here keeps the saving (no runner-minutes on Claude, no
+    # LLM spend) while the job still runs and still reports. It also collapses
+    # 21 copy-pasted caller lists into one definition — the same drift argument
+    # as the mechanical classifier below, and the same one `assert_agent_ran.mjs`
+    # made: one invariant maintained in twenty-one places is maintained in none.
+    #
+    # NOT A MECHANICAL SKIP, and deliberately named differently. The mechanical
+    # classifier's three-part test asks whether a DETERMINISTIC GATE already
+    # provides the guarantee review would provide. Nothing asserts a
+    # documentation change is correct. The honest statement is narrower: these
+    # paths carry no code for this reviewer to reason about, and they have been
+    # excluded since long before the check was a gate. Widening this list is a
+    # policy change and needs the convention's test; it is not a place to park
+    # work you would rather not have reviewed.
+    #
+    # PATHS-IGNORE SEMANTICS ARE REPRODUCED EXACTLY: GitHub skips only when
+    # EVERY changed file matches the list. One reviewable file anywhere in the
+    # diff means the whole PR is reviewed. `grep -qv` is that test.
+    #
+    # ONE DELIBERATE TIGHTENING: `.github/dependabot.yml` was on the callers'
+    # ignore list and is not on this one, because `.github/**` is already a hard
+    # never-skip invariant three inches below (the workflow IS the gate). Two
+    # skip classes disagreeing about `.github/` is exactly the drift this
+    # consolidation removes, and the tightening can only ever cause MORE review,
+    # never a false green.
+    #
+    # FAIL-CLOSED: an unreadable diff reviews.
+    # ---------------------------------------------------------------------
+    - name: Classify — is there anything here to REVIEW?
+      id: reviewable
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        REPO: ${{ github.repository }}
+        PR: ${{ github.event.pull_request.number }}
+      shell: bash
+      run: |
+        set -uo pipefail
+
+        # `skip` is written EXACTLY ONCE, by review_it() or at the end.
+        review_it() {
+          echo "reviewable: $1"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        }
+
+        # The relocated caller list. Anchored per GitHub's own glob semantics:
+        # `**/x` matches at any depth, `docs/**` only from the repo root.
+        NOT_REVIEWABLE='(\.md$)|(^docs/)|((^|/)Gemfile\.lock$)|((^|/)package-lock\.json$)|((^|/)yarn\.lock$)|((^|/)pnpm-lock\.yaml$)|((^|/)gradle\.lockfile$)|(^gradle/wrapper/)|(^sorbet/rbi/)'
+
+        if ! files=$(gh pr diff "$PR" --repo "$REPO" --name-only 2>/dev/null) || [ -z "$files" ]; then
+          echo "::warning::Could not read the changed-file list for PR #${PR}; reviewing rather than assuming there is nothing to review."
+          review_it "changed-file list unreadable (fail-closed)"
+        fi
+
+        # The workflow IS the gate. Never skippable, by any classifier.
+        if printf '%s\n' "$files" | grep -qE '^\.github/'; then
+          review_it "touches .github/ (the gate itself)"
+        fi
+
+        # paths-ignore semantics: ANY file outside the list makes this reviewable.
+        if printf '%s\n' "$files" | grep -qvE "$NOT_REVIEWABLE"; then
+          review_it "at least one changed file carries reviewable content"
+        fi
+
+        echo "skip=true" >> "$GITHUB_OUTPUT"
+        n=$(printf '%s\n' "$files" | wc -l | tr -d ' ')
+        echo "NO REVIEWABLE CONTENT: all $n changed file(s) are documentation or generated artifacts."
+        echo "::notice title=Claude review skipped (no reviewable content)::All ${n} changed file(s) are documentation or generated lock/RBI artifacts. This green check means NO REVIEW WAS NEEDED, not that a review passed."
+        {
+          echo "### :page_facing_up: Claude Code Review skipped — no reviewable content"
+          echo
+          echo "All **${n}** changed file(s) are documentation (\`*.md\`, \`docs/\`) or generated"
+          echo "artifacts (lockfiles, \`gradle/wrapper/\`, \`sorbet/rbi/\`)."
+          echo
+          echo "These paths were excluded by the callers' \`paths-ignore\` long before this"
+          echo "check was a gate. The exclusion now lives in the reusable so the job still"
+          echo "**reports the context** — a \`paths-ignore\` match suppresses the trigger"
+          echo "entirely, which leaves a required check forever-pending."
+          echo
+          echo "This green check means *no review was needed*, *not* that a review passed."
+        } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+    # Secrets aren't allowed in `if:` expressions, so route through env and
+    # short-circuit downstream steps when the token is missing.
+    #
+    # A MISSING TOKEN IS NOT ALWAYS BENIGN, and conflating the two cases was the
+    # second green-that-reviewed-nothing hole (core-platform-brain#370, sibling of
+    # #340). Every step below — INCLUDING the `Verify a review actually ran` gate
+    # added by #127 — is conditioned on `skip != 'true'`, so a blanket skip
+    # disarms the gate itself and the job reports SUCCESS with no review. That is
+    # the exact failure #127 exists to prevent, reached by a different branch.
+    #
+    # So the two cases are separated:
+    #
+    #   STRUCTURALLY tokenless — a fork PR (GitHub withholds secrets from forks)
+    #     or a dependabot PR (same-repo, but secrets are withheld from dependabot
+    #     by default). Nothing is wrong; skip and stay green. Hard-failing here
+    #     would make every fork PR unmergeable.
+    #
+    #   UNEXPECTEDLY tokenless — a same-repo, non-dependabot PR in a repo that
+    #     calls this reusable, i.e. one that is supposed to be wired. The secret
+    #     is unset, revoked, renamed or expired at org level. FAIL, because the
+    #     alternative is certifying a review that cannot happen — and an
+    #     org-level credential failure hits all calling repos at once, silently,
+    #     exactly as the spend cap did in #340.
+    - name: Check for Claude OAuth token
+      id: token-check
+      # Gated on the reviewability classifier so a docs-only PR does not go RED
+      # during an org-token outage. A skipped step's `outputs.skip` is empty, so
+      # every downstream step carries the reviewable condition too rather than
+      # relying on this one to have run.
+      if: steps.reviewable.outputs.skip != 'true'
+      env:
+        CLAUDE_CODE_OAUTH_TOKEN: ${{ inputs.claude_code_oauth_token }}
+        # `head.repo.fork` is the discriminator, NOT the secret's absence — the
+        # absence is the symptom both cases share.
+        IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
+        PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+      shell: bash
+      run: |
+        if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+        elif [ "${IS_FORK:-}" = "true" ] || [ "${PR_AUTHOR:-}" = "dependabot[bot]" ]; then
+          # DURABLE SKIP RECORD. Now that this check is a REQUIRED gate, a green
+          # tick asserts "auto-merge may proceed" — so the reason it is green has
+          # to survive the run. `::notice` puts it on the check itself in the PR
+          # UI (a distinguishable check output, readable after the fact without
+          # opening the log), alongside the step summary. Deliberately NOT a PR
+          # comment on this path: dependabot volume would make it noise, and a
+          # dependabot PR is already decided by semver + the repo's own tests.
+          reason="fork PR"
+          [ "${PR_AUTHOR:-}" = "dependabot[bot]" ] && reason="dependabot PR"
+          echo "::notice title=Claude review skipped (no token by design)::${reason} — GitHub withholds secrets here, so no review ran. This green check means NO REVIEW WAS NEEDED, not that a review passed."
+          {
+            echo "### :recycle: Claude Code Review skipped — no token by design"
+            echo
+            echo "**Why:** ${reason}. GitHub withholds \`CLAUDE_CODE_OAUTH_TOKEN\` from forks and"
+            echo "from Dependabot, so the review could not have run."
+            echo
+            echo "This green check means *no review was needed*, *not* that a review passed."
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "::error::CLAUDE_CODE_OAUTH_TOKEN is unavailable on a same-repo, non-dependabot PR. This repo calls the shared review workflow, so the secret is expected to be present: it is unset, revoked, renamed or expired at org level. Failing rather than reporting a green check for a review that never ran (core-platform-brain#370)."
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+          exit 1
+        fi
+
+    # ---------------------------------------------------------------------
+    # MECHANICAL PRs — skip review when a deterministic gate already decided.
+    #
+    # A PR is mechanical only when a deterministic check already provides the
+    # guarantee review would provide, so a reviewer could not add information. Not
+    # "small", not "boring", not "a bot opened it". The canonical case is a
+    # `sync/shared-tools` PR: `sync-check` asserts the vendored files are
+    # BYTE-IDENTICAL to octo-brain, where that diff was already reviewed when it
+    # landed. Reviewing the copy in six spokes reviews one diff seven times. So the
+    # rule is "review the canonical, not the copies".
+    #
+    # This replaces per-repo `if:` expressions on the caller jobs, which had already
+    # drifted: sre-brain skipped NOTHING despite ~19 review runs/week, octo-brain
+    # omitted `weekly/`, and no repo covered `sync/` at all. One invariant maintained
+    # in seven places is maintained in none — same lesson as octo-brain#295's guard.
+    #
+    # Two failure modes this deliberately avoids:
+    #
+    #   A GREEN CHECK THAT REVIEWED NOTHING. The `Verify a review actually ran` gate
+    #     below (#127) only runs when the review step FAILED, so a skipped review step
+    #     skips it too — every new skip branch is a potential false green, the same
+    #     hole #127 closed, reached from a different direction. Hence the step summary
+    #     write below: skipping may be correct, but an UNEXPLAINED green is not.
+    #
+    #   A BRANCH NAME AS AN AUTHORISATION TOKEN. A prefix is attacker-chosen and
+    #     asserts nothing on its own. The skip requires bot authorship AND the prefix
+    #     AND the changed paths to agree. Prefix alone would make "name your branch
+    #     sync/" a route to unreviewed code — a cost saving turned into an attack
+    #     surface. `.github/**` is never mechanical: the workflow IS the gate, and
+    #     reviewing the checker is the one place review is irreplaceable.
+    #
+    # FAIL-CLOSED: if the changed-file list can't be read, this REVIEWS. The safe
+    # default is to spend money, not to skip a gate (octo-brain#295 — a check that
+    # cannot say "I don't know" eventually says "fine"; here it must say "review").
+    #
+    # Note the step-gating is LOAD-BEARING, not merely prudent: `Claude Code Review /
+    # Claude Code Review` is a REQUIRED status check on THIS repo's own `main`. A
+    # job-level `if:` here would report that context as skipped, which GitHub treats as
+    # not-satisfied, and every PR to this repo would sit forever-pending — the failure
+    # the note at the top of this job already warns about.
+    #
+    # Rationale: measured over 7d, PR review is the estate's single largest consumer of
+    # shared Claude capacity, and mechanical PRs are the lowest-value slice of it. Figures
+    # deliberately omitted — this reusable lives in a PUBLIC repo (see the redaction note
+    # in the verify step below, which withholds cost/usage for the same reason); the
+    # analysis is in the private octo-brain#326. Policy + the three-part test: the
+    # workspace convention `mechanical-pr-review-skip.md`.
+    # ---------------------------------------------------------------------
+    - name: Classify — is this a MECHANICAL pull request?
+      id: mechanical
+      if: steps.reviewable.outputs.skip != 'true' && steps.token-check.outputs.skip != 'true' && github.event.pull_request.user.login != 'dependabot[bot]'
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        REPO: ${{ github.repository }}
+        PR: ${{ github.event.pull_request.number }}
+        HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+      shell: bash
+      run: |
+        set -uo pipefail
+        # `skip` is written EXACTLY ONCE, by review_it() or at the end. Writing the key
+        # twice would make the outcome depend on GITHUB_OUTPUT duplicate-key precedence,
+        # which is not a contract a review gate should rest on.
+        review_it() {
+          echo "not mechanical: $1 — reviewing."
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        }
+
+        case "$PR_AUTHOR" in
+          *"[bot]"|*-bot) ;;
+          *) review_it "author '$PR_AUTHOR' is not a bot" ;;
+        esac
+
+        prefix=""
+        for p in sync/ weekly/ cycle/ quarterly/ direction/; do
+          case "$HEAD_REF" in "$p"*) prefix="$p"; break ;; esac
+        done
+        if [ -z "$prefix" ]; then
+          review_it "branch '$HEAD_REF' has no mechanical prefix"
+        fi
+
+        # Fail CLOSED on an unreadable diff — never skip on missing information.
+        if ! files=$(gh pr diff "$PR" --repo "$REPO" --name-only 2>/dev/null) || [ -z "$files" ]; then
+          echo "::warning::Could not read the changed-file list for PR #${PR}; reviewing rather than assuming this PR is mechanical."
+          review_it "changed-file list unreadable (fail-closed)"
+        fi
+
+        # The workflow IS the gate — never let a mechanical prefix bypass review of it.
+        if printf '%s\n' "$files" | grep -qE '^\.github/'; then
+          review_it "touches .github/ (the gate itself)"
+        fi
+
+        # `sync/` carries one specific guarantee: sync-shared-tools can only copy files
+        # under tools/, so anything else on a sync branch is unexplained by that gate.
+        if [ "$prefix" = "sync/" ] && printf '%s\n' "$files" | grep -qvE '^tools/'; then
+          printf '%s\n' "$files" | grep -vE '^tools/' | sed 's/^/  unexpected: /'
+          review_it "sync branch changes paths outside tools/"
+        fi
+
+        echo "skip=true" >> "$GITHUB_OUTPUT"
+        n=$(printf '%s\n' "$files" | wc -l | tr -d ' ')
+        echo "MECHANICAL: '$HEAD_REF' by $PR_AUTHOR, $n file(s) — skipping Claude review."
+        {
+          echo "### :recycle: Claude Code Review intentionally skipped — mechanical PR"
+          echo
+          echo "Branch \`$HEAD_REF\` (prefix \`$prefix\`) authored by \`$PR_AUTHOR\`, touching $n file(s)."
+          echo
+          if [ "$prefix" = "sync/" ]; then
+            echo "**Guarantee that replaces review:** \`sync-check\` asserts these vendored files are"
+            echo "**byte-identical** to octo-brain, where the change was reviewed when it landed."
+            echo "Reviewing the copy would review the same diff again."
+          else
+            echo "**Guarantee that replaces review:** beat-regenerated artifact — regenerated, not authored."
+          fi
+          echo
+          echo "This green check means *no review was needed*, *not* that a review passed."
+          echo "Policy + the three-part test: workspace convention \`mechanical-pr-review-skip.md\`."
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        # DURABLE SKIP RECORD (mechanical path).
+        #
+        # `$GITHUB_STEP_SUMMARY` lives inside a run that GitHub eventually ages
+        # out, and nobody opens it for a green check. Now that this check is a
+        # REQUIRED gate, its green is what arms auto-merge — so on the one path
+        # where a PR merges with NO review at all, the reason has to be legible
+        # from the PR itself, forever, next to the merge it authorised.
+        #
+        # Volume is low by construction (only bot-authored `sync/` + beat
+        # branches reach here), the comment is idempotent per head SHA, and it
+        # is BEST-EFFORT: a caller that forgot `pull-requests: write` gets a
+        # warning, never a failed gate. The `::notice` is the fallback record.
+        echo "::notice title=Claude review skipped (mechanical PR)::${HEAD_REF} by ${PR_AUTHOR} — a deterministic gate already provides the guarantee review would. This green check means NO REVIEW WAS NEEDED, not that a review passed."
+        skip_marker="<!-- claude-review-skipped: mechanical sha=${HEAD_SHA:-unknown} -->"
+        if gh api --paginate "repos/${REPO}/issues/${PR}/comments" --jq '.[].body' 2>/dev/null \
+             | grep -qF "$skip_marker"; then
+          echo "skip notice already posted for ${HEAD_SHA:-unknown} — not repeating."
+        else
+          # Built line-by-line into a file rather than a heredoc: a heredoc body
+          # has to start at column 0, which would close this `run: |` block
+          # scalar and make the workflow unparseable.
+          body_file="${RUNNER_TEMP:-/tmp}/claude-review-skip-comment.md"
+          {
+            echo ":recycle: **Claude Code Review intentionally skipped — mechanical PR**"
+            echo
+            echo "Branch \`${HEAD_REF}\` (prefix \`${prefix}\`) by \`${PR_AUTHOR}\`, ${n} file(s)."
+            echo
+            echo "A deterministic gate already provides the guarantee review would provide, so"
+            echo "a reviewer could not add information. \`sync/\` branches are asserted"
+            echo "byte-identical to octo-brain by \`sync-check\`, where the diff was reviewed"
+            echo "when it landed; beat branches are regenerated, not authored."
+            echo
+            echo "**The green \`Claude Code Review\` on this PR means no review was needed — not"
+            echo "that a review passed.** Policy + the three-part test: workspace convention"
+            echo "\`mechanical-pr-review-skip.md\`."
+            echo
+            echo "$skip_marker"
+          } > "$body_file"
+          gh pr comment "$PR" --repo "$REPO" --body-file "$body_file" 2>/dev/null \
+            || echo "::warning::Could not post the mechanical-skip notice to PR #${PR} (needs \`pull-requests: write\`); the reason is in the step summary and the run annotation."
+        fi
+
+    - name: Checkout repository
+      if: steps.reviewable.outputs.skip != 'true' && steps.token-check.outputs.skip != 'true' && github.event.pull_request.user.login != 'dependabot[bot]' && steps.mechanical.outputs.skip != 'true'
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      with:
+        fetch-depth: 1
+
+    - name: Run Claude Code Review
+      id: review
+      if: steps.reviewable.outputs.skip != 'true' && steps.token-check.outputs.skip != 'true' && github.event.pull_request.user.login != 'dependabot[bot]' && steps.mechanical.outputs.skip != 'true'
+      # continue-on-error only so the RETRY + verify steps below get to run —
+      # NOT because a failure here is acceptable. claude-code-action >=
+      # v1.0.168 hard-fails the step when the run's result record carries
+      # `is_error:true` ("Claude execution failed: result is_error:true").
+      # The step's own conclusion stays honest in the UI; the verify step
+      # decides the JOB conclusion.
+      continue-on-error: true
+      uses: anthropics/claude-code-action@9d7150bc8a3dae8149739a88019d192b579ad90c # v1.0.168 (bundled CLI validates OAuth after 2026-07-07 Anthropic auth change; old pins 401)
+      with:
+        claude_code_oauth_token: ${{ inputs.claude_code_oauth_token }}
+        track_progress: true
+        allowed_bots: '*'
+        prompt: |
+          REPO: ${{ github.repository }}
+          PR NUMBER: ${{ github.event.pull_request.number }}
+
+          Please review this pull request and provide feedback on:
+          - Code quality and best practices
+          - Potential bugs or issues
+          - Performance considerations
+          - Security concerns
+          - Test coverage
+
+          Use the repository's CLAUDE.md for guidance on style and conventions.
+          Be constructive and helpful in your feedback.
+
+          Use `gh pr comment` with your Bash tool to leave your review as a comment on the PR.
+
+          ## Severity — this review is a MERGE GATE, so classify every finding
+
+          Give every finding you raise exactly one severity, and write that
+          severity at the start of the finding:
+
+          - **BLOCKING** — correctness or security. A logic error, an off-by-one,
+            a crash or unhandled failure path, data loss or corruption, a race or
+            deadlock, a broken API/schema contract, a regression the diff
+            introduces, a test that asserts nothing it claims to assert; or an
+            injection, authz/authn, secret-handling, SSRF or unsafe-deserialisation
+            flaw. The test is: **merging this as-is ships a defect.**
+          - **ADVISORY** — everything else. Simplification, reuse, naming, style,
+            nits, formatting, "consider", speculative performance, extra test
+            coverage you would like, documentation. Real value, but not a defect.
+
+          Post ALL findings of BOTH severities in your comment — advisory findings
+          are information the author should have, they simply do not block.
+
+          When you are genuinely unsure whether something is a real defect, say so
+          in the finding and mark it ADVISORY. Do not inflate a preference into a
+          BLOCKING finding, and do not soften a defect to keep a PR moving.
+
+          ## Verdict marker — REQUIRED, machine-read
+
+          The LAST LINE of that same PR comment must be exactly one of these two
+          lines, copied verbatim (do not alter the run id, do not wrap it in a
+          code fence):
+
+              <!-- claude-review-verdict: BLOCKING run=${{ github.run_id }}-${{ github.run_attempt }} -->
+              <!-- claude-review-verdict: PASS run=${{ github.run_id }}-${{ github.run_attempt }} -->
+
+          Use BLOCKING if you raised one or more BLOCKING findings. Use PASS
+          otherwise — including when you raised only ADVISORY findings, and when
+          you found nothing at all.
+
+          A deterministic step parses this marker to decide whether the
+          `Claude Code Review` merge gate passes. If it is missing, malformed, or
+          carries the wrong run id, the gate FAILS CLOSED and the PR is blocked —
+          so emit it even if you have nothing else to say. Emit it exactly once,
+          in the comment that carries your review, and nowhere else.
+
+        # Read/Glob/Grep let the reviewer inspect the checked-out source
+        # (type defs, tests, the CLAUDE.md the prompt references) instead of
+        # reasoning from `gh pr diff` alone. Deliberately read-only — no Edit
+        # or mutating Bash — so the workflow stays fork-safe and resistant to
+        # prompt injection from untrusted PR content.
+        claude_args: '--model ${{ inputs.claude_model }} --allowed-tools "Read,Glob,Grep,Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)" --effort high'
+
+    # ---------------------------------------------------------------------
+    # Retry once before giving up.
+    #
+    # A genuinely transient upstream blip (rate limit, momentary 5xx,
+    # overload) should not red-flag a PR or stall the estate, so one failure
+    # buys a second attempt after a short pause rather than an immediate red
+    # check. What it does NOT buy is a green check — see the verify step.
+    # ---------------------------------------------------------------------
+    - name: Pause before review retry
+      # A skipped step's outcome is 'skipped', not 'failure', so this
+      # inherits the token-check / dependabot gate from the review step.
+      if: steps.review.outcome == 'failure'
+      shell: bash
+      run: sleep 60
+
+    - name: Run Claude Code Review (retry)
+      id: review_retry
+      if: steps.review.outcome == 'failure'
+      continue-on-error: true
+      uses: anthropics/claude-code-action@9d7150bc8a3dae8149739a88019d192b579ad90c # v1.0.168 (bundled CLI validates OAuth after 2026-07-07 Anthropic auth change; old pins 401)
+      with:
+        claude_code_oauth_token: ${{ inputs.claude_code_oauth_token }}
+        track_progress: true
+        allowed_bots: '*'
+        prompt: |
+          REPO: ${{ github.repository }}
+          PR NUMBER: ${{ github.event.pull_request.number }}
+
+          Please review this pull request and provide feedback on:
+          - Code quality and best practices
+          - Potential bugs or issues
+          - Performance considerations
+          - Security concerns
+          - Test coverage
+
+          Use the repository's CLAUDE.md for guidance on style and conventions.
+          Be constructive and helpful in your feedback.
+
+          Use `gh pr comment` with your Bash tool to leave your review as a comment on the PR.
+
+          ## Severity — this review is a MERGE GATE, so classify every finding
+
+          Give every finding you raise exactly one severity, and write that
+          severity at the start of the finding:
+
+          - **BLOCKING** — correctness or security. A logic error, an off-by-one,
+            a crash or unhandled failure path, data loss or corruption, a race or
+            deadlock, a broken API/schema contract, a regression the diff
+            introduces, a test that asserts nothing it claims to assert; or an
+            injection, authz/authn, secret-handling, SSRF or unsafe-deserialisation
+            flaw. The test is: **merging this as-is ships a defect.**
+          - **ADVISORY** — everything else. Simplification, reuse, naming, style,
+            nits, formatting, "consider", speculative performance, extra test
+            coverage you would like, documentation. Real value, but not a defect.
+
+          Post ALL findings of BOTH severities in your comment — advisory findings
+          are information the author should have, they simply do not block.
+
+          When you are genuinely unsure whether something is a real defect, say so
+          in the finding and mark it ADVISORY. Do not inflate a preference into a
+          BLOCKING finding, and do not soften a defect to keep a PR moving.
+
+          ## Verdict marker — REQUIRED, machine-read
+
+          The LAST LINE of that same PR comment must be exactly one of these two
+          lines, copied verbatim (do not alter the run id, do not wrap it in a
+          code fence):
+
+              <!-- claude-review-verdict: BLOCKING run=${{ github.run_id }}-${{ github.run_attempt }} -->
+              <!-- claude-review-verdict: PASS run=${{ github.run_id }}-${{ github.run_attempt }} -->
+
+          Use BLOCKING if you raised one or more BLOCKING findings. Use PASS
+          otherwise — including when you raised only ADVISORY findings, and when
+          you found nothing at all.
+
+          A deterministic step parses this marker to decide whether the
+          `Claude Code Review` merge gate passes. If it is missing, malformed, or
+          carries the wrong run id, the gate FAILS CLOSED and the PR is blocked —
+          so emit it even if you have nothing else to say. Emit it exactly once,
+          in the comment that carries your review, and nowhere else.
+
+        claude_args: '--model ${{ inputs.claude_model }} --allowed-tools "Read,Glob,Grep,Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)" --effort high'
+
+    # ---------------------------------------------------------------------
+    # Maps the review outcome onto the JOB conclusion.
+    #
+    # The review itself is advisory — findings are posted as a PR comment and
+    # never fail the step — so a failed step always means the reviewer could
+    # NOT RUN, and therefore that no review exists for this PR.
+    #
+    # This step used to treat a MODEL-side `is_error` as advisory and keep the
+    # check GREEN (sidekick-labs/native-experiences-brain#463, .github#122).
+    # That was wrong, and it is the bug this step now fixes: workspace
+    # CLAUDE.md rule #7 makes merging autonomous *because* the check coverage
+    # is dense — "the dense check coverage is the safeguard, not a human". A
+    # green check that reviewed nothing silently deletes one of the gates that
+    # policy relies on. Whose fault the failure was (Anthropic-side vs. our
+    # config) is the wrong question for a merge gate; the only question that
+    # matters is "did a review happen?", and in both branches the answer is no.
+    #
+    # So: both branches now FAIL, after the retry above has already absorbed
+    # the transient case. The classification is kept — it makes the annotation
+    # actionable (rotate the token vs. fix the workflow) — but it no longer
+    # changes the exit code.
+    #
+    # If Anthropic is genuinely down estate-wide, this WILL turn the check red
+    # everywhere and block autonomous merges. That is the intended behaviour:
+    # the gate being unavailable is exactly when a human should be deciding,
+    # not when a green tick should be manufactured.
+    #
+    # `execution_file` is set on both paths (the action calls
+    # setExecutionFileOutputIfPresent() from its error handler), with
+    # $RUNNER_TEMP/claude-execution-output.json as the documented location —
+    # used as a fallback in case the output is empty.
+    - name: Verify a review actually ran
+      # Runs only if the first attempt failed. NOT continue-on-error, so the
+      # failure branches below fail the job naturally.
+      if: steps.review.outcome == 'failure'
+      env:
+        RETRY_OUTCOME: ${{ steps.review_retry.outcome }}
+        EXECUTION_FILE: ${{ steps.review_retry.outputs.execution_file || steps.review.outputs.execution_file }}
+      shell: bash
+      run: |
+        set -uo pipefail
+
+        if [ "${RETRY_OUTCOME:-}" = "success" ]; then
+          echo "::notice title=Claude review succeeded on retry::The first attempt failed and the retry produced a review. Treating as green."
+          exit 0
+        fi
+
+        exec_file="${EXECUTION_FILE:-}"
+        if [ -z "$exec_file" ] || [ ! -f "$exec_file" ]; then
+          exec_file="${RUNNER_TEMP:-/tmp}/claude-execution-output.json"
+        fi
+
+        model_error=false
+        if [ -f "$exec_file" ] \
+          && jq -e 'any(.[]?; .type == "result" and .is_error == true)' "$exec_file" >/dev/null 2>&1; then
+          model_error=true
+        fi
+
+        # The action does not surface the underlying API error anywhere, which
+        # is why these outages are so hard to diagnose. Surface just enough to
+        # classify the failure.
+        #
+        # DELIBERATELY NARROW — do not widen this. This reusable runs in a
+        # PUBLIC repo (.github's own pr.yml self-test), so anything echoed here
+        # is world-readable. `api_error_status` + `terminal_reason` are enough
+        # to tell auth (401/403) from rate/spend limits (429) from an upstream
+        # outage (5xx). The `result` message text and `total_cost_usd` are
+        # NOT printed: they can carry account, billing and usage detail.
+        # A maintainer who needs the full record can read it from the run's
+        # artifacts, which are not public.
+        if [ -f "$exec_file" ]; then
+          echo "Failure classification (redacted — see comment above):"
+          jq -c 'map(select(.type == "result")) | last
+                 | {subtype, is_error, api_error_status, terminal_reason, num_turns, duration_ms}' \
+            "$exec_file" 2>/dev/null || echo "(unparseable)"
+        fi
+
+        if [ "$model_error" = "true" ]; then
+          # Status only — no cost/usage figures, no API message text (public repo).
+          status=$(jq -r 'map(select(.type == "result")) | last | .api_error_status // "?"' "$exec_file" 2>/dev/null || echo "?")
+          turns=$(jq -r 'map(select(.type == "result")) | last | .num_turns // "?"' "$exec_file" 2>/dev/null || echo "?")
+          echo "::error title=Claude review did not run::The model call failed on both attempts (is_error, api status ${status}, turns ${turns}) — commonly an expired or usage-exhausted shared-account OAuth token, or an Anthropic-side outage. NO REVIEW WAS PRODUCED, so this check is red rather than a green tick over an ungated PR."
+          {
+            echo "### :x: Claude Code Review did not run"
+            echo
+            echo "The model call returned \`is_error\` on **both** the initial attempt and the retry"
+            echo "(api status \`${status}\`, turns \`${turns}\`). Typical causes: an expired or"
+            echo "usage-exhausted \`CLAUDE_CODE_OAUTH_TOKEN\`, an account-level limit, or an"
+            echo "Anthropic-side outage."
+            echo
+            echo "**No review was produced.** This check is red on purpose: a green"
+            echo "\`Claude Code Review\` must mean a review actually happened, because the"
+            echo "workspace merge policy treats the check set as the safeguard in place of a"
+            echo "human reviewer."
+            echo
+            echo "To unblock: fix or rotate the org \`CLAUDE_CODE_OAUTH_TOKEN\` secret and re-run,"
+            echo "or merge with an explicit human review and a note saying why."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+        fi
+
+        echo "::error title=Claude review setup failure::The review step failed before/around the model call on both attempts (no result record in the execution log) — likely credentials, inputs, or the action itself. Failing the job so it gets fixed."
+        {
+          echo "### :x: Claude Code Review failed to start"
+          echo
+          echo "The review step failed on both attempts without producing a model \`result\`"
+          echo "record, so this is a configuration/credential failure rather than a model"
+          echo "error. Check the \`Run Claude Code Review\` step log."
+        } >> "$GITHUB_STEP_SUMMARY"
+        exit 1
+
+    # ---------------------------------------------------------------------
+    # THE VERDICT. "A review happened" is no longer enough — this step maps
+    # WHAT THE REVIEW FOUND onto the job conclusion.
+    #
+    # Until now the job answered exactly one question: did a review run? A
+    # review that ran and found a null-dereference concluded `success`,
+    # identical on the wire to one that found nothing. Under workspace rule #7
+    # merging is autonomous *because* the check set is dense, so a check that
+    # cannot go red on a real defect is a gate in name only — the exact defect
+    # class `check-positive-controls.md` is about, one level up from the #340
+    # hole (which was a green over a review that never ran; this is a green
+    # over a review that ran and objected).
+    #
+    # MECHANISM — the review's own PR comment, not a second pass.
+    #
+    # The reviewer already posts its findings with `gh pr comment`; the prompt
+    # now requires that comment to end with one machine-readable marker:
+    #
+    #     <!-- claude-review-verdict: BLOCKING|PASS run=<run_id>-<attempt> -->
+    #
+    # so the verdict is carried by the artefact a human reads anyway, and is
+    # auditable on the PR long after the run's logs age out. No `Write` tool is
+    # granted to the reviewer (it stays read-only + `gh pr comment`, so the
+    # fork-safety and prompt-injection posture is unchanged), and no second
+    # model call is made — a parallel review pass would double the estate's
+    # largest Claude consumer to answer a question the first pass already knew.
+    #
+    # THE RUN NONCE IS LOAD-BEARING. Without it, a stale PASS marker from an
+    # earlier push would satisfy the gate for a later, defective one — the
+    # verdict would be attached to the PR rather than to this run's diff. The
+    # marker must carry THIS run+attempt or it does not count.
+    #
+    # SEVERITY SPLIT. Only correctness/security findings block. Simplification,
+    # style, nits and advisory suggestions still post as comments and still
+    # conclude green: a gate that reddens on taste is a gate people learn to
+    # merge past, which costs more than it saves.
+    #
+    # FAIL CLOSED. No marker, an unreadable comment list, an unrecognised
+    # verdict, or a marker for a different run all FAIL. An undeterminable
+    # verdict is never a pass (workspace rule #9). Note this also closes the
+    # zero-turn "success" shape from octo-brain#276 from a second direction: an
+    # agent that answers in prose without calling a tool posts no marker.
+    #
+    # WHAT THIS STEP DOES NOT COVER: the review-never-ran case, which the
+    # `Verify a review actually ran` step above already owns. The two are
+    # mutually exclusive by construction — this one requires an attempt to have
+    # SUCCEEDED, that one requires the first attempt to have FAILED.
+    #
+    # POSITIVE CONTROL: `tests/review-gate-exit-codes.py` pins this script's
+    # exit-code contract against fixtures (BLOCKING/PASS/stale nonce/absent
+    # marker/unreadable comments), and that suite proves the PARSER. It does not
+    # prove the CONSEQUENCE — that a real correctness bug produces a BLOCKING
+    # marker. Forcing one live positive is written up in `docs/review-verdict-gate.md`;
+    # do that once before treating this check's green as evidence.
+    # ---------------------------------------------------------------------
+    - name: Determine the review VERDICT
+      if: >-
+        steps.reviewable.outputs.skip != 'true'
+        && steps.token-check.outputs.skip != 'true'
+        && github.event.pull_request.user.login != 'dependabot[bot]'
+        && steps.mechanical.outputs.skip != 'true'
+        && (steps.review.outcome == 'success' || steps.review_retry.outcome == 'success')
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        REPO: ${{ github.repository }}
+        PR: ${{ github.event.pull_request.number }}
+        RUN_NONCE: ${{ github.run_id }}-${{ github.run_attempt }}
+        # EMPTY means the action returned WITHOUT running Claude. Confirmed from
+        # the action's source at the pinned SHA: `conclusion` and `execution_file`
+        # are set only after the model call (`src/entrypoints/run.ts`), well past
+        # the early `return` on the workflow-validation skip path. So an empty
+        # conclusion on a step that concluded `success` is the precise, tested
+        # signature of "the action no-opped" — no log-grepping required.
+        REVIEW_CONCLUSION: ${{ steps.review_retry.outputs.conclusion || steps.review.outputs.conclusion }}
+      shell: bash
+      run: |
+        set -uo pipefail
+
+        fail_closed() {
+          echo "::error title=Claude review verdict undeterminable::$1 NO VERDICT could be read for run ${RUN_NONCE}, so this check is red rather than a green tick over an unadjudicated PR."
+          {
+            echo "### :x: Claude Code Review — verdict undeterminable"
+            echo
+            echo "$1"
+            echo
+            echo "The review step reported success, but no \`claude-review-verdict\` marker for"
+            echo "run \`${RUN_NONCE}\` could be read from this PR's comments."
+            echo
+            echo "This check **fails closed**: an undeterminable verdict is not a pass"
+            echo "(workspace rule #9). Common causes — the reviewer posted no comment (a"
+            echo "zero-turn run), it answered in prose without the marker, or the comment"
+            echo "list could not be read."
+            echo
+            echo "Re-run the check. If it recurs, the reviewer is not honouring the marker"
+            echo "contract in \`claude-code-review.yml\` and that is the bug to fix."
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          exit 1
+        }
+
+        # THE ACTION NO-OPPED. Classified separately from a generic missing
+        # marker because the cause is specific, self-inflicted and actionable,
+        # and because reporting it as "verdict undeterminable" sent a reader
+        # hunting for a model failure that never happened. Still RED — this is a
+        # sharper error message, NOT a new green: no review was produced, and a
+        # green here would be exactly the false green this whole gate removes.
+        if [ -z "${REVIEW_CONCLUSION:-}" ]; then
+          echo "::error title=Claude review did not run (action no-opped)::The review step concluded success but produced no conclusion, so the action returned without calling the model. On this action pin the known cause is the server-side workflow-validation guard, which is FALSE BY CONSTRUCTION on a PR that edits the workflow file carrying the action. NO REVIEW WAS PRODUCED, so this check is red."
+          {
+            echo "### :x: Claude Code Review did not run — the action no-opped"
+            echo
+            echo "The review step concluded \`success\` but set no \`conclusion\` output, which"
+            echo "means it returned before calling the model."
+            echo
+            echo "On this action pin the known cause is the **workflow-validation guard**:"
+            echo "\`claude-code-action\` asks Anthropic to exchange its OIDC token, and that"
+            echo "endpoint requires the workflow file the job runs from to exist on the"
+            echo "**default branch with identical content**. A PR that edits that workflow"
+            echo "fails the check by construction."
+            echo
+            echo "That is why the review orchestration lives in"
+            echo "\`.github/actions/claude-review\` and the workflow is a thin shim: editing the"
+            echo "review **logic** no longer edits the validated file. If you are seeing this,"
+            echo "you are almost certainly editing the shim itself — which is the one case"
+            echo "that still needs a human review plus an admin merge."
+            echo
+            echo "**No review was produced**, so this check is red rather than a green tick"
+            echo "over an unreviewed PR."
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          exit 1
+        fi
+
+        if ! bodies=$(gh api --paginate "repos/${REPO}/issues/${PR}/comments" --jq '.[].body' 2>/dev/null); then
+          fail_closed "Could not read the comments on PR #${PR}."
+        fi
+
+        # Only markers carrying THIS run+attempt count — a marker from an earlier
+        # push describes an earlier diff.
+        markers=$(printf '%s\n' "$bodies" \
+          | grep -oE "<!-- claude-review-verdict: [A-Za-z]+ run=${RUN_NONCE} -->" \
+          | sed -E 's/^<!-- claude-review-verdict: ([A-Za-z]+) .*$/\1/')
+
+        if [ -z "$markers" ]; then
+          stale=$(printf '%s\n' "$bodies" | grep -cE '<!-- claude-review-verdict: ' || true)
+          fail_closed "Found ${stale:-0} verdict marker(s) on this PR, none for run ${RUN_NONCE}."
+        fi
+
+        # Strictest wins. Two markers should not happen, but if they do, the
+        # objection is the one that matters — never let a second PASS launder it.
+        if printf '%s\n' "$markers" | grep -qx 'BLOCKING'; then
+          echo "::error title=Claude Code Review found a blocking issue::The review raised at least one CORRECTNESS or SECURITY finding on this PR. Read the review comment, fix or rebut it, and push again. Advisory findings (style, simplification, nits) do not reach this branch."
+          {
+            echo "### :x: Claude Code Review — BLOCKING findings"
+            echo
+            echo "The review raised at least one **correctness or security** finding. The"
+            echo "details are in the review comment on this PR."
+            echo
+            echo "This check is red on purpose: workspace rule #7 makes merging autonomous"
+            echo "*because* the check set is dense, so a review that objects must be able to"
+            echo "hold the merge. Style, simplification and nit findings do **not** land here."
+            echo
+            echo "To unblock: fix the finding and push, or reply on the PR explaining why it"
+            echo "is not a defect and re-run the check."
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          exit 1
+        fi
+
+        if printf '%s\n' "$markers" | grep -qx 'PASS'; then
+          echo "::notice title=Claude Code Review passed::A review ran for run ${RUN_NONCE} and raised no correctness or security findings. Any advisory findings are in the review comment."
+          {
+            echo "### :white_check_mark: Claude Code Review — no blocking findings"
+            echo
+            echo "A review ran for run \`${RUN_NONCE}\` and raised no **correctness or"
+            echo "security** findings. Advisory findings, if any, are in the review comment"
+            echo "and do not block the merge."
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          exit 0
+        fi
+
+        got=$(printf '%s\n' "$markers" | tr '\n' ',' | sed 's/,$//')
+        fail_closed "Unrecognised verdict value(s): ${got}. Expected BLOCKING or PASS."

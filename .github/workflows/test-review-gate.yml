@@ -10,18 +10,27 @@ name: Test review-gate logic
 # exit code, so it is worth pinning: "a review happened" -> 0, "no review
 # happened" -> 1, whatever the cause.
 #
-# The test executes the gate step's inline script against synthetic execution
-# logs. Network-free and cheap. Mirrors the path-filtered, per-area pattern of
+# The test executes each step's inline script against synthetic fixtures.
+# Network-free and cheap. Mirrors the path-filtered, per-area pattern of
 # test-audit-logic.yml / test-release-thread.yml.
+#
+# It watches THREE paths, and each one earns its place:
+#   * the composite action — where the review logic actually lives;
+#   * claude-code-review.yml — the shim, asserted to stay thin (logic there is
+#     unmergeable to change, because claude-code-action validates that file
+#     against the default branch);
+#   * the test itself.
 on:
   pull_request:
     paths:
+      - '.github/actions/claude-review/action.yml'
       - '.github/workflows/claude-code-review.yml'
       - 'tests/review-gate-exit-codes.py'
       - '.github/workflows/test-review-gate.yml'
   push:
     branches: [main]
     paths:
+      - '.github/actions/claude-review/action.yml'
       - '.github/workflows/claude-code-review.yml'
       - 'tests/review-gate-exit-codes.py'
       - '.github/workflows/test-review-gate.yml'
