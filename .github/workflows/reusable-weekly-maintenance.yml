@@ -157,7 +157,7 @@ env:
   # Single source of truth for the Claude model. Override org-wide via the
   # CLAUDE_MODEL Actions variable (resolved in the caller's context); the
   # literal is a safe fallback so an unset var can't yield an empty --model.
-  CLAUDE_MODEL: "${{ vars.CLAUDE_MODEL || 'claude-opus-4-8' }}"
+  CLAUDE_MODEL: "${{ vars.CLAUDE_MODEL || 'claude-sonnet-4-6' }}"
 
 jobs:
   maintenance:

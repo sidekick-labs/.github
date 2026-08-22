@@ -15,7 +15,7 @@ The original plan assumed we'd build the auto-PR machinery from scratch (`recomm
 
 - **`.github/workflows/reusable-weekly-maintenance.yml`** (PR #5, ~670 lines) already does: AI-engine-driven fixes that open a signed PR, a **TODO/FIXME census with week-over-week deltas via `actions/cache`** (not committed reports), CodeQL alert review, and a **Linear fallback** for judgment-call items (`linear-fallback` input). It is **per-repo** — each repo's own workflow calls it with `secrets: inherit`.
 - The AI engine is **`anthropics/claude-code-action`** + `CLAUDE_CODE_OAUTH_TOKEN`. (A prior Claude→Codex migration was reversed — Codex tooling has been removed org-wide.)
-- Model is pinned via the `CLAUDE_MODEL` Actions var with a literal fallback (`claude-opus-4-8`).
+- Model is pinned via the `CLAUDE_MODEL` Actions var with a literal fallback (`claude-sonnet-4-6`, aligned org-wide 2026-08-22 per octo-brain#302).
 
 **Implication:** don't rebuild primitives. The actions-audit is the one thing weekly-maintenance does NOT cover, because it is **org-level / cross-repo** (it analyses Actions *usage* across all repos), whereas weekly-maintenance is per-repo dependency/security hygiene. So actions-audit is a **separate org-level scheduled workflow** in `.github`, but it should **reuse weekly-maintenance's conventions and proven steps** rather than reinvent them.
 
