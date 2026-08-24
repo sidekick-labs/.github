@@ -65,6 +65,16 @@ inputs:
       Model id. Resolved by the CALLER, because the `vars` context is not available
       inside a composite action.
     required: true
+  review_author:
+    description: >-
+      The account whose comments may carry a verdict marker. A marker from anyone
+      else is IGNORED and reported, because the run id is public within seconds of
+      the job starting and an unfiltered read makes the verdict forgeable. This is
+      the login as the REST comments API spells it (`claude[bot]`), NOT the bare
+      `claude` that `gh pr view`'s GraphQL returns. An input rather than a literal
+      so a differently-installed app can be named without editing logic.
+    required: false
+    default: 'claude[bot]'
 
 runs:
   using: composite
@@ -744,6 +754,7 @@ runs:
         # conclusion on a step that concluded `success` is the precise, tested
         # signature of "the action no-opped" — no log-grepping required.
         REVIEW_CONCLUSION: ${{ steps.review_retry.outputs.conclusion || steps.review.outputs.conclusion }}
+        REVIEW_AUTHOR: ${{ inputs.review_author }}
       shell: bash
       run: |
         set -uo pipefail
@@ -801,19 +812,53 @@ runs:
           exit 1
         fi
 
-        if ! bodies=$(gh api --paginate "repos/${REPO}/issues/${PR}/comments" --jq '.[].body' 2>/dev/null); then
+        # AUTHOR IS PART OF THE CONTRACT, not just the nonce.
+        #
+        # Reading every comment made the marker FORGEABLE. The run id appears in
+        # the Actions tab within seconds of the job starting, so anyone who can
+        # comment on the PR could post a PASS marker for the live run. BLOCKING
+        # beats PASS, so this could not overturn an objection — but it could
+        # convert a FAIL-CLOSED RED into a green, which is the more valuable
+        # target: it is precisely the state a PR sits in when the reviewer did
+        # not adjudicate. On a repo where this context is a REQUIRED check, that
+        # is a bypass of the gate by anyone with comment access.
+        #
+        # So a verdict counts only from the reviewer's own account. The login is
+        # an input rather than a literal so a differently-installed app can be
+        # named without editing logic. Confirmed against a real run rather than
+        # assumed: the REST comments API reports `claude[bot]` (type Bot, id
+        # 209825114), while `gh pr view`'s GraphQL reports a bare `claude` — this
+        # step reads REST, so the bracketed form is the correct one. Taking the
+        # GraphQL spelling would have matched nothing and failed closed on EVERY
+        # pull request in the estate.
+        #
+        # A user account cannot impersonate it: GitHub logins may not contain
+        # brackets, so `claude[bot]` is unspoofable by a human account.
+        if ! raw=$(gh api --paginate "repos/${REPO}/issues/${PR}/comments" \
+             --jq '.[] | {login: .user.login, body: .body} | tojson' 2>/dev/null); then
           fail_closed "Could not read the comments on PR #${PR}."
         fi
 
+        authored=$(printf '%s\n' "$raw" \
+          | jq -r --arg a "$REVIEW_AUTHOR" 'select(.login == $a) | .body' 2>/dev/null)
+
         # Only markers carrying THIS run+attempt count — a marker from an earlier
         # push describes an earlier diff.
-        markers=$(printf '%s\n' "$bodies" \
+        markers=$(printf '%s\n' "$authored" \
           | grep -oE "<!-- claude-review-verdict: [A-Za-z]+ run=${RUN_NONCE} -->" \
           | sed -E 's/^<!-- claude-review-verdict: ([A-Za-z]+) .*$/\1/')
 
         if [ -z "$markers" ]; then
-          stale=$(printf '%s\n' "$bodies" | grep -cE '<!-- claude-review-verdict: ' || true)
-          fail_closed "Found ${stale:-0} verdict marker(s) on this PR, none for run ${RUN_NONCE}."
+          # An IGNORED forgery is reported, never silently dropped. A rejected
+          # attempt to green the gate is exactly the event a human should see.
+          forged=$(printf '%s\n' "$raw" \
+            | jq -r --arg a "$REVIEW_AUTHOR" 'select(.login != $a) | .body' 2>/dev/null \
+            | grep -cE "<!-- claude-review-verdict: [A-Za-z]+ run=${RUN_NONCE} -->" || true)
+          stale=$(printf '%s\n' "$authored" | grep -cE '<!-- claude-review-verdict: ' || true)
+          if [ "${forged:-0}" -gt 0 ]; then
+            fail_closed "IGNORED ${forged} verdict marker(s) for run ${RUN_NONCE} posted by someone other than ${REVIEW_AUTHOR}: a verdict counts only from the reviewer's own account. ${stale:-0} marker(s) from ${REVIEW_AUTHOR} on this PR, none for this run."
+          fi
+          fail_closed "Found ${stale:-0} verdict marker(s) from ${REVIEW_AUTHOR} on this PR, none for run ${RUN_NONCE}."
         fi
 
         # Strictest wins. Two markers should not happen, but if they do, the
