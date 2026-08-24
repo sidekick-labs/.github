@@ -15,6 +15,28 @@ cd .worktrees/<feature-name>
 # work, commit, push
 ```
 
+### Claude Code: install the workflow plugin first
+
+The shared workflow skills — `/ship`, `/babysit`, `/land`, `/warm-up`,
+`/cool-down`, `/cleanup` — are **not** in any repo. They ship as a marketplace
+plugin, so a fresh machine has none of them until you add it:
+
+```
+/plugin marketplace add sidekick-labs/claude-plugins
+/plugin install sidekick-workflows
+```
+
+Check with `/plugin` — if `sidekick-workflows` is listed, you're set. (Ignore
+`sidekick-ops-operator` in the same marketplace; that's infrastructure-owner
+tooling, not app work.) You need read access to
+[`sidekick-labs/claude-plugins`](https://github.com/sidekick-labs/claude-plugins);
+if `marketplace add` fails, that's what's missing — ask in `#eng`.
+
+This step is written **here** rather than only in the plugin's own
+`/getting-started` skill, because `/getting-started` ships *inside* the plugin:
+without the plugin there is nothing to invoke, and the on-ramp is unreachable
+from exactly the position that needs it.
+
 ## Branching
 
 - Branch off `origin/main`. Use a descriptive name — Linear ticket ID if available

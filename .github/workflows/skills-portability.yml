@@ -1,0 +1,141 @@
+name: Skills Portability
+
+# Reusable PR gate that FAILS when a committed `.claude/` file tells the agent to
+# READ A SKILL off somebody's local disk.
+#
+# Why this exists
+# ---------------
+# `sidekick-companion-kit`'s `/ship` skill ended with:
+#
+#     Read `~/Workspace/sidekick-labs/.claude/skills/babysit/SKILL.md` and follow its loop
+#
+# The workspace root is NOT a git repo, so nothing distributes that file. It
+# resolved on exactly one laptop. Everywhere else the hand-off step read a
+# non-existent file and the babysit loop -- CI-fixing, review-addressing, and the
+# autonomous merge under workspace Rule #7 -- silently never started. `/ship`
+# still printed a PR URL and reported success, so nothing went red for months,
+# in five of eight repos at once. Reported by a contractor who had no way to
+# know the path was personal.
+#
+# The shared skills are distributed as the `sidekick-workflows` marketplace
+# plugin. A cross-repo skill reference belongs to the plugin (`/babysit`), never
+# to a path.
+#
+# Scope -- deliberately NARROW
+# ---------------------------
+# Only home-relative or absolute paths that point INTO a `.claude/skills` tree.
+# It does not flag every `/Users/` or `~/` string in `.claude/`, because several
+# are legitimate (a documented devcontainer `REMOTE_PATH` default, a table of
+# env-var defaults). The failure class here is specifically "an instruction to
+# resolve a skill from a filesystem path", which is never portable.
+#
+# Consume from a PR workflow:
+#
+#   jobs:
+#     skills-portability:
+#       uses: sidekick-labs/.github/.github/workflows/skills-portability.yml@main
+#
+# Org-agnostic: everything derives from the caller's repo.
+
+on:
+  workflow_call:
+    inputs:
+      paths:
+        description: 'Space-separated pathspecs to scan. Empty = every tracked file under a .claude/ tree.'
+        type: string
+        default: ''
+
+permissions: {}
+
+jobs:
+  scan:
+    name: No laptop-only skill paths
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Scan committed .claude files for laptop-only skill references
+        env:
+          INPUT_PATHS: ${{ inputs.paths }}
+        run: |
+          # No `-e`: grep's exit 1 on "no match" is the normal path here and is
+          # handled explicitly below. Every real failure calls `exit 1` itself.
+          set -uo pipefail
+
+          # A home-relative or absolute path reaching into a `.claude/skills` tree.
+          PATTERN='(~|/Users/[^/[:space:]]+|/home/[^/[:space:]]+)/[^[:space:]`")'"'"']*\.claude/skills'
+
+          # -- POSITIVE CONTROL -------------------------------------------------
+          # A check that has never returned a positive is unverified, not clean
+          # (.claude/conventions/check-positive-controls.md). Prove the matcher
+          # can still go red against the exact line that motivated this gate,
+          # BEFORE trusting a clean scan of the repo.
+          fixture='Read `~/Workspace/sidekick-labs/.claude/skills/babysit/SKILL.md` and follow its'
+          if ! printf '%s\n' "$fixture" | grep -qE "$PATTERN"; then
+            echo "::error title=Positive control failed::The matcher no longer flags the known-bad line this gate exists for. Result is UNKNOWN, not clean."
+            exit 1
+          fi
+          fixture_ok='Invoke the `/babysit` skill (from the `sidekick-workflows` plugin) and follow its'
+          if printf '%s\n' "$fixture_ok" | grep -qE "$PATTERN"; then
+            echo "::error title=Negative control failed::The matcher flags the CORRECT plugin wording. Result is UNKNOWN, not clean."
+            exit 1
+          fi
+          echo "Positive + negative control: OK (matcher discriminates)."
+
+          # -- SCOPE ------------------------------------------------------------
+          if [ -n "${INPUT_PATHS}" ]; then
+            # Word-splitting is the point: one input string -> several pathspecs.
+            # `inputs.paths` is caller-controlled workflow YAML, never PR-author
+            # text, so there is no untrusted-input path into this expansion.
+            # shellcheck disable=SC2086
+            mapfile -t files < <(git ls-files -- ${INPUT_PATHS})
+          else
+            mapfile -t files < <(git ls-files | grep -E '(^|/)\.claude/')
+          fi
+
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::notice title=Nothing to scan::No tracked files under a .claude/ tree in this repo. Vacuously clean -- this gate asserted nothing here."
+            exit 0
+          fi
+          echo "Scanning ${#files[@]} tracked .claude file(s)."
+
+          # `.claude/settings.local.json` is per-developer machine state, not an
+          # instruction the agent follows. Skip it (some repos commit one).
+          hits=0
+          for f in "${files[@]}"; do
+            case "$f" in
+              */settings.local.json|settings.local.json) continue ;;
+            esac
+            while IFS= read -r line; do
+              hits=$((hits + 1))
+              n="${line%%:*}"
+              echo "::error file=${f},line=${n},title=Laptop-only skill path::${line#*:}"
+            done < <(grep -nE "$PATTERN" "$f" || true)
+          done
+
+          if [ "$hits" -gt 0 ]; then
+            {
+              echo "### Skills Portability: FAILED"
+              echo
+              echo "\`$hits\` reference(s) to a skill file by filesystem path."
+              echo
+              echo "A cross-repo skill is distributed as a marketplace plugin, not a path."
+              echo "Replace the read with an invocation, e.g.:"
+              echo
+              echo '```diff'
+              echo '-Read `~/Workspace/sidekick-labs/.claude/skills/babysit/SKILL.md` and follow its'
+              echo '+Invoke the `/babysit` skill (from the `sidekick-workflows` plugin) and follow its'
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          {
+            echo "### Skills Portability: clean"
+            echo
+            echo "Scanned \`${#files[@]}\` tracked \`.claude/\` file(s); no skill referenced by filesystem path."
+            echo "Matcher verified against a known-bad and a known-good fixture this run."
+          } >> "$GITHUB_STEP_SUMMARY"
