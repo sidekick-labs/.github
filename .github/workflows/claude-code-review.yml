@@ -19,7 +19,23 @@ jobs:
     # RUNS for dependabot PRs and the review STEPS are step-gated below, so
     # the job completes green without spending LLM budget on a version bump.
     if: github.event.pull_request.draft == false
-    runs-on: ubuntu-latest
+    # Homelab-routable review lane. `review / Claude Code Review` is a REQUIRED
+    # context in NO sidekick-labs repo except THIS one, and at ~687 min/week it is
+    # the largest single workload in the estate — which is what makes it worth
+    # routing while the `RUNNER_LABEL` un-gating PRs stay parked on a second host.
+    #
+    # 🔴 SET THIS VARIABLE AT REPO SCOPE ONLY. NEVER AT ORG SCOPE.
+    #
+    # `vars` in a called reusable resolves in the CALLER's context, and this repo
+    # (`sidekick-labs/.github`) calls it from `pr.yml` for its own review check —
+    # which its ruleset REQUIRES. `.github` is PUBLIC, and every runner group here
+    # sets `allows_public_repositories: false`, so a self-hosted label can never be
+    # served here. An org-scoped variable would therefore make `.github`'s required
+    # check queue forever with nothing red — the CI-090 failure mode, on the one
+    # repo where this check is mandatory. Arm private, group-admitted repos
+    # individually; an unset variable is a hosted no-op, which is why `.github`,
+    # `sidekick-ui` and `brain-template` stay hosted by simply never being armed.
+    runs-on: ${{ vars.RUNNER_LABEL_REVIEW || 'ubuntu-latest' }}
     timeout-minutes: 30
 
     steps:
