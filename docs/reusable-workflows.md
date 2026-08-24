@@ -17,6 +17,9 @@ Available reusable workflows:
 - **`pin-check.yml`** — reusable PR gate that fails when a third-party action
   isn't SHA-pinned (the actions-pinning self-healer's SENSOR). See
   [Actions pinning self-healer](#actions-pinning-self-healer).
+- **`skills-portability.yml`** — reusable PR gate that fails when a committed
+  `.claude/` file references a skill by filesystem path instead of invoking the
+  plugin skill. See [Skills portability](#skills-portability).
 
 > **Removed:** `reusable-sentry-autofix.yml` — the Sentry autofix moved to the
 > one-workflow-per-org model: `sidekick-labs/sre-brain`'s `sentry-sweep.yml` +
@@ -307,3 +310,53 @@ jobs:
 Also ensure the consumer's `.github/dependabot.yml` has the `github-actions`
 weekly block. The `pin-sweep` covers every non-archived repo automatically —
 no per-repo wiring needed for the actuator.
+
+## Skills portability
+
+`skills-portability.yml` fails a PR when a committed `.claude/` file tells the
+agent to **read a skill off somebody's local disk**.
+
+The motivating bug: `/ship` in five of eight repos ended its babysit hand-off
+with
+
+```
+Read `~/Workspace/sidekick-labs/.claude/skills/babysit/SKILL.md` and follow its loop
+```
+
+The workspace root is not a git repo, so nothing distributes that file — it
+resolved on one laptop. Everywhere else the step read a non-existent file and the
+babysit loop (CI-fixing, review-addressing, the autonomous merge under workspace
+Rule #7) silently never started, while `/ship` still printed a PR URL and
+reported success. Nothing went red for months. The shared skills are distributed
+as the `sidekick-workflows` marketplace plugin, so a cross-repo skill reference
+belongs to the plugin (`/babysit`), never to a path.
+
+**Scope is deliberately narrow:** only home-relative or absolute paths pointing
+into a `.claude/skills` tree. It does *not* flag every `~/` or `/Users/` string
+under `.claude/`, because some are legitimate (a documented devcontainer
+`REMOTE_PATH` default, a table of env-var defaults). `settings.local.json` is
+skipped — per-developer machine state, not an instruction.
+
+**It carries its own controls.** Each run first asserts the matcher still flags
+the known-bad line and still passes the correct plugin wording; either control
+failing makes the result UNKNOWN (exit 1), never "clean"
+(`check-positive-controls.md`). A repo with no tracked `.claude/` files reports
+"vacuously clean — this gate asserted nothing here" rather than a silent pass.
+
+### Per-repo adoption
+
+```yaml
+# .github/workflows/skills-gate.yml in the consumer repo
+name: Skills Gate
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions: {}
+jobs:
+  skills-portability:
+    permissions:
+      contents: read
+    # @main is deliberate for now, matching pin-check adoption: pin to a tag
+    # once a v3 or later cuts.
+    uses: sidekick-labs/.github/.github/workflows/skills-portability.yml@main
+```
