@@ -217,7 +217,7 @@ jobs:
         # The step's own conclusion stays honest in the UI; the verify step
         # decides the JOB conclusion.
         continue-on-error: true
-        uses: anthropics/claude-code-action@9d7150bc8a3dae8149739a88019d192b579ad90c # v1.0.168 (bundled CLI validates OAuth after 2026-07-07 Anthropic auth change; old pins 401)
+        uses: anthropics/claude-code-action@dcb57747bfceeaa1fa72638cae52295d1d853d4a # v1.0.168 (bundled CLI validates OAuth after 2026-07-07 Anthropic auth change; old pins 401)
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           track_progress: true
@@ -263,7 +263,7 @@ jobs:
         id: review_retry
         if: steps.review.outcome == 'failure'
         continue-on-error: true
-        uses: anthropics/claude-code-action@9d7150bc8a3dae8149739a88019d192b579ad90c # v1.0.168 (bundled CLI validates OAuth after 2026-07-07 Anthropic auth change; old pins 401)
+        uses: anthropics/claude-code-action@dcb57747bfceeaa1fa72638cae52295d1d853d4a # v1.0.168 (bundled CLI validates OAuth after 2026-07-07 Anthropic auth change; old pins 401)
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           track_progress: true
