@@ -240,7 +240,7 @@ jobs:
 
       - name: Set up JDK
         if: ${{ inputs.stack == 'kmp' }}
-        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v6.0.0
         with:
           distribution: 'zulu'
           java-version: ${{ inputs.jdk-version }}
@@ -613,7 +613,7 @@ jobs:
 
       - name: Weekly maintenance
         id: maintenance
-        uses: anthropics/claude-code-action@dcb57747bfceeaa1fa72638cae52295d1d853d4a # v1.0.168 (bundled CLI validates OAuth after 2026-07-07 Anthropic auth change; old pins 401)
+        uses: anthropics/claude-code-action@a874e9ecd7bb36efdad65429c6b35815f5a08f10 # v1.0.168 (bundled CLI validates OAuth after 2026-07-07 Anthropic auth change; old pins 401)
         timeout-minutes: ${{ inputs.claude-timeout-minutes }}
         with:
           claude_code_oauth_token: ${{ secrets.claude-code-oauth-token }}
