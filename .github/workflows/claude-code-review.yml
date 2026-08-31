@@ -318,21 +318,14 @@ jobs:
       # $RUNNER_TEMP/claude-execution-output.json as the documented location —
       # used as a fallback in case the output is empty.
       - name: Verify a review actually ran
-        # Runs only if the first attempt failed. The failure branches below normally
-        # fail the job (this gate is fail-closed BY DESIGN — a green check must mean a
-        # review actually happened).
+        # Runs only if the first attempt failed. NOT continue-on-error, so the
+        # failure branches below fail the job naturally — this gate is fail-closed
+        # BY DESIGN: a green check must mean a review actually happened.
         #
-        # TEMPORARY (2026-08-31): overridden to continue-on-error while an upstream
-        # claude-code-action regression returns is_error on turn 1 ("directory
-        # mismatch … tsconfig.json") DETERMINISTICALLY. The retry above was built for
-        # the transient case and can't absorb a deterministic CLI crash, so this gate
-        # currently red-lines EVERY PR estate-wide and misclassifies a fixable CLI bug
-        # as an auth/outage failure. The diagnostics and step-summary below still emit
-        # (so a genuine token/outage failure is still loudly visible for a human to act
-        # on) — continue-on-error only stops the CLI-side flake from hard-blocking
-        # otherwise-clean merges. ⚠️ Revert this line the moment upstream is fixed to
-        # restore the fail-closed merge gate.
-        continue-on-error: true
+        # The ONE exception is the TEMPORARY known-upstream-bug branch below, which
+        # tolerates a single precisely-fingerprinted upstream CLI crash (and nothing
+        # else). Every genuine failure — expired/missing token, 401/403/429, a 5xx
+        # outage, an empty/unparseable log, any real error — still fails closed.
         if: steps.review.outcome == 'failure'
         env:
           RETRY_OUTCOME: ${{ steps.review_retry.outcome }}
@@ -373,6 +366,46 @@ jobs:
             jq -c 'map(select(.type == "result")) | last
                    | {subtype, is_error, api_error_status, terminal_reason, num_turns, duration_ms}' \
               "$exec_file" 2>/dev/null || echo "(unparseable)"
+          fi
+
+          # ── TEMPORARY known-upstream-bug tolerance (2026-08-31) ────────────────
+          # DELETE this whole `if` block once the upstream claude-code-action regression
+          # is fixed; the fail-closed branches below are the permanent behaviour.
+          #
+          # The 2026-08-31 regression crashes the CLI on turn 1 and writes a
+          # SELF-CONTRADICTORY result record: subtype "success" WITH is_error true
+          # (num_turns 1, $0 spent) — the "Internal error: directory mismatch for
+          # .../tsconfig.json" Bun bug. That exact contradiction is the fingerprint, and
+          # it keeps the gate FAIL-CLOSED for every real failure: a genuine outage/auth
+          # failure reports subtype "error"/"error_*" and/or a non-null api_error_status,
+          # NEVER subtype "success". So a green gate STILL means "a real review ran, or
+          # the one specific known-broken upstream CLI was the cause" — no security bypass.
+          if [ -f "$exec_file" ] && jq -e '
+                (map(select(.type == "result")) | last) as $r
+                | $r != null
+                  and $r.is_error == true
+                  and $r.subtype == "success"
+                  and (($r.num_turns // 99) <= 1)
+                  and (($r.api_error_status // null) == null)
+              ' "$exec_file" >/dev/null 2>&1; then
+            echo "::warning title=Claude review hit the known upstream CLI crash::The review CLI crashed on turn 1 with the known 2026-08-31 upstream bug (subtype=success + is_error=true, 0 turns, \$0 — the 'directory mismatch … tsconfig.json' Bun regression). This is NOT a security bypass and NOT a token/outage failure — no genuine-failure signature was present. Passing the gate so the known flake does not block merges."
+            {
+              echo "### :warning: Claude Code Review: known upstream CLI crash tolerated"
+              echo
+              echo "The review CLI crashed on **turn 1** with the known upstream regression"
+              echo "(\`subtype: success\` **and** \`is_error: true\`, 0 turns, \$0 — the"
+              echo "\"directory mismatch … tsconfig.json\" Bun bug, first seen 2026-08-31)."
+              echo
+              echo "This is **not** a security bypass: the gate stays fail-closed for a real"
+              echo "outage or auth failure (those report \`subtype: error\` / an"
+              echo "\`api_error_status\`, never \`subtype: success\`). It matched **only** this"
+              echo "one known-broken upstream CLI signature, so the check is green instead of"
+              echo "red-lining an otherwise-clean PR."
+              echo
+              echo "⚠️ Remove the crash-detection block in \`claude-code-review.yml\` once the"
+              echo "upstream regression is fixed, to restore strict fail-closed behaviour."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
 
           if [ "$model_error" = "true" ]; then
