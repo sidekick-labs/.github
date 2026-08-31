@@ -362,6 +362,13 @@ jobs:
         # requests an OIDC token at startup regardless of auth method; without it
         # this step failed on every release and the fallback was the only path
         # ever taken.
+        #
+        # Effort: per-lane opt-up to `medium` (not a floor change). Theme
+        # extraction/de-dup over a full release's PRs is genuine summarization
+        # judgement where more reasoning helps; the step is best-effort, off the
+        # deploy critical path, and low-volume, so the extra latency is free.
+        # Rationale: Agents-on-Rails F5 (asymmetric scaling); see
+        # claude-effort-tiering.md. Revisit on the next CLAUDE_MODEL re-sweep.
         id: ai_summary
         if: ${{ !inputs.dry_run && success() && steps.ff_push.outputs.already_at_target != 'true' && inputs.slack_channel != '' }}
         continue-on-error: true
@@ -371,7 +378,7 @@ jobs:
           claude_args: >-
             --model ${{ vars.CLAUDE_MODEL || 'claude-sonnet-4-6' }}
             --allowed-tools Read,Write
-            --effort ${{ vars.CLAUDE_EFFORT || 'low' }}
+            --effort ${{ vars.CLAUDE_EFFORT || 'medium' }}
           prompt: |
             /tmp/release-prs.txt lists the PRs/commits in this production release of `${{ inputs.image_repo }}`. Read it, then WRITE a concise "what's shipping" summary to /tmp/release-summary.md.
 
