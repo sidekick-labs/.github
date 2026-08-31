@@ -318,8 +318,21 @@ jobs:
       # $RUNNER_TEMP/claude-execution-output.json as the documented location —
       # used as a fallback in case the output is empty.
       - name: Verify a review actually ran
-        # Runs only if the first attempt failed. NOT continue-on-error, so the
-        # failure branches below fail the job naturally.
+        # Runs only if the first attempt failed. The failure branches below normally
+        # fail the job (this gate is fail-closed BY DESIGN — a green check must mean a
+        # review actually happened).
+        #
+        # TEMPORARY (2026-08-31): overridden to continue-on-error while an upstream
+        # claude-code-action regression returns is_error on turn 1 ("directory
+        # mismatch … tsconfig.json") DETERMINISTICALLY. The retry above was built for
+        # the transient case and can't absorb a deterministic CLI crash, so this gate
+        # currently red-lines EVERY PR estate-wide and misclassifies a fixable CLI bug
+        # as an auth/outage failure. The diagnostics and step-summary below still emit
+        # (so a genuine token/outage failure is still loudly visible for a human to act
+        # on) — continue-on-error only stops the CLI-side flake from hard-blocking
+        # otherwise-clean merges. ⚠️ Revert this line the moment upstream is fixed to
+        # restore the fail-closed merge gate.
+        continue-on-error: true
         if: steps.review.outcome == 'failure'
         env:
           RETRY_OUTCOME: ${{ steps.review_retry.outcome }}
