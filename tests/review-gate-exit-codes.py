@@ -173,7 +173,7 @@ def run_reviewable(script, files):
             "PR": "1",
             "GH_TOKEN": "stub",
         })
-        proc = subprocess.run(["bash", "-c", script], env=env,
+        proc = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", script], env=env,
                               capture_output=True, text=True)
         skip = None
         with open(out) as fh:
@@ -237,9 +237,15 @@ def run_verdict(script, comments, nonce="99-1", gh_ok=True, conclusion="success"
             # YAML directly and never goes through this env.
             "REVIEW_AUTHOR": author,
         })
-        proc = subprocess.run(["bash", "-c", script], env=env,
-                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              text=True)
+        # `-e -o pipefail` mirrors the runner's `shell: bash` (`bash --noprofile
+        # --norc -e -o pipefail {0}`). Running the script with a bare `bash -c`
+        # hid a real defect: a no-match `grep` in a `$(...)` assignment aborts
+        # the step under `-e` BEFORE `fail_closed` can report, which is exactly
+        # what .github#167 (run 35676795661) showed — exit 1 and nothing else.
+        # This suite passed the whole time because it never ran under `-e`.
+        proc = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", script],
+                              env=env, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True)
         with open(summary) as fh:
             return proc.returncode, proc.stdout, fh.read()
 
@@ -276,7 +282,7 @@ def run_mechanical(script, author, ref, files):
             "REPO": "sidekick-labs/example",
             "PR": "1",
         })
-        proc = subprocess.run(["bash", "-c", script], env=env,
+        proc = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", script], env=env,
                               capture_output=True, text=True)
         skip = None
         with open(out) as fh:
@@ -300,7 +306,7 @@ def run_token_check(script, token="", is_fork="false", author="someone"):
             "PR_AUTHOR": author,
             "GITHUB_OUTPUT": out,
         })
-        proc = subprocess.run(["bash", "-c", script], env=env,
+        proc = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", script], env=env,
                               capture_output=True, text=True)
         skip = ""
         for line in open(out):
@@ -326,7 +332,7 @@ def run_gate(script, execution_log=None, retry_outcome="failure", write_file=Tru
             "GITHUB_STEP_SUMMARY": os.path.join(tmp, "summary.md"),
         })
         proc = subprocess.run(
-            ["bash", "-c", script], env=env,
+            ["bash", "-e", "-o", "pipefail", "-c", script], env=env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         )
         return proc.returncode, proc.stdout
@@ -401,7 +407,7 @@ def main():
         env.update({"RETRY_OUTCOME": "failure", "EXECUTION_FILE": bad,
                     "RUNNER_TEMP": tmp,
                     "GITHUB_STEP_SUMMARY": os.path.join(tmp, "s.md")})
-        rc = subprocess.run(["bash", "-c", script], env=env,
+        rc = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", script], env=env,
                             stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL).returncode
     check("unparseable execution log -> exit 1", rc == 1, f"got {rc}")
@@ -580,9 +586,30 @@ def main():
     check("  ... and says how many stale markers it saw", "1 verdict marker" in summary
           or "1 verdict marker(s)" in summary, f"summary={summary[:200]!r}")
 
-    rc, _, _ = run_verdict(verdict, ["I reviewed it and it seems fine to me."])
+    rc, out, summary = run_verdict(verdict, ["I reviewed it and it seems fine to me."])
     check("no marker at all -> exit 1 (fail closed; also catches the zero-turn "
           "prose answer of octo-brain#276)", rc == 1, f"got {rc}")
+    # THE #167 SILENT EXIT. Under the runner's `bash -e -o pipefail` the
+    # `markers=$(... | grep ...)` assignment aborted the step on no-match before
+    # `fail_closed` ran: red, but with no annotation and no summary to say why.
+    # Failing closed is only useful if it says so (sidekick-labs/sre-brain#568).
+    check("  ... and says so LOUDLY: a ::error annotation is emitted",
+          "::error" in out, f"stdout={out[:200]!r}")
+    check("  ... and writes the step summary", "verdict undeterminable" in summary,
+          f"summary={summary[:200]!r}")
+
+    # NO PROSE FALLBACK. A "No BLOCKING findings" sentence is not a verdict: it is
+    # not bound to the run nonce and is trivially produced by a reviewer that read
+    # nothing. The contract is the marker; a missing one is a prompt bug, not a
+    # reason to loosen the parser.
+    rc, _, _ = run_verdict(
+        verdict, ["Reviewed thoroughly.\n\nNo BLOCKING findings."])
+    check("'No BLOCKING findings' prose WITHOUT a marker -> exit 1 (prose is not "
+          "a verdict; the contract stays the marker)", rc == 1, f"got {rc}")
+    rc, _, _ = run_verdict(
+        verdict, ["No correctness, security, or behavioural defects introduced."])
+    check("the exact #167 closing sentence WITHOUT a marker -> exit 1", rc == 1,
+          f"got {rc}")
 
     # ---- FORGERY. The author is part of the contract, not just the nonce. ----
     #
@@ -685,6 +712,34 @@ def main():
               "github.run_id" in blk and "github.run_attempt" in blk)
         check(f"'{step}' prompt defines the severity split",
               "ADVISORY" in blk)
+        # The model omitted the marker on two consecutive real reviews (#159,
+        # #167) while the requirement sat mid-prompt. It now has to be the LAST
+        # section, framed as the FINAL LINE, with the literal to emit.
+        # Indentation scan, not a regex: the prompt body is every line after
+        # `prompt: |` deeper-indented than the key. (A `(?:#.*\n\s*)*` regex
+        # here backtracked catastrophically.)
+        lines = blk.split("\n")
+        pi = next((i for i, l in enumerate(lines) if l.strip() == "prompt: |"), None)
+        check(f"'{step}' has a block-scalar prompt", pi is not None)
+        prompt = None
+        if pi is not None:
+            key_indent = len(lines[pi]) - len(lines[pi].lstrip())
+            body_lines = []
+            for l in lines[pi + 1:]:
+                if l.strip() and (len(l) - len(l.lstrip())) <= key_indent:
+                    break
+                body_lines.append(l)
+            prompt = "\n".join(body_lines)
+        if prompt:
+            body = prompt
+            last_heading = [l for l in body.split("\n") if l.strip().startswith("## ")][-1]
+            check(f"'{step}' prompt's LAST section is the FINAL LINE marker rule",
+                  "FINAL LINE" in last_heading, f"last heading={last_heading.strip()!r}")
+            check(f"'{step}' prompt says the comment is REJECTED without the marker",
+                  "REJECTED" in body)
+            check(f"'{step}' prompt gives the literal PASS and BLOCKING lines to emit",
+                  "<!-- claude-review-verdict: PASS run=${{ github.run_id }}-${{ github.run_attempt }} -->" in body
+                  and "<!-- claude-review-verdict: BLOCKING run=${{ github.run_id }}-${{ github.run_attempt }} -->" in body)
 
     # A skip must leave a record that outlives the run's step summary, now that a
     # green here is what arms auto-merge.
