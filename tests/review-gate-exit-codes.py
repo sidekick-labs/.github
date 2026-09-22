@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# shim smoke 2026-09-22: reviewable line so the composite runs the model path
 """Exit-code contract tests for the Claude Code Review merge gate.
 
 Why this exists
