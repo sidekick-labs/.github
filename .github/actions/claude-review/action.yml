@@ -436,7 +436,10 @@ runs:
           Use the repository's CLAUDE.md for guidance on style and conventions.
           Be constructive and helpful in your feedback.
 
-          Use `gh pr comment` with your Bash tool to leave your review as a comment on the PR.
+          Leave your review as a comment on the PR. Either channel is fine: update
+          the tracking comment this action already created for you, or post a new
+          one with `gh pr comment`. Whichever you use, the verdict-marker rule at
+          the end of this prompt applies to THAT comment.
 
           ## Severity — this review is a MERGE GATE, so classify every finding
 
@@ -467,9 +470,12 @@ runs:
           findings" is NOT read and does NOT count. Without the marker the merge
           gate FAILS CLOSED and the PR is blocked even if your review was clean.
 
-          Before you call `gh pr comment`, append exactly ONE of these two lines
-          as the LAST line of the comment body, copied verbatim: do not alter the
-          run id, do not wrap it in a code fence, do not add anything after it.
+          This applies to whichever comment carries your review — the tracking
+          comment you update with `update_claude_comment` just as much as one you
+          post with `gh pr comment`. It is NOT conditional on using any particular
+          tool: before you write that comment's body, append exactly ONE of these
+          two lines as its LAST line, copied verbatim — do not alter the run id, do
+          not wrap it in a code fence, do not add anything after it.
           Emit it exactly once, in the comment that carries your review, and
           nowhere else. Emit it even if you have nothing else to say.
 
@@ -524,7 +530,10 @@ runs:
           Use the repository's CLAUDE.md for guidance on style and conventions.
           Be constructive and helpful in your feedback.
 
-          Use `gh pr comment` with your Bash tool to leave your review as a comment on the PR.
+          Leave your review as a comment on the PR. Either channel is fine: update
+          the tracking comment this action already created for you, or post a new
+          one with `gh pr comment`. Whichever you use, the verdict-marker rule at
+          the end of this prompt applies to THAT comment.
 
           ## Severity — this review is a MERGE GATE, so classify every finding
 
@@ -555,9 +564,12 @@ runs:
           findings" is NOT read and does NOT count. Without the marker the merge
           gate FAILS CLOSED and the PR is blocked even if your review was clean.
 
-          Before you call `gh pr comment`, append exactly ONE of these two lines
-          as the LAST line of the comment body, copied verbatim: do not alter the
-          run id, do not wrap it in a code fence, do not add anything after it.
+          This applies to whichever comment carries your review — the tracking
+          comment you update with `update_claude_comment` just as much as one you
+          post with `gh pr comment`. It is NOT conditional on using any particular
+          tool: before you write that comment's body, append exactly ONE of these
+          two lines as its LAST line, copied verbatim — do not alter the run id, do
+          not wrap it in a code fence, do not add anything after it.
           Emit it exactly once, in the comment that carries your review, and
           nowhere else. Emit it even if you have nothing else to say.
 
