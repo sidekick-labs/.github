@@ -740,6 +740,14 @@ def main():
             check(f"'{step}' prompt gives the literal PASS and BLOCKING lines to emit",
                   "<!-- claude-review-verdict: PASS run=${{ github.run_id }}-${{ github.run_attempt }} -->" in body
                   and "<!-- claude-review-verdict: BLOCKING run=${{ github.run_id }}-${{ github.run_attempt }} -->" in body)
+            # The reviewer writes into the tracking comment this action creates
+            # (`update_claude_comment`), not via `gh pr comment` — observed on
+            # #167 and estate-wide. A marker rule phrased as "before you call
+            # `gh pr comment`" therefore never fires: the trigger is an action the
+            # model does not take. The rule must name the tracking comment too.
+            check(f"'{step}' marker rule is not conditioned on `gh pr comment` alone",
+                  "update_claude_comment" in body,
+                  "the FINAL LINE section must name the tracking-comment channel")
 
     # A skip must leave a record that outlives the run's step summary, now that a
     # green here is what arms auto-merge.
