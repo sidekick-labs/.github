@@ -3,10 +3,25 @@ name: PR
 # Triggers reviews on pull requests opened against this repo. The actual
 # review logic lives in `claude-code-review.yml` (a `workflow_call` reusable
 # also consumed by the rest of the org), so this file is intentionally thin.
+#
+# `Claude Code Review / Claude Code Review` is a REQUIRED status check on this
+# repo's `main`, so this caller must honour the caller contract documented at the
+# top of the reusable's job. Two of the three obligations are visible right here:
+#
+#   * NO `paths:` / `paths-ignore:` filter. A filtered-out PR never triggers the
+#     workflow, so the required context is never reported and the PR hangs. Path
+#     exclusions live INSIDE the reusable, where they skip the work but still
+#     report the context.
+#   * `ready_for_review` in `types:` — added 2026-08-17. The reusable's job is
+#     gated on `draft == false` (a draft cannot merge, and a green "skipped:
+#     draft" would be a false green waiting to be inherited). Without this event a
+#     PR opened as a draft and later marked ready never runs the job again, and
+#     its required check sits forever-pending. This repo was one event short of
+#     that hang.
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, ready_for_review]
 
 permissions: {}
 

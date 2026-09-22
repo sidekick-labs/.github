@@ -55,11 +55,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # guard does not look at composite actions (measured: .github#145 / #147 changed
 # a composite and reviewed normally). So the STEP SCRIPTS live here now...
 ACTION = os.path.join(ROOT, ".github", "actions", "claude-review", "action.yml")
-# ...while the calling workflow still carries its own (now duplicated) copy until
-# the shim flip lands. That duplication is deliberate and short-lived: the shim
-# change edits the file `claude-code-action` validates, so it cannot ride along
-# with this PR without making this PR unreviewable. The assertions that pin the
-# shim thin arrive with it.
+# ...and the workflow keeps only the shim structure the tests still assert on.
+WORKFLOW = os.path.join(ROOT, ".github", "workflows", "claude-code-review.yml")
 
 GATE_STEP = "Verify a review actually ran"
 VERDICT_STEP = "Determine the review VERDICT"
@@ -68,6 +65,7 @@ REVIEWABLE_STEP = "Classify — is there anything here to REVIEW?"
 # `gh pr view` (GraphQL) reports a bare `claude`; REST reports `claude[bot]`.
 # The verdict step reads REST, so this is the form that must match.
 REVIEW_AUTHOR = "claude[bot]"
+CALLER = os.path.join(ROOT, ".github", "workflows", "pr.yml")
 MECHANICAL_STEP = "Classify \u2014 is this a MECHANICAL pull request?"
 TOKEN_STEP = "Check for Claude OAuth token"
 REVIEW_STEP = "Run Claude Code Review"
@@ -357,6 +355,9 @@ def main():
     # `src` is the COMPOSITE: every step script under test lives there now.
     with open(ACTION) as fh:
         src = fh.read()
+    # `shim` is the calling workflow, which must stay thin — see the shim guards.
+    with open(WORKFLOW) as fh:
+        shim = fh.read()
     script = gate_script(src)
 
     if subprocess.run(["which", "jq"], stdout=subprocess.DEVNULL).returncode != 0:
@@ -779,6 +780,55 @@ def main():
               "carry this condition rather than inherit it")
 
     # ---------------------------------------------------------------------
+    # THE CALLER CONTRACT.
+    #
+    # The reusable cannot enforce these on the ~21 thin callers, but it can
+    # enforce them on the one caller that lives in this repo — where the context
+    # is ALREADY a required check, so a regression here is an immediate estate
+    # incident rather than a latent one.
+    # ---------------------------------------------------------------------
+    print("caller contract (.github/workflows/pr.yml):")
+    with open(CALLER) as fh:
+        caller = fh.read()
+    caller_body = strip_comments(caller)
+    check("caller declares NO paths-ignore (a filtered-out PR never triggers the "
+          "workflow, so a REQUIRED context is never reported and the PR hangs)",
+          "paths-ignore" not in caller_body)
+    check("caller declares NO paths filter either", "paths:" not in caller_body)
+    check("caller listens for ready_for_review (the reusable job-gates on "
+          "draft == false; without this event a draft marked ready never runs the "
+          "job again and its required check hangs forever)",
+          "ready_for_review" in caller_body)
+    check("caller's review job has no job-level `if:` that could suppress the "
+          "ready transition",
+          not re.search(r"^\s+if:", caller_body, re.M),
+          "a job-level if: on the caller can reintroduce the draft hang")
+
+    # The job-level draft gate is a DELIBERATE non-reporter, and the reason is
+    # subtle enough to be refactored away by someone tidying up: a green
+    # "skipped: draft" would be inherited the instant the PR is marked ready.
+    job_hdr = shim[shim.index("  claude_review:"):shim.index("    steps:")]
+    check("the reusable still job-gates on draft == false (a draft cannot merge; "
+          "reporting green for one would be a false green waiting to be inherited)",
+          "github.event.pull_request.draft == false" in job_hdr)
+    check("the caller contract is documented where a caller author will see it",
+          "CALLER CONTRACT" in shim and "ready_for_review" in shim
+          and "paths-ignore" in shim)
+
+    # ---------------------------------------------------------------------
+    # THE SHIM MUST STAY THIN.
+    #
+    # This is the property that keeps the deadlock closed. `claude-code-action`
+    # validates the workflow file it runs from against the default branch, so any
+    # logic that lives in the workflow can only be changed by a PR that the review
+    # itself cannot pass. Logic belongs in the composite, which is not validated.
+    #
+    # Asserted structurally rather than trusted to a comment, because the failure
+    # mode is silent and slow: one `run:` step added here for convenience, and the
+    # next person to edit the review finds the check unmergeable with no
+    # explanation of why.
+    # ---------------------------------------------------------------------
+    # ---------------------------------------------------------------------
     # IS THE COMPOSITE A VALID COMPOSITE?
     #
     # This suite is the ONLY pre-merge exercise the composite gets, and the gap is
@@ -847,6 +897,25 @@ def main():
               == REVIEW_AUTHOR,
               f"got {comp.get('inputs', {}).get('review_author', {}).get('default')!r}, "
               f"want {REVIEW_AUTHOR!r}")
+
+    print("shim thinness (this is what keeps the deadlock closed):")
+    shim_jobs = shim[shim.index("jobs:"):]
+    check("the shim contains NO inline `run:` logic (it would be unmergeable to "
+          "change, because the action validates this file against the default branch)",
+          not re.search(r"^\s+run:", shim_jobs, re.M),
+          "move it into .github/actions/claude-review/action.yml")
+    check("the shim delegates to the claude-review composite",
+          "actions/claude-review@" in shim_jobs)
+    check("the shim does NOT invoke claude-code-action directly (that is the "
+          "invocation whose presence makes a file validated)",
+          "anthropics/claude-code-action" not in shim_jobs)
+    check("the shim resolves what the composite cannot: the secret and `vars`",
+          "secrets.CLAUDE_CODE_OAUTH_TOKEN" in shim_jobs
+          and "vars.CLAUDE_MODEL" in shim_jobs,
+          "neither context is available inside a composite action")
+    check("the composite declares an input for each of them",
+          "claude_code_oauth_token:" in src and "claude_model:" in src
+          and "github_token:" in src)
 
     print()
     if failures:
