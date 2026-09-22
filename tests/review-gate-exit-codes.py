@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# shim smoke 2026-09-22: reviewable line so the composite runs the model path (re-run after v3 advanced)
+# shim smoke 2026-09-22: re-run after the marker-channel fix (v3=e7b20131)
 """Exit-code contract tests for the Claude Code Review merge gate.
 
 Why this exists
