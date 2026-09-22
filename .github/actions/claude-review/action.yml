@@ -417,7 +417,7 @@ runs:
       # The step's own conclusion stays honest in the UI; the verify step
       # decides the JOB conclusion.
       continue-on-error: true
-      uses: anthropics/claude-code-action@9d7150bc8a3dae8149739a88019d192b579ad90c # v1.0.168 (bundled CLI validates OAuth after 2026-07-07 Anthropic auth change; old pins 401)
+      uses: anthropics/claude-code-action@4036a180cf690f49529f5d8c79c998855287f590 # v1.0.230 (bundled CLI validates OAuth after 2026-07-07 Anthropic auth change; old pins 401). Dependabot does NOT scan composites — keep in step with the pin the workflows use.
       with:
         claude_code_oauth_token: ${{ inputs.claude_code_oauth_token }}
         track_progress: true
@@ -460,24 +460,24 @@ runs:
           in the finding and mark it ADVISORY. Do not inflate a preference into a
           BLOCKING finding, and do not soften a defect to keep a PR moving.
 
-          ## Verdict marker — REQUIRED, machine-read
+          ## FINAL LINE OF YOUR COMMENT — MANDATORY, MACHINE-READ
 
-          The LAST LINE of that same PR comment must be exactly one of these two
-          lines, copied verbatim (do not alter the run id, do not wrap it in a
-          code fence):
+          Your PR comment is REJECTED unless its very last line is the verdict
+          marker. A deterministic step parses it; prose such as "No BLOCKING
+          findings" is NOT read and does NOT count. Without the marker the merge
+          gate FAILS CLOSED and the PR is blocked even if your review was clean.
 
-              <!-- claude-review-verdict: BLOCKING run=${{ github.run_id }}-${{ github.run_attempt }} -->
-              <!-- claude-review-verdict: PASS run=${{ github.run_id }}-${{ github.run_attempt }} -->
+          Before you call `gh pr comment`, append exactly ONE of these two lines
+          as the LAST line of the comment body, copied verbatim: do not alter the
+          run id, do not wrap it in a code fence, do not add anything after it.
+          Emit it exactly once, in the comment that carries your review, and
+          nowhere else. Emit it even if you have nothing else to say.
 
-          Use BLOCKING if you raised one or more BLOCKING findings. Use PASS
-          otherwise — including when you raised only ADVISORY findings, and when
-          you found nothing at all.
+          If you raised one or more BLOCKING findings, the last line is:
+          <!-- claude-review-verdict: BLOCKING run=${{ github.run_id }}-${{ github.run_attempt }} -->
 
-          A deterministic step parses this marker to decide whether the
-          `Claude Code Review` merge gate passes. If it is missing, malformed, or
-          carries the wrong run id, the gate FAILS CLOSED and the PR is blocked —
-          so emit it even if you have nothing else to say. Emit it exactly once,
-          in the comment that carries your review, and nowhere else.
+          Otherwise (ADVISORY findings only, or nothing found), the last line is:
+          <!-- claude-review-verdict: PASS run=${{ github.run_id }}-${{ github.run_attempt }} -->
 
         # Read/Glob/Grep let the reviewer inspect the checked-out source
         # (type defs, tests, the CLAUDE.md the prompt references) instead of
@@ -505,7 +505,7 @@ runs:
       id: review_retry
       if: steps.review.outcome == 'failure'
       continue-on-error: true
-      uses: anthropics/claude-code-action@9d7150bc8a3dae8149739a88019d192b579ad90c # v1.0.168 (bundled CLI validates OAuth after 2026-07-07 Anthropic auth change; old pins 401)
+      uses: anthropics/claude-code-action@4036a180cf690f49529f5d8c79c998855287f590 # v1.0.230 (bundled CLI validates OAuth after 2026-07-07 Anthropic auth change; old pins 401). Dependabot does NOT scan composites — keep in step with the pin the workflows use.
       with:
         claude_code_oauth_token: ${{ inputs.claude_code_oauth_token }}
         track_progress: true
@@ -548,24 +548,24 @@ runs:
           in the finding and mark it ADVISORY. Do not inflate a preference into a
           BLOCKING finding, and do not soften a defect to keep a PR moving.
 
-          ## Verdict marker — REQUIRED, machine-read
+          ## FINAL LINE OF YOUR COMMENT — MANDATORY, MACHINE-READ
 
-          The LAST LINE of that same PR comment must be exactly one of these two
-          lines, copied verbatim (do not alter the run id, do not wrap it in a
-          code fence):
+          Your PR comment is REJECTED unless its very last line is the verdict
+          marker. A deterministic step parses it; prose such as "No BLOCKING
+          findings" is NOT read and does NOT count. Without the marker the merge
+          gate FAILS CLOSED and the PR is blocked even if your review was clean.
 
-              <!-- claude-review-verdict: BLOCKING run=${{ github.run_id }}-${{ github.run_attempt }} -->
-              <!-- claude-review-verdict: PASS run=${{ github.run_id }}-${{ github.run_attempt }} -->
+          Before you call `gh pr comment`, append exactly ONE of these two lines
+          as the LAST line of the comment body, copied verbatim: do not alter the
+          run id, do not wrap it in a code fence, do not add anything after it.
+          Emit it exactly once, in the comment that carries your review, and
+          nowhere else. Emit it even if you have nothing else to say.
 
-          Use BLOCKING if you raised one or more BLOCKING findings. Use PASS
-          otherwise — including when you raised only ADVISORY findings, and when
-          you found nothing at all.
+          If you raised one or more BLOCKING findings, the last line is:
+          <!-- claude-review-verdict: BLOCKING run=${{ github.run_id }}-${{ github.run_attempt }} -->
 
-          A deterministic step parses this marker to decide whether the
-          `Claude Code Review` merge gate passes. If it is missing, malformed, or
-          carries the wrong run id, the gate FAILS CLOSED and the PR is blocked —
-          so emit it even if you have nothing else to say. Emit it exactly once,
-          in the comment that carries your review, and nowhere else.
+          Otherwise (ADVISORY findings only, or nothing found), the last line is:
+          <!-- claude-review-verdict: PASS run=${{ github.run_id }}-${{ github.run_attempt }} -->
 
         claude_args: '--model ${{ inputs.claude_model }} --allowed-tools "Read,Glob,Grep,Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)" --effort medium'
 
@@ -844,9 +844,27 @@ runs:
 
         # Only markers carrying THIS run+attempt count — a marker from an earlier
         # push describes an earlier diff.
+        #
+        # `|| true` IS LOAD-BEARING. The runner executes this script under
+        # `bash -e -o pipefail`, so a no-match `grep` (exit 1) would abort the
+        # step HERE — before `fail_closed` prints its `::error` and summary.
+        # That is exactly what happened on .github#167 (run 35676795661): a red
+        # check whose only output was "Process completed with exit code 1".
+        # Fail-closed is unchanged — an empty `$markers` still fails below — it
+        # just fails LOUDLY (sidekick-labs/sre-brain#568).
         markers=$(printf '%s\n' "$authored" \
           | grep -oE "<!-- claude-review-verdict: [A-Za-z]+ run=${RUN_NONCE} -->" \
-          | sed -E 's/^<!-- claude-review-verdict: ([A-Za-z]+) .*$/\1/')
+          | sed -E 's/^<!-- claude-review-verdict: ([A-Za-z]+) .*$/\1/' || true)
+
+        # NO PROSE FALLBACK — deliberately. The reviewer's comment on #167 ended
+        # in "No correctness, security, or behavioural defects introduced" with no
+        # marker, and it is tempting to read a "No BLOCKING findings" sentinel as
+        # PASS when the marker is absent. Do not: prose is not bound to the run
+        # nonce (a stale sentence from an earlier push would satisfy a later
+        # diff), it is trivially produced by a reviewer that read nothing, and it
+        # would make the contract "marker OR whatever we grep for this month". The
+        # contract is the marker; a missing marker is a prompt bug to fix, not a
+        # parse rule to loosen. Fail closed.
 
         if [ -z "$markers" ]; then
           # An IGNORED forgery is reported, never silently dropped. A rejected
