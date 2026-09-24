@@ -1,0 +1,46 @@
+name: estate-check
+
+# Reusable agent-config lint (rarebit-one/estate-check): instruction-file budgets,
+# permission bypasses, CI agent-step hygiene, MCP pinning, machine-local paths.
+# It runs with the caller's own read-only token, so no cross-org credential is involved.
+#
+# Consume from a repo:
+#
+#   on:
+#     pull_request:
+#     push:
+#       branches: [main]
+#     schedule:
+#       - cron: "23 2 * * 1"
+#   permissions:
+#     contents: read
+#   jobs:
+#     estate-check:
+#       uses: <org>/.github/.github/workflows/estate-check.yml@main
+#       with:
+#         mode: report   # switch to enforce (and make the check required) once clean
+#
+# Bump the pinned action here, once per org, and every caller follows.
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: "report (annotate, never fail) or enforce (fail on any error finding)"
+        type: string
+        default: report
+
+permissions:
+  contents: read
+
+jobs:
+  estate-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: rarebit-one/estate-check@ee2755bb81ddf1519659d77b54db3d807cb14c66 # v1.0.0
+        with:
+          mode: ${{ inputs.mode }}
