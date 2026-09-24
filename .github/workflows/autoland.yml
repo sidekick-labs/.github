@@ -1,0 +1,134 @@
+name: autoland
+
+# Reusable autoland sweeper (rarebit-one/autoland). INERT by default: a calling
+# repo is a dry run, logging "would land #N", until it sets the repo variable
+# AUTOLAND_LIVE=true (actuator-arming convention). Disarm by deleting it.
+#
+# The merge uses this org's release-bot App (not GITHUB_TOKEN), so push-triggered
+# deploys fire for landed commits. No PR code is checked out, so callers may
+# trigger this on pull_request_target safely.
+#
+# Opt a repo in with a caller like:
+#
+#   on:
+#     workflow_run:
+#       workflows: [CI]                 # workflows that produce the required checks
+#       types: [completed]
+#     pull_request_review:
+#       types: [submitted]
+#     pull_request_target:
+#       types: [labeled]
+#     schedule:
+#       - cron: "23 */6 * * *"          # safety net
+#     workflow_dispatch:
+#   permissions:
+#     contents: read
+#     pull-requests: write
+#     checks: read
+#     statuses: read
+#     actions: read
+#     issues: write
+#   concurrency:
+#     group: autoland
+#     cancel-in-progress: false
+#   jobs:
+#     autoland:
+#       uses: sidekick-labs/.github/.github/workflows/autoland.yml@main
+#       secrets: inherit
+#       with:
+#         required-contexts: |
+#           CI
+#
+# Then label PRs `auto-land`. `hold` / `no-auto-land` labels or a STOP comment block a PR.
+
+on:
+  workflow_call:
+    inputs:
+      required-contexts:
+        description: "Newline-separated check names that must all be green. Required."
+        type: string
+        required: true
+      verdict-workflow:
+        description: "Optional pull_request_target review-verdict workflow path that must have succeeded for the head."
+        type: string
+        default: ""
+      label:
+        type: string
+        default: auto-land
+
+permissions:
+  contents: read
+
+jobs:
+  sweep:
+    name: Sweep eligible PRs
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Serialise sweeps here, not only in the caller: overlapping runs could both
+    # see no open heartbeat issue and open two.
+    concurrency:
+      group: autoland-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      pull-requests: write
+      checks: read
+      statuses: read
+      actions: read
+    steps:
+      - name: Mint the release-bot App token for the merge
+        id: app
+        # A missing credential or uninstalled App must drop to the next rung, not
+        # take the sweeper down; the action reports the rung it ends up on.
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.SIDEKICK_RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.SIDEKICK_RELEASE_BOT_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+      - uses: rarebit-one/autoland@2b2abe4b9baefa8190e70420728e80681adbd4b0 # v1.0.0
+        with:
+          required-contexts: ${{ inputs.required-contexts }}
+          verdict-workflow: ${{ inputs.verdict-workflow }}
+          label: ${{ inputs.label }}
+          live: ${{ vars.AUTOLAND_LIVE == 'true' }}
+          app-token: ${{ steps.app.outputs.token }}
+          pat: ${{ secrets.AUTOLAND_PAT }}
+
+  # Crash heartbeat: a sweep that dies before reporting opens ONE issue, and the
+  # next successful run closes it.
+  alert:
+    needs: [sweep]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # The issue list-then-create below must not race another run's alert job.
+    concurrency:
+      group: autoland-alert-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      issues: write
+    steps:
+      - name: Flag failure or clear on recovery
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          # A timed-out or cancelled sweep reported nothing, so it counts as a failure.
+          FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+          SUCCEEDED: ${{ contains(needs.*.result, 'success') }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          EXISTING="$(gh issue list --search '"beat failure: autoland" in:title' --state open --json number --jq '.[0].number // empty')"
+          if [ "$FAILED" != "true" ]; then
+            if [ "$SUCCEEDED" = "true" ] && [ -n "$EXISTING" ]; then
+              gh issue close "$EXISTING" --comment "Recovered: autoland succeeded, $RUN_URL."
+            fi
+            exit 0
+          fi
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "Failed again: $RUN_URL"
+          else
+            gh issue create --title "beat failure: autoland ($(date -u +%F))" --body "The autoland sweep failed before it could report: $RUN_URL"
+          fi
