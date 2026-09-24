@@ -17,6 +17,40 @@ name: Auto-lander (Dependabot + autonomous engine PRs)
 # workflow checks out no PR code and runs no PR bundle — it only reads metadata
 # and calls the gh API. The only privileged action is "approve + enable
 # auto-merge", which still defers the actual merge to the required-checks gate.
+#
+# ---------------------------------------------------------------------------
+# MERGE TOKEN — App → GITHUB_TOKEN (loud fallback)
+# ---------------------------------------------------------------------------
+# GitHub does NOT emit workflow-triggering events for actions performed with the
+# automatic `GITHUB_TOKEN` (documented loop prevention). Native auto-merge is
+# attributed to whoever ENABLED it, so an enable done with `GITHUB_TOKEN` lands
+# as `github-actions[bot]` and fires NO `push` event — silently skipping every
+# `push`-triggered / `workflow_run`-chained workflow (deploy, sentry-release).
+# Estate CI audit finding A-4: 86 Dependabot merges across four orgs in 30 days
+# skipped their deploy + sentry-release chains this way (same failure class as
+# rarebit-one/jumpdrive-web#566).
+#
+# Fix, ported from rarebit-one/.github's lander: mint the org release-bot App's
+# installation token (`sidekick-labs-bot`, App id 3877791, installed on all repositories)
+# and use it ONLY for the `gh pr merge --auto` enable. An App-token action DOES
+# emit workflow-triggering events. Reads and the Dependabot approval keep
+# `GITHUB_TOKEN` — moving the approval would be a governance change, not a
+# push-event fix.
+#
+#   * `SIDEKICK_RELEASE_BOT_CLIENT_ID` — org VARIABLE (the App's Client ID)
+#   * `SIDEKICK_RELEASE_BOT_PRIVATE_KEY` — org SECRET
+#
+# If the mint fails (App not installed, secret not visible to the calling repo,
+# caller not passing `secrets: inherit`) the enable falls back to
+# `GITHUB_TOKEN` LOUDLY: a `::warning::` plus a job-summary block naming what
+# will not fire. A silent fallback is the bug being fixed.
+#
+# Every enable is also READ BACK (`autoMergeRequest != null`, or already
+# MERGED) and the step fails if nothing was queued — `gh pr merge --auto` can
+# report success while queueing nothing, and a swallowed failure reads green.
+#
+# CI-021: this job mints a write-capable App token, so it is pinned to a
+# GitHub-hosted runner (`ubuntu-latest`), never a self-hosted label.
 
 on:
   workflow_call:
@@ -47,6 +81,54 @@ jobs:
       contents: write
       pull-requests: write
     steps:
+      - name: Mint a release-bot App token for the merge
+        id: app_token
+        # `continue-on-error` is load-bearing: this action FAILS the step when the
+        # client-id / private key is missing or the App is not installed on the
+        # calling repo. On failure `steps.app_token.outputs.token` is empty and the
+        # enable below falls back (loudly) to GITHUB_TOKEN instead of the whole
+        # lander going down for that PR.
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.SIDEKICK_RELEASE_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.SIDEKICK_RELEASE_BOT_PRIVATE_KEY }}
+          # Scoped down to exactly what the enable needs.
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Resolve the merge token (App → GITHUB_TOKEN)
+        id: token
+        # Runs on every path so the decision is always recorded. Only a
+        # "true"/"false" comparison is interpolated — never a token.
+        env:
+          HAS_APP: ${{ steps.app_token.outputs.token != '' }}
+        run: |
+          set -euo pipefail
+          if [ "$HAS_APP" = "true" ]; then
+            echo "mode=release-bot App" >> "$GITHUB_OUTPUT"
+            {
+              echo "### Auto-lander merge token"
+              echo ""
+              echo "✅ Using the \`sidekick-labs-bot\` **App installation token** — the merge is attributed to the App, so downstream \`push\` / \`workflow_run\` workflows (deploy, sentry-release) WILL fire."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "mode=GITHUB_TOKEN (degraded)" >> "$GITHUB_OUTPUT"
+            echo "::warning::The sidekick-labs-bot App token is not available to this repo — falling back to GITHUB_TOKEN. GitHub emits no workflow-triggering events for GITHUB_TOKEN actions, so the resulting merge will fire NO push event: push-triggered / workflow_run-chained workflows (deploy, sentry-release) will NOT run for it. Check that the caller passes 'secrets: inherit', that the sidekick-labs-bot App is installed on this repo, and that SIDEKICK_RELEASE_BOT_CLIENT_ID / SIDEKICK_RELEASE_BOT_PRIVATE_KEY are visible to it."
+            {
+              echo "### Auto-lander merge token"
+              echo ""
+              echo "⚠️ **Degraded — no \`sidekick-labs-bot\` App token; falling back to \`GITHUB_TOKEN\`.**"
+              echo ""
+              echo "The merge will be attributed to \`github-actions[bot]\` and will emit **no \`push\` event**, so push-triggered and \`workflow_run\`-chained workflows (deploy, sentry-release) **will not fire** for it."
+              echo ""
+              echo "Check, in order:"
+              echo "1. the caller passes \`secrets: inherit\`;"
+              echo "2. the \`sidekick-labs-bot\` App is installed on this repository;"
+              echo "3. \`SIDEKICK_RELEASE_BOT_CLIENT_ID\` (org variable) and \`SIDEKICK_RELEASE_BOT_PRIVATE_KEY\` (org secret) are both visible to it."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Fetch Dependabot metadata
         id: metadata
         if: github.actor == 'dependabot[bot]'
@@ -76,9 +158,25 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_URL: ${{ github.event.pull_request.html_url }}
+          MERGE_TOKEN: ${{ steps.app_token.outputs.token || secrets.GITHUB_TOKEN }}
+          MERGE_TOKEN_MODE: ${{ steps.token.outputs.mode }}
         run: |
+          set -euo pipefail
           gh pr review --approve "$PR_URL" || true
-          gh pr merge --auto --squash "$PR_URL" || echo "::warning::auto-merge not enabled for $PR_URL"
+          GH_TOKEN="$MERGE_TOKEN" gh pr merge --auto --squash "$PR_URL" || echo "::warning::auto-merge not enabled for $PR_URL"
+
+          # Read the enable back. `gh pr merge --auto` can report success while
+          # queueing nothing — fail loudly instead of reading green. MERGED counts
+          # as success: when every requirement is already green GitHub merges
+          # outright and leaves no pending autoMergeRequest. `set -e` makes a
+          # flaky `gh pr view` abort rather than read as queued.
+          verdict=$(gh pr view "$PR_URL" --json autoMergeRequest,state \
+            --jq 'if .state == "MERGED" or .autoMergeRequest != null then "ok" else "not-queued" end')
+          if [ "$verdict" != "ok" ]; then
+            echo "::error::auto-merge was NOT queued on $PR_URL (autoMergeRequest null and state is not MERGED)"
+            exit 1
+          fi
+          echo "auto-merge queued (or already merged) on $PR_URL — merge token: $MERGE_TOKEN_MODE" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Enable auto-merge — autonomous SRE engine PR
         # Actor-gated (not just branch-prefix) — closes head-ref spoofing.
@@ -86,10 +184,26 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_URL: ${{ github.event.pull_request.html_url }}
+          MERGE_TOKEN: ${{ steps.app_token.outputs.token || secrets.GITHUB_TOKEN }}
+          MERGE_TOKEN_MODE: ${{ steps.token.outputs.mode }}
         run: |
+          set -euo pipefail
           # Engine PRs (issue-worker/*, ci-fix/*, sentry-autofix/*) are already
           # vetted by the engine's own guardrails (path guards, diff-line cap,
           # test gate, signed commit) before opening — so just enable squash
           # auto-merge and let the repo's required-checks gate do the rest, the
           # same as Dependabot.
-          gh pr merge --auto --squash "$PR_URL" || echo "::warning::auto-merge not enabled for $PR_URL"
+          GH_TOKEN="$MERGE_TOKEN" gh pr merge --auto --squash "$PR_URL" || echo "::warning::auto-merge not enabled for $PR_URL"
+
+          # Read the enable back. `gh pr merge --auto` can report success while
+          # queueing nothing — fail loudly instead of reading green. MERGED counts
+          # as success: when every requirement is already green GitHub merges
+          # outright and leaves no pending autoMergeRequest. `set -e` makes a
+          # flaky `gh pr view` abort rather than read as queued.
+          verdict=$(gh pr view "$PR_URL" --json autoMergeRequest,state \
+            --jq 'if .state == "MERGED" or .autoMergeRequest != null then "ok" else "not-queued" end')
+          if [ "$verdict" != "ok" ]; then
+            echo "::error::auto-merge was NOT queued on $PR_URL (autoMergeRequest null and state is not MERGED)"
+            exit 1
+          fi
+          echo "auto-merge queued (or already merged) on $PR_URL — merge token: $MERGE_TOKEN_MODE" >> "$GITHUB_STEP_SUMMARY"
