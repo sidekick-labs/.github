@@ -110,11 +110,11 @@ jobs:
             {
               echo "### Auto-lander merge token"
               echo ""
-              echo "✅ Using the \`sidekick-labs-bot\` **App installation token** — the merge is attributed to the App, so downstream \`push\` / \`workflow_run\` workflows (deploy, sentry-release) WILL fire."
+              echo "✅ Merge token: the \`sidekick-labs-bot\` **App installation token**. If this run enables auto-merge (see the enable step), the merge is attributed to the App, so downstream \`push\` / \`workflow_run\` workflows (deploy, sentry-release) will fire."
             } >> "$GITHUB_STEP_SUMMARY"
           else
             echo "mode=GITHUB_TOKEN (degraded)" >> "$GITHUB_OUTPUT"
-            echo "::warning::The sidekick-labs-bot App token is not available to this repo — falling back to GITHUB_TOKEN. GitHub emits no workflow-triggering events for GITHUB_TOKEN actions, so the resulting merge will fire NO push event: push-triggered / workflow_run-chained workflows (deploy, sentry-release) will NOT run for it. Check that the caller passes 'secrets: inherit', that the sidekick-labs-bot App is installed on this repo, and that SIDEKICK_RELEASE_BOT_CLIENT_ID / SIDEKICK_RELEASE_BOT_PRIVATE_KEY are visible to it."
+            echo "::warning::No sidekick-labs-bot App token — auto-merge falls back to GITHUB_TOKEN, so the merge fires NO push event (deploy/sentry-release will not run). See the job summary."
             {
               echo "### Auto-lander merge token"
               echo ""
@@ -163,17 +163,24 @@ jobs:
         run: |
           set -euo pipefail
           gh pr review --approve "$PR_URL" || true
-          GH_TOKEN="$MERGE_TOKEN" gh pr merge --auto --squash "$PR_URL" || echo "::warning::auto-merge not enabled for $PR_URL"
+          GH_TOKEN="$MERGE_TOKEN" gh pr merge --auto --squash "$PR_URL" || echo "::notice::gh pr merge --auto returned non-zero for $PR_URL (e.g. already merged) — the readback below decides"
 
           # Read the enable back. `gh pr merge --auto` can report success while
           # queueing nothing — fail loudly instead of reading green. MERGED counts
           # as success: when every requirement is already green GitHub merges
-          # outright and leaves no pending autoMergeRequest. `set -e` makes a
-          # flaky `gh pr view` abort rather than read as queued.
-          verdict=$(gh pr view "$PR_URL" --json autoMergeRequest,state \
-            --jq 'if .state == "MERGED" or .autoMergeRequest != null then "ok" else "not-queued" end')
+          # outright and leaves no pending autoMergeRequest. Up to 3 reads, 5s
+          # apart, so read-after-write lag can't turn a real enable red; a read
+          # that still fails (or still shows nothing queued) fails the step —
+          # it never reads as queued.
+          verdict=not-queued
+          for attempt in 1 2 3; do
+            verdict=$(gh pr view "$PR_URL" --json autoMergeRequest,state \
+              --jq 'if .state == "MERGED" or .autoMergeRequest != null then "ok" else "not-queued" end') || verdict=read-failed
+            if [ "$verdict" = "ok" ]; then break; fi
+            if [ "$attempt" -lt 3 ]; then sleep 5; fi
+          done
           if [ "$verdict" != "ok" ]; then
-            echo "::error::auto-merge was NOT queued on $PR_URL (autoMergeRequest null and state is not MERGED)"
+            echo "::error::auto-merge was NOT queued on $PR_URL ($verdict after 3 reads: autoMergeRequest null and state is not MERGED)"
             exit 1
           fi
           echo "auto-merge queued (or already merged) on $PR_URL — merge token: $MERGE_TOKEN_MODE" >> "$GITHUB_STEP_SUMMARY"
@@ -193,17 +200,24 @@ jobs:
           # test gate, signed commit) before opening — so just enable squash
           # auto-merge and let the repo's required-checks gate do the rest, the
           # same as Dependabot.
-          GH_TOKEN="$MERGE_TOKEN" gh pr merge --auto --squash "$PR_URL" || echo "::warning::auto-merge not enabled for $PR_URL"
+          GH_TOKEN="$MERGE_TOKEN" gh pr merge --auto --squash "$PR_URL" || echo "::notice::gh pr merge --auto returned non-zero for $PR_URL (e.g. already merged) — the readback below decides"
 
           # Read the enable back. `gh pr merge --auto` can report success while
           # queueing nothing — fail loudly instead of reading green. MERGED counts
           # as success: when every requirement is already green GitHub merges
-          # outright and leaves no pending autoMergeRequest. `set -e` makes a
-          # flaky `gh pr view` abort rather than read as queued.
-          verdict=$(gh pr view "$PR_URL" --json autoMergeRequest,state \
-            --jq 'if .state == "MERGED" or .autoMergeRequest != null then "ok" else "not-queued" end')
+          # outright and leaves no pending autoMergeRequest. Up to 3 reads, 5s
+          # apart, so read-after-write lag can't turn a real enable red; a read
+          # that still fails (or still shows nothing queued) fails the step —
+          # it never reads as queued.
+          verdict=not-queued
+          for attempt in 1 2 3; do
+            verdict=$(gh pr view "$PR_URL" --json autoMergeRequest,state \
+              --jq 'if .state == "MERGED" or .autoMergeRequest != null then "ok" else "not-queued" end') || verdict=read-failed
+            if [ "$verdict" = "ok" ]; then break; fi
+            if [ "$attempt" -lt 3 ]; then sleep 5; fi
+          done
           if [ "$verdict" != "ok" ]; then
-            echo "::error::auto-merge was NOT queued on $PR_URL (autoMergeRequest null and state is not MERGED)"
+            echo "::error::auto-merge was NOT queued on $PR_URL ($verdict after 3 reads: autoMergeRequest null and state is not MERGED)"
             exit 1
           fi
           echo "auto-merge queued (or already merged) on $PR_URL — merge token: $MERGE_TOKEN_MODE" >> "$GITHUB_STEP_SUMMARY"
