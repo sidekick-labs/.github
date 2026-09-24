@@ -75,6 +75,15 @@ inputs:
       so a differently-installed app can be named without editing logic.
     required: false
     default: 'claude[bot]'
+  allowed_bots:
+    description: >-
+      Comma-separated bot logins claude-code-action may run for (the PR event's
+      GITHUB_ACTOR). Defaults to the org App, the only non-Dependabot bot observed
+      opening/pushing reviewed PRs (Dependabot PRs are step-gated out above).
+      This repo is PUBLIC — never pass '*', which lets any third-party App drive
+      the review prompt.
+    required: false
+    default: 'sidekick-labs-bot'
 
 runs:
   using: composite
@@ -421,7 +430,7 @@ runs:
       with:
         claude_code_oauth_token: ${{ inputs.claude_code_oauth_token }}
         track_progress: true
-        allowed_bots: '*'
+        allowed_bots: ${{ inputs.allowed_bots }}
         prompt: |
           REPO: ${{ github.repository }}
           PR NUMBER: ${{ github.event.pull_request.number }}
@@ -515,7 +524,7 @@ runs:
       with:
         claude_code_oauth_token: ${{ inputs.claude_code_oauth_token }}
         track_progress: true
-        allowed_bots: '*'
+        allowed_bots: ${{ inputs.allowed_bots }}
         prompt: |
           REPO: ${{ github.repository }}
           PR NUMBER: ${{ github.event.pull_request.number }}

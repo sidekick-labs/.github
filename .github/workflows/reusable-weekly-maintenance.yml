@@ -140,6 +140,14 @@ on:
         required: false
         type: number
         default: 25
+      allowed-bots:
+        description: >-
+          Comma-separated bot logins claude-code-action may run for (the
+          caller's GITHUB_ACTOR — for `schedule`, whoever last pushed the cron).
+          Defaults to the org App. Extend per caller if needed; never '*'.
+        required: false
+        type: string
+        default: 'sidekick-labs-bot'
       review-security-alerts:
         description: 'Fetch open CodeQL code-scanning alerts so Claude fixes actionable ones and reports the rest in the PR. Never auto-dismisses.'
         required: false
@@ -622,7 +630,9 @@ jobs:
           # bot actors unless allow-listed; this reusable is now pinned at
           # v1.0.168, so opt in or the beat fails on bot-initiated runs. Mirrors
           # the inference fix (sidekick-inference#111). See ai-foundations-brain#298 / #299.
-          allowed_bots: "*"
+          # Explicit list (was "*"): only the org App by default; callers extend
+          # via the `allowed-bots` input.
+          allowed_bots: ${{ inputs.allowed-bots }}
           show_full_output: true
           prompt: ${{ steps.build-prompt.outputs.prompt }}
           claude_args: >-
