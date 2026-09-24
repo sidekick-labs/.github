@@ -29,6 +29,10 @@ on:
         description: "report (annotate, never fail) or enforce (fail on any error finding)"
         type: string
         default: report
+      workspace:
+        description: "true when the repo is an org workspace root (workspace-config): tighter budgets"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -44,3 +48,4 @@ jobs:
       - uses: rarebit-one/estate-check@ee2755bb81ddf1519659d77b54db3d807cb14c66 # v1.0.0
         with:
           mode: ${{ inputs.mode }}
+          workspace: ${{ inputs.workspace }}
