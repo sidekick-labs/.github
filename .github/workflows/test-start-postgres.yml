@@ -1,0 +1,198 @@
+name: Test start-postgres
+
+# Exercises .github/actions/start-postgres on GitHub-hosted ubuntu-latest.
+#
+# HOSTED ONLY, on purpose: this repo is public, and the jumpdrive-broker refuses
+# public repositories on the self-hosted fleet (a self-hosted runner reachable
+# from a fork PR is the classic RCE path). The jdb lane is proven by the
+# consumers' push-lane runs and by the capability smoke baked into the
+# jumpdrive-ci-runner image build (rarebit-one/jumpdrive-runner#121).
+#
+# Legs:
+#   pg18       the PGDG install path (hosted ubuntu-24.04 ships only 16): server
+#              AND pgvector are installed at job time. This is the lane every
+#              sidekick consumer uses while RUNNER_LABEL_HEAVY is unset.
+#   pg16       the "server already present" path, the shape of the jdb lane
+#              (binaries baked, nothing to install for the server).
+#   defaults   no extensions, no database, custom port, default database-url:
+#              the zero-install path (16 is preinstalled) and the "export
+#              nothing extra" contract.
+#   bad input  a major that does not exist must FAIL the action, never fall
+#              back; a non-boolean database-url must fail too.
+on:
+  pull_request:
+    paths:
+      - '.github/actions/start-postgres/**'
+      - '.github/workflows/test-start-postgres.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/actions/start-postgres/**'
+      - '.github/workflows/test-start-postgres.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  start:
+    name: start-postgres (pg${{ matrix.major }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        major: ['18', '16']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Start PostgreSQL
+        id: pg
+        uses: ./.github/actions/start-postgres
+        with:
+          major: ${{ matrix.major }}
+          extensions: vector
+          user: smoke_user
+          password: smoke_pw
+          database: smoke_db
+          database-url: 'true'
+
+      - name: Assert version, extension and exported env
+        env:
+          EXPECTED_MAJOR: ${{ matrix.major }}
+          OUTPUT_URL: ${{ steps.pg.outputs.database-url }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+
+          # Exported connection env.
+          [ "$PGHOST" = localhost ] || fail "PGHOST=$PGHOST"
+          [ "$PGPORT" = 5432 ] || fail "PGPORT=$PGPORT"
+          [ "$PGUSER" = smoke_user ] || fail "PGUSER=$PGUSER"
+          [ "$PGDATABASE" = smoke_db ] || fail "PGDATABASE=$PGDATABASE"
+          [ "$DATABASE_URL" = "postgresql://smoke_user:smoke_pw@localhost:5432/smoke_db" ] || fail "DATABASE_URL=$DATABASE_URL"
+          [ "$OUTPUT_URL" = "$DATABASE_URL" ] || fail "output database-url=$OUTPUT_URL"
+          [ -s "$START_POSTGRES_LOG" ] || fail "START_POSTGRES_LOG ($START_POSTGRES_LOG) missing or empty"
+
+          # The server-matched psql is first on PATH.
+          case "$(command -v psql)" in "/usr/lib/postgresql/$EXPECTED_MAJOR/bin/psql") ;; *) fail "psql on PATH is $(command -v psql)";; esac
+
+          # SELECT version() over DATABASE_URL (TCP, app-style).
+          version="$(psql "$DATABASE_URL" -qAtX -v ON_ERROR_STOP=1 -c 'SELECT version()')"
+          echo "version(): $version"
+          case "$version" in "PostgreSQL $EXPECTED_MAJOR."*) ;; *) fail "expected PostgreSQL $EXPECTED_MAJOR.x, got: $version";; esac
+
+          # The requested database already has vector (created via template1).
+          [ "$(psql -qAtX -c "SELECT count(*) FROM pg_extension WHERE extname = 'vector'")" = 1 ] \
+            || fail "vector is not installed in smoke_db"
+
+          # A plain CREATE EXTENSION vector in a fresh database (template0, so
+          # nothing is inherited) must succeed, and the type must work.
+          psql -qAtX -v ON_ERROR_STOP=1 -d postgres -c 'CREATE DATABASE fresh TEMPLATE template0'
+          psql -qAtX -v ON_ERROR_STOP=1 -d fresh -c 'CREATE EXTENSION vector'
+          dist="$(psql -qAtX -v ON_ERROR_STOP=1 -d fresh -c "SELECT '[1,2,3]'::vector <-> '[1,2,4]'::vector")"
+          [ "$dist" = 1 ] || fail "vector distance returned '$dist', expected 1"
+
+          # New databases inherit the extension from template1 (Rails db:create /
+          # parallel:create path).
+          psql -qAtX -v ON_ERROR_STOP=1 -d postgres -c 'CREATE DATABASE inherits'
+          [ "$(psql -qAtX -d inherits -c "SELECT count(*) FROM pg_extension WHERE extname = 'vector'")" = 1 ] \
+            || fail "a new database did not inherit vector from template1"
+
+          # The #375 settings are live.
+          for s in dynamic_shared_memory_type=mmap fsync=off synchronous_commit=off full_page_writes=off; do
+            got="$(psql -qAtX -c "SHOW ${s%%=*}")"
+            [ "$got" = "${s#*=}" ] || fail "${s%%=*}=$got, expected ${s#*=}"
+          done
+          [ "$(psql -qAtX -c 'SHOW server_encoding')" = UTF8 ] || fail "server_encoding is not UTF8"
+          echo "start-postgres pg$EXPECTED_MAJOR: all assertions passed"
+
+      - name: Dump the postgres log on failure
+        if: failure() && env.START_POSTGRES_LOG != ''
+        run: tail -n 200 "$START_POSTGRES_LOG" || true
+
+  defaults:
+    name: start-postgres (defaults, custom port)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Start PostgreSQL
+        id: pg
+        uses: ./.github/actions/start-postgres
+        with:
+          major: '16'
+          port: '5433'
+
+      - name: Assert the minimal contract
+        env:
+          OUTPUT_URL: ${{ steps.pg.outputs.database-url }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          [ "$PGHOST" = localhost ] || fail "PGHOST=$PGHOST"
+          [ "$PGPORT" = 5433 ] || fail "PGPORT=$PGPORT"
+          [ "$PGUSER" = postgres ] || fail "PGUSER=$PGUSER"
+          [ -z "${PGDATABASE:-}" ] || fail "PGDATABASE is set ($PGDATABASE) with no database input"
+          [ -z "${DATABASE_URL:-}" ] || fail "DATABASE_URL is set ($DATABASE_URL) although database-url defaults to false"
+          [ -z "$OUTPUT_URL" ] || fail "output database-url=$OUTPUT_URL with no database input"
+          version="$(psql -d postgres -qAtX -v ON_ERROR_STOP=1 -c 'SELECT version()')"
+          case "$version" in "PostgreSQL 16."*) ;; *) fail "expected PostgreSQL 16.x, got: $version";; esac
+          # The unix socket lives under PGDATA.
+          psql -h "$(dirname "$START_POSTGRES_LOG")/data" -d postgres -qAtX -v ON_ERROR_STOP=1 -c 'SELECT 1' >/dev/null \
+            || fail "no unix socket under PGDATA"
+          [ "$(psql -d postgres -qAtX -c 'SHOW port')" = 5433 ] || fail "server is not on 5433"
+          echo "start-postgres defaults: all assertions passed"
+
+      - name: Dump the postgres log on failure
+        if: failure() && env.START_POSTGRES_LOG != ''
+        run: tail -n 200 "$START_POSTGRES_LOG" || true
+
+  bad-input:
+    name: start-postgres (bad input fails loudly)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Start a PostgreSQL major that does not exist
+        id: pg
+        continue-on-error: true
+        uses: ./.github/actions/start-postgres
+        with:
+          major: '99'
+
+      - name: Pass a non-boolean database-url
+        id: badurl
+        continue-on-error: true
+        uses: ./.github/actions/start-postgres
+        with:
+          major: '16'
+          database: x
+          database-url: 'yes'
+
+      - name: Assert both failed and nothing started
+        env:
+          OUTCOME: ${{ steps.pg.outcome }}
+          BADURL: ${{ steps.badurl.outcome }}
+        run: |
+          set -euo pipefail
+          [ "$OUTCOME" = failure ] || { echo "::error::start-postgres with major 99 returned '$OUTCOME', expected failure"; exit 1; }
+          [ "$BADURL" = failure ] || { echo "::error::start-postgres with database-url 'yes' returned '$BADURL', expected failure"; exit 1; }
+          if pgrep -x postgres >/dev/null; then
+            echo "::error::a postgres server is running after a failed start (fallback to another major?)"; exit 1
+          fi
+          echo "major 99 failed as required, and no server was started"
