@@ -1,3 +1,6 @@
 
 # Local git worktrees (workspace worktree-only workflow)
 .worktrees/
+
+# Python bytecode (tests import the review verdict parser)
+__pycache__/

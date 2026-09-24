@@ -54,12 +54,17 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # fail-closed verdicts, made every future edit to the review unmergeable. The
 # guard does not look at composite actions (measured: .github#145 / #147 changed
 # a composite and reviewed normally). So the STEP SCRIPTS live here now...
-ACTION = os.path.join(ROOT, ".github", "actions", "claude-review", "action.yml")
+ACTION_DIR = os.path.join(ROOT, ".github", "actions", "claude-review")
+ACTION = os.path.join(ACTION_DIR, "action.yml")
+# Real review bodies the derivation is pinned against (sre-brain#568).
+FIXTURES = os.path.join(ROOT, "tests", "fixtures", "review-verdict")
 # ...and the workflow keeps only the shim structure the tests still assert on.
 WORKFLOW = os.path.join(ROOT, ".github", "workflows", "claude-code-review.yml")
 
 GATE_STEP = "Verify a review actually ran"
 VERDICT_STEP = "Determine the review VERDICT"
+DERIVE_STEP = "Derive the review verdict from the reviewer's comment"
+WINDOW_STEP = "Open the review window"
 REVIEWABLE_STEP = "Classify — is there anything here to REVIEW?"
 # As the REST comments API spells it. Verified against run 32088893389:
 # `gh pr view` (GraphQL) reports a bare `claude`; REST reports `claude[bot]`.
@@ -184,24 +189,64 @@ def run_reviewable(script, files):
             return proc.returncode, skip, fh.read()
 
 
+def derive_script(src):
+    return step_script(src, DERIVE_STEP)
+
+
 def verdict_script(src):
     return step_script(src, VERDICT_STEP)
 
 
-def run_verdict(script, comments, nonce="99-1", gh_ok=True, conclusion="success",
-                author=REVIEW_AUTHOR):
-    """Execute the verdict script against a stubbed comment list.
+# A fixed review window for the stubbed runs. Comments default to one minute
+# inside it; `created_at=` on a case moves one outside.
+WINDOW_START = "2026-09-24T10:00:00Z"
+IN_WINDOW = "2026-09-24T10:01:00Z"
+BEFORE_WINDOW = "2026-09-24T09:50:00Z"
+RUN_ID = "99"
 
-    `comments` is either a list of bodies (all attributed to `author`, the
-    reviewer) or a list of `(login, body)` pairs when a case needs a comment from
-    someone else — which is how forgery is exercised. The stub emits the same
-    `{login, body}` JSON-per-line shape the real `gh api --jq ... | tojson` does.
-    `gh_ok=False` simulates an unreadable comment list.
-    Returns (exit_code, stdout, step_summary)."""
-    pairs = [c if isinstance(c, tuple) else (author, c) for c in comments]
+
+def lane(body, run_id=RUN_ID, finished=True):
+    """A reviewer tracking comment in the exact shape claude-code-action writes:
+    a bold `Claude finished ...` (or `Claude encountered an error ...`) header
+    linking the job's run, then the body the model wrote."""
+    head = ("**Claude finished @author's task in 1m 2s**" if finished
+            else "**Claude encountered an error after 12s**")
+    return (f"{head} —— [View job](https://github.com/sidekick-labs/example/actions/"
+            f"runs/{run_id})\n\n---\n{body}")
+
+
+def fixture(name, run_id=RUN_ID):
+    """A real review body from tests/fixtures/review-verdict/, re-bound to `run_id`."""
+    with open(os.path.join(FIXTURES, name + ".md")) as fh:
+        return fh.read().replace("RUN_ID", run_id)
+
+
+def run_derive(script, comments, nonce="99-1", run_id=RUN_ID, gh_ok=True,
+               conclusion="success", author=REVIEW_AUTHOR, window=WINDOW_START,
+               action_path=None):
+    """Execute the DERIVE step against a stubbed comment list.
+
+    `comments` items are a body (attributed to `author`, created inside the
+    window), a `(login, body)` pair, or a full dict. The stub emits the same
+    `{id, login, created_at, html_url, body}` JSON-per-line shape the real
+    `gh api --jq ... | tojson` does. `gh_ok=False` simulates an unreadable list.
+    Returns (exit_code, stdout, step_summary, outputs)."""
+    rows = []
+    for i, c in enumerate(comments):
+        if isinstance(c, dict):
+            row = {"login": author, "created_at": IN_WINDOW, **c}
+        elif isinstance(c, tuple):
+            row = {"login": c[0], "body": c[1], "created_at": IN_WINDOW}
+        else:
+            row = {"login": author, "body": c, "created_at": IN_WINDOW}
+        row.setdefault("id", 1000 + i)
+        row.setdefault("html_url", f"https://github.com/sidekick-labs/example/pull/1#issuecomment-{1000 + i}")
+        rows.append(row)
     with tempfile.TemporaryDirectory() as d:
         summary = os.path.join(d, "summary")
         open(summary, "w").close()
+        out = os.path.join(d, "gh_output")
+        open(out, "w").close()
         bindir = os.path.join(d, "bin")
         os.makedirs(bindir)
         gh = os.path.join(bindir, "gh")
@@ -209,40 +254,56 @@ def run_verdict(script, comments, nonce="99-1", gh_ok=True, conclusion="success"
             if not gh_ok:
                 fh.write("#!/bin/sh\nexit 1\n")
             else:
-                lines = "\n".join(
-                    json.dumps({"login": lg, "body": bd}) for lg, bd in pairs)
+                lines = "\n".join(json.dumps(r) for r in rows)
                 fh.write("#!/bin/sh\ncat <<'EOF'\n" + lines + "\nEOF\n")
         os.chmod(gh, 0o755)
         env = dict(os.environ)
         env.update({
             "PATH": bindir + os.pathsep + env["PATH"],
             "GITHUB_STEP_SUMMARY": summary,
+            "GITHUB_OUTPUT": out,
+            # Composite run steps get the action's own directory here; that is
+            # where derive_verdict.py ships.
+            "GITHUB_ACTION_PATH": ACTION_DIR if action_path is None else action_path,
             "REPO": "sidekick-labs/example",
             "PR": "1",
+            "RUN_ID": run_id,
             "RUN_NONCE": nonce,
             "GH_TOKEN": "stub",
             # Empty = the action returned without calling the model (the
             # workflow-validation no-op). Non-empty = it really ran.
             "REVIEW_CONCLUSION": conclusion,
-            # Track the `author` param, NOT the module constant. These two
-            # govern different sides of the same contract — `author` attributes
-            # the stub's shorthand comments, this tells the script under test
-            # whose comments to count — so pinning one to the constant lets them
-            # disagree: `run_verdict(script, ["body"], author="other-bot")` would
-            # emit `other-bot` and be silently graded as a forgery rather than
-            # the pass case its caller meant. No current case trips it (forgery
-            # cases pass explicit tuples, pass cases take the default), so this
-            # is a trap laid for the next test author, not a live bug. The
-            # shipped-default assertion is unaffected: it reads the composite
-            # YAML directly and never goes through this env.
+            # Tracks the `author` param, NOT the module constant, so a case that
+            # passes `author=` is graded as that reviewer rather than as a forgery.
             "REVIEW_AUTHOR": author,
+            "WINDOW_START": window,
         })
         # `-e -o pipefail` mirrors the runner's `shell: bash` (`bash --noprofile
-        # --norc -e -o pipefail {0}`). Running the script with a bare `bash -c`
-        # hid a real defect: a no-match `grep` in a `$(...)` assignment aborts
-        # the step under `-e` BEFORE `fail_closed` can report, which is exactly
-        # what .github#167 (run 35676795661) showed — exit 1 and nothing else.
-        # This suite passed the whole time because it never ran under `-e`.
+        # --norc -e -o pipefail {0}`). A bare `bash -c` hid a real defect once: a
+        # no-match `grep` in a `$(...)` assignment aborted the step under `-e`
+        # BEFORE `fail_closed` could report (.github#167, run 35676795661).
+        proc = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", script],
+                              env=env, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True)
+        outputs = {}
+        with open(out) as fh:
+            for line in fh:
+                if "=" in line:
+                    k, v = line.rstrip("\n").split("=", 1)
+                    outputs[k] = v
+        with open(summary) as fh:
+            return proc.returncode, proc.stdout, fh.read(), outputs
+
+
+def run_gate_verdict(script, derived_marker, nonce="99-1"):
+    """Execute the GATE step (`Determine the review VERDICT`) against a given
+    derived-marker step output. Returns (exit_code, stdout, step_summary)."""
+    with tempfile.TemporaryDirectory() as d:
+        summary = os.path.join(d, "summary")
+        open(summary, "w").close()
+        env = dict(os.environ)
+        env.update({"GITHUB_STEP_SUMMARY": summary, "RUN_NONCE": nonce,
+                    "DERIVED_MARKER": derived_marker})
         proc = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", script],
                               env=env, stdout=subprocess.PIPE,
                               stderr=subprocess.STDOUT, text=True)
@@ -252,6 +313,17 @@ def run_verdict(script, comments, nonce="99-1", gh_ok=True, conclusion="success"
 
 def marker(value, nonce="99-1"):
     return f"<!-- claude-review-verdict: {value} run={nonce} -->"
+
+
+def derive_end_to_end(src, comments, **kw):
+    """Derive, then feed the derived marker to the gate exactly as the composite
+    does. Returns (gate_exit_code, derive_result, gate_result)."""
+    d = run_derive(derive_script(src), comments, **kw)
+    if d[0] != 0:
+        return d[0], d, None
+    g = run_gate_verdict(verdict_script(src), d[3].get("marker", ""),
+                         nonce=kw.get("nonce", "99-1"))
+    return g[0], d, g
 
 
 def run_mechanical(script, author, ref, files):
@@ -530,224 +602,284 @@ def main():
           COND in checkout_blk, "condition missing from the checkout step")
 
     # ---------------------------------------------------------------------
-    # The VERDICT step.
+    # The VERDICT — derived by the composite, gated on the composite's marker.
     #
-    # The gate above answers "did a review happen?". This one answers "what did
-    # it say?", and it is the reason `review / Claude Code Review` can be a
-    # REQUIRED check at all: before it, a review that found a null dereference
-    # concluded `success`, indistinguishable on the wire from one that found
-    # nothing. Its contract:
+    # sre-brain#568 option 2: the model is no longer asked for a marker (three
+    # prompt fixes were provably ignored, and the tracking-comment path appears
+    # to strip HTML comments). `Derive the review verdict` parses the reviewer's
+    # own tracking comment for THIS run and authors the nonce-bound marker as a
+    # step output; `Determine the review VERDICT` reads only that output.
     #
-    #     BLOCKING marker for THIS run   -> exit 1   (correctness/security)
-    #     PASS marker for THIS run       -> exit 0   (advisory findings included)
-    #     anything else                  -> exit 1   (FAIL CLOSED)
-    #
-    # "Anything else" is where the value is: a stale marker from an earlier push,
-    # no marker at all (the zero-turn prose answer of octo-brain#276), an
-    # unreadable comment list, an unrecognised value. An undeterminable verdict is
-    # never a pass — workspace rule #9.
+    #     completed review, zero BLOCKING-labelled findings  -> exit 0
+    #     completed review, >=1 BLOCKING-labelled finding    -> exit 1
+    #     anything else                                      -> exit 1 (FAIL CLOSED)
     #
     # NOTE what this proves and what it does not (check-positive-controls.md):
-    # it proves the PARSER classifies correctly. It says nothing about whether a
-    # real correctness bug makes the reviewer emit BLOCKING. That consequence has
-    # to be measured live once — see docs/review-verdict-gate.md.
+    # it proves the PARSER and the exit codes. It says nothing about whether a
+    # real correctness bug makes the reviewer label a finding BLOCKING. That
+    # consequence has to be measured live once — see docs/review-verdict-gate.md.
     # ---------------------------------------------------------------------
-    print("verdict contract:")
-    verdict = verdict_script(src)
+    print("verdict derivation — real review bodies (tests/fixtures/review-verdict):")
+    sys.dont_write_bytecode = True  # never leave __pycache__ inside the shipped action
+    sys.path.insert(0, ACTION_DIR)
+    import derive_verdict as dv  # noqa: PLC0415
 
-    rc, out, summary = run_verdict(verdict, ["Looks good.\n\n" + marker("PASS")])
-    check("PASS marker for this run -> exit 0", rc == 0, f"got {rc}")
-    check("  ... and annotates as ::notice", "::notice" in out)
+    # Every fixture is a real claude[bot] review from the estate. Private-repo
+    # bodies are STRUCTURE-PRESERVING redactions (this repo is public): every
+    # line keeps its markdown shape, its labels and its "No BLOCKING findings"
+    # prose, and the words are replaced. The parser was also run against the
+    # unredacted originals with identical results (recorded in the PR).
+    REAL = {
+        "github-167-pass-verbatim": "PASS",          # `No **BLOCKING** findings.` + bold ADVISORY
+        "ck974-advisory-headings": "PASS",           # `### ADVISORY — ...` headings, "`ADVISORY` tier" prose
+        "ck981-bold-no-blocking": "PASS",            # `**No BLOCKING findings.**`
+        "harness1272-unlabelled": "PASS",            # no labels at all: completed review, zero BLOCKING
+        "web1928-unlabelled": "PASS",
+        "pb471-pass-labels": "PASS",                 # model also used `**PASS — ...**` per-check labels
+        "gt133-no-blocking-then-advisory": "PASS",
+        "ck962-bold-advisory": "PASS",
+        "ck983-no-blocking-heading": "PASS",
+        "ck984-blocking-section": "BLOCKING",        # `### BLOCKING` section, `#### 1. ...` finding under it
+        "ck984-blocking-fix-verified": "PASS",       # `### BLOCKING fix verified — #1 resolved` is prose
+    }
+    for name, want in REAL.items():
+        got = dv.derive([{"login": REVIEW_AUTHOR, "created_at": IN_WINDOW,
+                          "body": fixture(name)}], REVIEW_AUTHOR, RUN_ID, WINDOW_START)
+        check(f"real review '{name}' -> {want}", got["verdict"] == want,
+              f"got {got['verdict']} ({got['reason']}; {got['blocking'][:2]})")
 
-    rc, out, summary = run_verdict(
-        verdict,
-        ["BLOCKING: `user` may be nil here.\nADVISORY: rename `x`.\n\n" + marker("BLOCKING")])
-    check("BLOCKING marker for this run -> exit 1 (this is the whole point of the "
-          "change: a review that objects must be able to hold the merge)",
-          rc == 1, f"got {rc}")
-    check("  ... and annotates as ::error", "::error" in out)
-    check("  ... and the summary says findings are correctness/security",
-          "correctness" in summary.lower())
+    print("verdict derivation — label grammar:")
+    NOT_A_FINDING = [
+        "No BLOCKING findings.", "No **BLOCKING** findings.", "**No BLOCKING findings.**",
+        "### BLOCKING fix verified — #1 resolved correctly",
+        "- **#1 (BLOCKING)** — fixed in abc123", "Blocking the main thread here is fine.",
+        "BLOCKING: none", "**BLOCKING findings:** none", "BLOCKING — None found.",
+        "### BLOCKING\n\nNone.", "### BLOCKING\n\n### ADVISORY\n\n**ADVISORY — x**",
+        "| BLOCKING | 0 |", "The `ADVISORY` tier is a good idea.",
+        "```\n- **BLOCKING** — correctness or security\n```",  # a quoted prompt diff
+        "Non-blocking: rename `x`.",
+        # The prompt's own template line, quoted back by a reviewer of this repo.
+        "**BLOCKING — <short title>**",
+    ]
+    for text in NOT_A_FINDING:
+        check(f"not a BLOCKING finding: {text[:48]!r}",
+              dv.blocking_findings(text) == [], f"got {dv.blocking_findings(text)}")
+    IS_A_FINDING = [
+        "**BLOCKING — `user` may be nil**", "BLOCKING: unchecked nil.",
+        "- **BLOCKING**: off-by-one in the loop bound", "[BLOCKING] token logged",
+        "### BLOCKING — race on the cache", "1. **BLOCKING:** SQL injection",
+        "**Blocking:** lower-case label still counts", "### Null deref — BLOCKING",
+        "### BLOCKING\n\n#### 1. Consent withdrawn on failure",
+        "**BLOCKING findings:**\n\n- the retry swallows the error",
+        "| 1 | BLOCKING | nil deref |", "> **BLOCKING —** quoted but still a label",
+        "**BLOCKING —** Nothing validates the token",  # "Nothing ..." is a finding, not "none"
+    ]
+    for text in IS_A_FINDING:
+        check(f"a BLOCKING finding: {text[:48]!r}", len(dv.blocking_findings(text)) >= 1,
+              "not recognised")
 
-    # Advisory-only must NOT block: a gate that reddens on taste is one people
-    # learn to merge past, which costs more than it saves.
-    rc, _, _ = run_verdict(
-        verdict, ["ADVISORY: this could be simplified with `map`.\n\n" + marker("PASS")])
-    check("advisory-only findings -> exit 0 (style/simplification never blocks)",
+    print("verdict contract (derive -> composite-authored marker -> gate, under bash -e):")
+    derive = derive_script(src)
+    gate = verdict_script(src)
+
+    # PASS: completed review, advisory-only.
+    rc, d, g = derive_end_to_end(src, [lane("**ADVISORY — rename `x`.**\n\nNo BLOCKING findings.")])
+    check("completed review, advisory only -> exit 0", rc == 0, f"got {rc}; {d[1][-300:]!r}")
+    check("  ... the DERIVE step authored the nonce-bound PASS marker as a step output",
+          d[3].get("marker") == marker("PASS") and d[3].get("verdict") == "PASS",
+          f"outputs={d[3]!r}")
+    check("  ... and records that marker in the step summary",
+          marker("PASS") in d[2], f"summary={d[2][:300]!r}")
+    check("  ... and the gate annotates ::notice", g is not None and "::notice" in g[1])
+
+    # BLOCKING.
+    rc, d, g = derive_end_to_end(src, [lane(
+        "**BLOCKING — `user` may be nil here.**\n\n**ADVISORY — rename `x`.**")])
+    check("completed review with a BLOCKING-labelled finding -> exit 1 (a review that "
+          "objects must be able to hold the merge)", rc == 1, f"got {rc}")
+    check("  ... the derived marker says BLOCKING", d[3].get("marker") == marker("BLOCKING"),
+          f"outputs={d[3]!r}")
+    check("  ... the gate annotates ::error and the summary says correctness",
+          g is not None and "::error" in g[1] and "correctness" in g[2].lower())
+    check("  ... and the derive summary lists the finding",
+          "`user` may be nil" in d[2], f"summary={d[2][:300]!r}")
+
+    # "No BLOCKING findings" prose: must not be read as a BLOCKING finding, and is
+    # not by itself what makes a PASS — the completed-review header is.
+    rc, _, _ = derive_end_to_end(src, [lane("Reviewed thoroughly.\n\nNo BLOCKING findings.")])
+    check("'No BLOCKING findings' prose in a completed review -> exit 0 (the phrase "
+          "contains the word, not a label)", rc == 0, f"got {rc}")
+    rc, out, summary, _ = run_derive(derive, ["Reviewed thoroughly.\n\nNo BLOCKING findings."])
+    check("'No BLOCKING findings' prose WITHOUT the lane header -> exit 1 (prose alone "
+          "is never a verdict)", rc == 1, f"got {rc}")
+
+    # ERRORED review.
+    rc, out, summary, outs = run_derive(derive, [lane("Something broke.", finished=False)])
+    check("`Claude encountered an error` -> exit 1 (fail closed)", rc == 1, f"got {rc}")
+    check("  ... LOUDLY: ::error and the step summary say why",
+          "::error" in out and "encountered an error" in summary, f"out={out[:200]!r}")
+    check("  ... and no marker is authored", "marker" not in outs, f"outputs={outs!r}")
+
+    # Retry after an errored first attempt: the LAST lane comment of this run wins.
+    rc, _, _ = derive_end_to_end(src, [lane("boom", finished=False),
+                                       lane("Fine.\n\n**ADVISORY — nit.**")])
+    check("errored first attempt, completed retry -> exit 0 (last lane comment wins)",
           rc == 0, f"got {rc}")
+    rc, _, _ = derive_end_to_end(src, [lane("Fine."), lane("boom", finished=False)])
+    check("completed comment followed by an errored one -> exit 1", rc == 1, f"got {rc}")
 
-    # THE STALE-MARKER TRAP. Without the run nonce the verdict would attach to the
-    # PR rather than to this run's diff, so a PASS from an earlier push would
-    # certify a later, defective one.
-    rc, _, summary = run_verdict(
-        verdict, ["Older review.\n\n" + marker("PASS", nonce="11-1")], nonce="99-1")
-    check("PASS marker from a DIFFERENT run -> exit 1 (a verdict describes a diff, "
-          "not a PR)", rc == 1, f"got {rc}")
-    check("  ... and says how many stale markers it saw", "1 verdict marker" in summary
-          or "1 verdict marker(s)" in summary, f"summary={summary[:200]!r}")
-
-    rc, out, summary = run_verdict(verdict, ["I reviewed it and it seems fine to me."])
-    check("no marker at all -> exit 1 (fail closed; also catches the zero-turn "
-          "prose answer of octo-brain#276)", rc == 1, f"got {rc}")
-    # THE #167 SILENT EXIT. Under the runner's `bash -e -o pipefail` the
-    # `markers=$(... | grep ...)` assignment aborted the step on no-match before
-    # `fail_closed` ran: red, but with no annotation and no summary to say why.
-    # Failing closed is only useful if it says so (sidekick-labs/sre-brain#568).
-    check("  ... and says so LOUDLY: a ::error annotation is emitted",
-          "::error" in out, f"stdout={out[:200]!r}")
-    check("  ... and writes the step summary", "verdict undeterminable" in summary,
-          f"summary={summary[:200]!r}")
-
-    # NO PROSE FALLBACK. A "No BLOCKING findings" sentence is not a verdict: it is
-    # not bound to the run nonce and is trivially produced by a reviewer that read
-    # nothing. The contract is the marker; a missing one is a prompt bug, not a
-    # reason to loosen the parser.
-    rc, _, _ = run_verdict(
-        verdict, ["Reviewed thoroughly.\n\nNo BLOCKING findings."])
-    check("'No BLOCKING findings' prose WITHOUT a marker -> exit 1 (prose is not "
-          "a verdict; the contract stays the marker)", rc == 1, f"got {rc}")
-    rc, _, _ = run_verdict(
-        verdict, ["No correctness, security, or behavioural defects introduced."])
-    check("the exact #167 closing sentence WITHOUT a marker -> exit 1", rc == 1,
-          f"got {rc}")
-
-    # ---- FORGERY. The author is part of the contract, not just the nonce. ----
-    #
-    # The run id is visible in the Actions tab within seconds of the job starting,
-    # so an unfiltered comment read makes the marker forgeable by anyone who can
-    # comment. BLOCKING beats PASS, so a forgery cannot overturn an objection —
-    # but it can convert a FAIL-CLOSED RED into a green, which is the more
-    # valuable target: that is exactly the state a PR sits in when the reviewer
-    # did not adjudicate. Where this context is REQUIRED, that is a bypass of the
-    # gate by anyone with comment access.
-    rc, out, summary = run_verdict(
-        verdict, [("mallory", "Looks fine to me!\n\n" + marker("PASS"))])
-    check("forged PASS from a non-reviewer -> exit 1 (a verdict counts only from "
-          "the reviewer's own account)", rc == 1, f"got {rc}")
-    check("  ... and the forgery is REPORTED, not silently dropped (a rejected "
-          "attempt to green the gate is exactly what a human should see)",
-          "IGNORED" in summary or "IGNORED" in out, f"summary={summary[:200]!r}")
-
-    # The dangerous composition: reviewer says nothing, someone else says PASS.
-    rc, _, _ = run_verdict(verdict, [
-        ("claude[bot]", "I could not complete the review."),
-        ("mallory", marker("PASS")),
-    ])
-    check("reviewer posts NO marker + forged PASS -> exit 1 (the fail-closed red "
-          "is the target, and it must survive)", rc == 1, f"got {rc}")
-
-    # A forgery must not be able to hide a real objection either.
-    rc, _, _ = run_verdict(verdict, [
-        ("claude[bot]", "BLOCKING: unchecked nil.\n\n" + marker("BLOCKING")),
-        ("mallory", marker("PASS")),
-    ])
-    check("real BLOCKING + forged PASS -> exit 1", rc == 1, f"got {rc}")
-
-    # ...and the filter must not reject the REVIEWER. Getting the login spelling
-    # wrong (GraphQL's bare `claude` instead of REST's `claude[bot]`) would match
-    # nothing and fail closed on EVERY pull request in the estate — a far worse
-    # outage than the hole being closed, and invisible without this case.
-    rc, _, _ = run_verdict(verdict, [("claude", "Fine.\n\n" + marker("PASS"))])
-    check("a PASS from the GraphQL spelling `claude` does NOT satisfy the gate "
-          "(REST is what this step reads, and it says `claude[bot]`)",
+    # NO lane comment for this run.
+    rc, out, summary, _ = run_derive(derive, [])
+    check("no comment at all -> exit 1", rc == 1, f"got {rc}")
+    check("  ... LOUDLY (::error + summary)", "::error" in out and "undeterminable" in summary)
+    rc, _, _, _ = run_derive(derive, [lane("Fine.", run_id="11")])
+    check("a completed review for a DIFFERENT run -> exit 1 (a verdict describes this "
+          "run's diff, not the PR)", rc == 1, f"got {rc}")
+    rc, _, _, _ = run_derive(derive, [lane("Fine.", run_id="990")])
+    check("run id 990 does not satisfy run 99 (the run link is matched whole)",
           rc == 1, f"got {rc}")
-    rc, _, _ = run_verdict(verdict, [("claude[bot]", "Fine.\n\n" + marker("PASS"))])
-    check("a PASS from the REST spelling `claude[bot]` DOES satisfy the gate "
-          "(the filter must not lock out the reviewer itself)", rc == 0, f"got {rc}")
+    rc, _, _, _ = run_derive(derive, [{"body": lane("Fine."), "created_at": BEFORE_WINDOW}])
+    check("this run's comment from BEFORE the review window (an earlier attempt) -> "
+          "exit 1", rc == 1, f"got {rc}")
+    rc, _, _, _ = run_derive(derive, [lane("")])
+    check("`Claude finished` with no review content (zero-turn) -> exit 1", rc == 1, f"got {rc}")
+    rc, _, _, _ = run_derive(derive, [lane("- [x] Read files\n- [x] Post review\n\n---\n")])
+    check("`Claude finished` with only the task checklist -> exit 1", rc == 1, f"got {rc}")
+    rc, _, _, _ = run_derive(derive, [lane("- [x] Read files\n\n```diff\n+ BLOCKING — quoted\n```\n")])
+    check("`Claude finished` with only the checklist and a fenced snippet -> exit 1", rc == 1, f"got {rc}")
+    rc, _, _ = derive_end_to_end(src, [lane("Pasted diff:\n\n```diff\n+ x\n\n**BLOCKING — real defect after an unclosed fence**\n")])
+    check("an UNCLOSED fence does not hide a later BLOCKING label -> exit 1", rc == 1, f"got {rc}")
+    rc, _, _ = derive_end_to_end(src, [lane("Fine.\n\n```\n**BLOCKING — quoted in a closed fence**\n```\n\nNo BLOCKING findings.")])
+    check("a BLOCKING label inside a CLOSED fence is still ignored -> exit 0", rc == 0, f"got {rc}")
 
-    # THE .github#149 SHAPE, now classified rather than lumped in with "missing
-    # marker". claude-code-action's server-side workflow-validation guard makes it
-    # return WITHOUT calling the model, leaving the step green and setting no
-    # `conclusion` output. It must stay RED — this branch is a sharper message, not
-    # a new green — and it must be DISTINGUISHABLE, because reporting it as a
-    # generic undeterminable verdict sent a reader hunting for a model failure that
-    # never happened.
-    rc, out, summary = run_verdict(verdict, [], conclusion="")
-    check("action no-opped (empty conclusion) -> exit 1 (still fail-closed: no "
-          "review was produced)", rc == 1, f"got {rc}")
+    # A review the model posted with `gh pr comment` instead of the tracking
+    # comment is scanned too — it can only ADD a BLOCKING.
+    rc, _, _ = derive_end_to_end(src, [lane("- [x] Review\n\nSee below."),
+                                       "**BLOCKING — nil deref in `load`.**"])
+    check("BLOCKING in a separate reviewer comment inside the window -> exit 1",
+          rc == 1, f"got {rc}")
+    rc, _, _ = derive_end_to_end(src, [{"body": "**BLOCKING — stale.**",
+                                        "created_at": BEFORE_WINDOW}, lane("Fine.")])
+    check("a BLOCKING in an older reviewer comment from BEFORE the window does not "
+          "red this run", rc == 0, f"got {rc}")
+
+    # ---- FORGERY. Only the composite authors an accepted marker. ----
+    rc, out, summary, outs = run_derive(derive, [("mallory", "Looks fine!\n\n" + marker("PASS"))])
+    check("spoofed PASS marker in a HUMAN comment -> exit 1 (never read as a verdict)",
+          rc == 1, f"got {rc}")
+    check("  ... and the forgery is REPORTED, not silently dropped",
+          "IGNORED" in out, f"out={out[:300]!r}")
+    rc, out, _, _ = run_derive(derive, [("mallory", lane("Fine."))])
+    check("a HUMAN comment imitating this run's `Claude finished` header -> exit 1",
+          rc == 1, f"got {rc}")
+    check("  ... and is reported as an ignored forgery", "IGNORED" in out)
+    rc, _, _ = derive_end_to_end(src, [lane("**BLOCKING — unchecked nil.**"),
+                                       ("mallory", marker("PASS"))])
+    check("real BLOCKING + a human's forged PASS -> exit 1", rc == 1, f"got {rc}")
+    rc, _, _ = derive_end_to_end(src, [lane("**BLOCKING — unchecked nil.**\n\n" + marker("PASS"))])
+    check("a PASS marker written by the MODEL itself does not override its BLOCKING "
+          "label (comments are never read for a marker)", rc == 1, f"got {rc}")
+    rc, out, _, _ = run_derive(derive, [lane("Fine.\n\n" + marker("PASS"))])
+    check("  ... and a model-written marker is noted as ignored",
+          "Reviewer-written marker ignored" in out, f"out={out[:300]!r}")
+    # The login filter must not lock out the REVIEWER, and must use REST spelling.
+    rc, _, _, _ = run_derive(derive, [("claude", lane("Fine."))])
+    check("a lane comment from the GraphQL spelling `claude` does NOT count "
+          "(REST says `claude[bot]`)", rc == 1, f"got {rc}")
+    rc, _, _ = derive_end_to_end(src, [("claude[bot]", lane("Fine."))])
+    check("a lane comment from `claude[bot]` DOES count", rc == 0, f"got {rc}")
+
+    # THE .github#149 SHAPE — the action no-opped.
+    rc, out, summary, _ = run_derive(derive, [], conclusion="")
+    check("action no-opped (empty conclusion) -> exit 1", rc == 1, f"got {rc}")
     check("  ... and names the workflow-validation guard rather than blaming the model",
-          "workflow-validation" in summary and "default branch" in summary,
-          f"summary={summary[:200]!r}")
-    check("  ... and is distinguishable from a generic missing marker",
+          "workflow-validation" in summary and "default branch" in summary)
+    check("  ... and is distinguishable from a generic missing review",
           "no-opped" in out or "no-opped" in summary)
 
-    rc, _, _ = run_verdict(verdict, [], gh_ok=False)
-    check("unreadable comment list -> exit 1 (fail closed)", rc == 1, f"got {rc}")
+    rc, out, _, _ = run_derive(derive, [lane("Fine.")], gh_ok=False)
+    check("unreadable comment list -> exit 1 (fail closed, loudly)",
+          rc == 1 and "::error" in out, f"got {rc}")
+    rc, out, _, _ = run_derive(derive, [lane("Fine.")], window="")
+    check("no review-window start recorded -> exit 1", rc == 1, f"got {rc}")
+    rc, out, _, _ = run_derive(derive, [lane("Fine.")], action_path="/nonexistent")
+    check("parser missing from the action -> exit 1 (fail closed, loudly)",
+          rc == 1 and "::error" in out, f"got {rc}")
 
-    rc, _, _ = run_verdict(verdict, ["x\n\n" + marker("MAYBE")])
-    check("unrecognised verdict value -> exit 1 (fail closed)", rc == 1, f"got {rc}")
-
-    # Strictest wins. Two markers should not happen; if they do, a second PASS
-    # must not launder the objection.
-    rc, _, _ = run_verdict(
-        verdict, ["First pass.\n\n" + marker("BLOCKING"), "Second.\n\n" + marker("PASS")])
-    check("BLOCKING + PASS for the same run -> exit 1 (a PASS never launders an "
-          "objection)", rc == 1, f"got {rc}")
+    # ---- THE GATE reads only the composite's marker. ----
+    rc, _, _ = run_gate_verdict(gate, marker("PASS"))
+    check("gate: composite PASS marker for this run -> exit 0", rc == 0, f"got {rc}")
+    rc, _, _ = run_gate_verdict(gate, marker("BLOCKING"))
+    check("gate: composite BLOCKING marker -> exit 1", rc == 1, f"got {rc}")
+    rc, out, summary = run_gate_verdict(gate, "")
+    check("gate: no derived marker -> exit 1, loudly",
+          rc == 1 and "::error" in out and "undeterminable" in summary, f"got {rc}")
+    rc, _, _ = run_gate_verdict(gate, marker("PASS", nonce="11-1"))
+    check("gate: a PASS marker for a DIFFERENT run -> exit 1", rc == 1, f"got {rc}")
+    rc, _, _ = run_gate_verdict(gate, marker("PASS", nonce="99-2"))
+    check("gate: a PASS marker for a different ATTEMPT -> exit 1", rc == 1, f"got {rc}")
+    rc, _, _ = run_gate_verdict(gate, marker("MAYBE"))
+    check("gate: unrecognised value -> exit 1", rc == 1, f"got {rc}")
+    rc, _, _ = run_gate_verdict(gate, "x " + marker("PASS"))
+    check("gate: marker must match exactly (no surrounding text) -> exit 1", rc == 1, f"got {rc}")
 
     # --- structural guards for the verdict path ---------------------------
     print("verdict structural guards:")
-    verdict_blk = strip_comments(step_block(src, VERDICT_STEP))
-    check("verdict step is NOT continue-on-error",
-          "continue-on-error" not in verdict_blk)
-    check("verdict step runs only when a review attempt SUCCEEDED (it must not "
-          "double-report the review-never-ran case the gate step owns)",
-          "steps.review.outcome == 'success'" in verdict_blk
-          and "steps.review_retry.outcome == 'success'" in verdict_blk)
-    check("verdict step inherits the token / dependabot / mechanical skips (a "
-          "skipped lane must still conclude success, not hang a required check)",
-          "steps.token-check.outputs.skip != 'true'" in verdict_blk
-          and "dependabot[bot]" in verdict_blk
-          and "steps.mechanical.outputs.skip != 'true'" in verdict_blk)
-    check("verdict step has exactly one `exit 0` (the PASS branch)",
-          verdict_blk.count("exit 0") == 1, f"got {verdict_blk.count('exit 0')}")
+    for step in (DERIVE_STEP, VERDICT_STEP):
+        blk = strip_comments(step_block(src, step))
+        check(f"'{step}' is NOT continue-on-error", "continue-on-error" not in blk)
+        check(f"'{step}' runs only when a review attempt SUCCEEDED",
+              "steps.review.outcome == 'success'" in blk
+              and "steps.review_retry.outcome == 'success'" in blk)
+        check(f"'{step}' inherits the token / dependabot / mechanical skips",
+              "steps.token-check.outputs.skip != 'true'" in blk
+              and "dependabot[bot]" in blk
+              and "steps.mechanical.outputs.skip != 'true'" in blk)
+        check(f"'{step}' has exactly one `exit 0`", blk.count("exit 0") == 1,
+              f"got {blk.count('exit 0')}")
+    gate_v = strip_comments(step_block(src, VERDICT_STEP))
+    check("the gate's ONLY verdict input is the derive step's marker output",
+          "steps.derive.outputs.marker" in gate_v and "gh " not in verdict_script(src),
+          "the gate must not read comments")
+    derive_blk = strip_comments(step_block(src, DERIVE_STEP))
+    check("the derive step binds to THIS run and window",
+          "github.run_id" in derive_blk and "steps.review_window.outputs.started_at" in derive_blk)
+    check("the parser ships next to action.yml (composite steps see GITHUB_ACTION_PATH)",
+          os.path.isfile(os.path.join(ACTION_DIR, "derive_verdict.py"))
+          and "GITHUB_ACTION_PATH" in derive_script(src))
+    check("the composite exposes the derived verdict + marker as outputs",
+          "steps.derive.outputs.verdict" in src and "steps.derive.outputs.marker" in src)
 
-    # The parser is worthless if the prompt never asks for the marker. Both the
-    # first attempt and the RETRY must carry the contract — a retry that omitted
-    # it would fail closed on every transient blip.
+    # The prompt no longer asks for a marker, but the parse depends on labels.
+    # Both attempts must carry the same contract — a retry with a different
+    # prompt would be adjudicated differently.
+    prompts = {}
     for step in (REVIEW_STEP, "Run Claude Code Review (retry)"):
         blk = step_block(src, step)
-        check(f"'{step}' prompt requires the verdict marker",
-              "claude-review-verdict:" in blk and "BLOCKING" in blk and "PASS" in blk)
-        check(f"'{step}' prompt binds the marker to this run",
-              "github.run_id" in blk and "github.run_attempt" in blk)
-        check(f"'{step}' prompt defines the severity split",
-              "ADVISORY" in blk)
-        # The model omitted the marker on two consecutive real reviews (#159,
-        # #167) while the requirement sat mid-prompt. It now has to be the LAST
-        # section, framed as the FINAL LINE, with the literal to emit.
-        # Indentation scan, not a regex: the prompt body is every line after
-        # `prompt: |` deeper-indented than the key. (A `(?:#.*\n\s*)*` regex
-        # here backtracked catastrophically.)
         lines = blk.split("\n")
         pi = next((i for i, l in enumerate(lines) if l.strip() == "prompt: |"), None)
         check(f"'{step}' has a block-scalar prompt", pi is not None)
-        prompt = None
-        if pi is not None:
-            key_indent = len(lines[pi]) - len(lines[pi].lstrip())
-            body_lines = []
-            for l in lines[pi + 1:]:
-                if l.strip() and (len(l) - len(l.lstrip())) <= key_indent:
-                    break
-                body_lines.append(l)
-            prompt = "\n".join(body_lines)
-        if prompt:
-            body = prompt
-            last_heading = [l for l in body.split("\n") if l.strip().startswith("## ")][-1]
-            check(f"'{step}' prompt's LAST section is the FINAL LINE marker rule",
-                  "FINAL LINE" in last_heading, f"last heading={last_heading.strip()!r}")
-            check(f"'{step}' prompt says the comment is REJECTED without the marker",
-                  "REJECTED" in body)
-            check(f"'{step}' prompt gives the literal PASS and BLOCKING lines to emit",
-                  "<!-- claude-review-verdict: PASS run=${{ github.run_id }}-${{ github.run_attempt }} -->" in body
-                  and "<!-- claude-review-verdict: BLOCKING run=${{ github.run_id }}-${{ github.run_attempt }} -->" in body)
-            # The reviewer writes into the tracking comment this action creates
-            # (`update_claude_comment`), not via `gh pr comment` — observed on
-            # #167 and estate-wide. A marker rule phrased as "before you call
-            # `gh pr comment`" therefore never fires: the trigger is an action the
-            # model does not take. The rule must name the tracking comment too.
-            check(f"'{step}' marker rule is not conditioned on `gh pr comment` alone",
-                  "update_claude_comment" in body,
-                  "the FINAL LINE section must name the tracking-comment channel")
+        if pi is None:
+            continue
+        key_indent = len(lines[pi]) - len(lines[pi].lstrip())
+        body_lines = []
+        for l in lines[pi + 1:]:
+            if l.strip() and (len(l) - len(l.lstrip())) <= key_indent:
+                break
+            body_lines.append(l)
+        prompt = "\n".join(body_lines)
+        prompts[step] = prompt
+        check(f"'{step}' prompt defines the severity split",
+              "**BLOCKING**" in prompt and "**ADVISORY**" in prompt)
+        check(f"'{step}' prompt mandates the machine-read label format",
+              "**BLOCKING — <short title>**" in prompt
+              and "**ADVISORY — <short title>**" in prompt and "MACHINE-READ" in prompt)
+        check(f"'{step}' prompt no longer asks the model for a verdict marker",
+              "<!-- claude-review-verdict" not in prompt and "FINAL LINE" not in prompt)
+        check(f"'{step}' prompt directs the review into the tracking comment",
+              "tracking comment" in prompt)
+    check("the first attempt and the retry use the SAME prompt",
+          len(prompts) == 2 and len(set(prompts.values())) == 1)
 
     # A skip must leave a record that outlives the run's step summary, now that a
     # green here is what arms auto-merge.
@@ -835,7 +967,8 @@ def main():
     check("the reviewability classifier has NO job/step `if:` of its own (it must "
           "run for every PR, or it cannot decide anything)",
           "\n        if:" not in rv_blk, "the classifier is itself conditional")
-    for step in (TOKEN_STEP, MECHANICAL_STEP, CHECKOUT_STEP, REVIEW_STEP, VERDICT_STEP):
+    for step in (TOKEN_STEP, MECHANICAL_STEP, CHECKOUT_STEP, WINDOW_STEP, REVIEW_STEP,
+                 DERIVE_STEP, VERDICT_STEP):
         blk = strip_comments(step_block(src, step))
         check(f"'{step}' is gated on the reviewability classifier",
               RV_COND in blk,

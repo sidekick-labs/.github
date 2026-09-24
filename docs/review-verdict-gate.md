@@ -21,7 +21,7 @@ The gate now answers a second question — **what did the review say?**
 | review raised nothing | pass |
 | review could not run (both attempts) | fail (`Verify a review actually ran`) |
 | the action returned without calling the model (workflow-validation no-op) | **fail**, classified distinctly |
-| verdict undeterminable — no marker, stale marker, unreadable comments | **fail (closed)** |
+| verdict undeterminable — no review comment for this run, `Claude encountered an error`, an empty (zero-turn) review, unreadable comments | **fail (closed)** |
 | lane skipped — dependabot, fork, mechanical PR | pass, with a durable reason |
 
 ## Where the logic lives, and why it is not in the workflow
@@ -108,28 +108,64 @@ message, not a new green.
 
 ## Mechanism
 
-The reviewer already posts its findings to the PR with `gh pr comment`. The prompt
-now requires that comment to end with exactly one machine-readable marker:
+**The composite derives the verdict and authors the marker; the model does not**
+(`sre-brain#568`, option 2). The gate originally asked the reviewer to end its
+comment with a nonce-bound HTML marker. Three prompt iterations failed with the
+instruction provably in the prompt, and on `sidekick-glasses-test#133` the
+reviewer's tracking comment contained zero `<!--` sequences — consistent with the
+`update_claude_comment` path stripping HTML comments, which no wording can fix.
+What the reviewer *does* reliably emit is severity-labelled findings.
 
-```
-<!-- claude-review-verdict: BLOCKING run=<run_id>-<run_attempt> -->
-<!-- claude-review-verdict: PASS     run=<run_id>-<run_attempt> -->
-```
+So two steps in the composite now decide the verdict:
 
-A deterministic step (`Determine the review VERDICT`) reads the PR's comments and
-maps the marker onto the job's exit code.
+1. **`Derive the review verdict from the reviewer's comment`** reads the PR's
+   comments and selects the reviewer's tracking comment for **this run**: author
+   `review_author` (REST `claude[bot]`), first line `**Claude finished …` or
+   `**Claude encountered an error …`, a link to `/actions/runs/<this run id>`,
+   created inside this job's review window (opened by `Open the review window`,
+   less 30 s of clock skew). The last such comment wins. It then applies
+   `derive_verdict.py`, whose docstring is the exact rule:
+   - no such comment, `Claude encountered an error`, an unknown header, or a
+     comment with no review content → **fail closed**;
+   - any **BLOCKING-labelled** finding → `BLOCKING`;
+   - otherwise → `PASS`.
 
-Three properties are deliberate:
+   A *label* is not the *word*: `No BLOCKING findings`, `No **BLOCKING**
+   findings` and `### BLOCKING fix verified — #1 resolved` are prose and never
+   count. `**BLOCKING — title**`, `BLOCKING: title`, `[BLOCKING] title`, a
+   `### BLOCKING` section with content under it, a heading ending `— BLOCKING`
+   and a table cell `BLOCKING` do. Fenced code is ignored. A completed review
+   with no labels at all is `PASS`, which is what the model would have declared
+   under the old contract.
 
-- **No second review pass.** The verdict rides the artefact a human reads anyway.
-  PR review is already the estate's largest single consumer of shared Claude
-  capacity; a parallel adjudication pass would double it to answer a question the
-  first pass already knew.
-- **No new tool grants.** The reviewer stays read-only plus `gh pr comment`, so the
-  fork-safety and prompt-injection posture is unchanged. It is never given `Write`.
-- **The run nonce is load-bearing.** Without it the verdict would attach to the *PR*
-  rather than to *this run's diff*, and a PASS from an earlier push would certify a
-  later, defective one. A marker for a different run does not count.
+   It then **writes the marker itself**, as a step output (and into the step
+   summary and the check annotation):
+
+   ```
+   <!-- claude-review-verdict: BLOCKING run=<run_id>-<run_attempt> -->
+   <!-- claude-review-verdict: PASS     run=<run_id>-<run_attempt> -->
+   ```
+
+2. **`Determine the review VERDICT`** reads **only** that step output, requires
+   an exact match for this run+attempt, and maps it onto the exit code.
+
+Properties that are deliberate:
+
+- **Forgery-resistant by construction.** Only the composite's own step can write
+  a step output, so no comment — the model's, a human's, another bot's — can
+  supply an accepted marker. A marker found in any comment is never read; it is
+  reported (`::warning` for a non-reviewer, `::notice` for the reviewer). A human
+  comment imitating this run's `Claude finished` header is ignored the same way.
+- **The run nonce is still load-bearing.** The source comment is bound to this
+  run id and window; the marker to this run+attempt. A PASS from an earlier push
+  cannot certify a later one.
+- **No second review pass, no new tool grants.** The reviewer stays read-only
+  plus `gh pr comment`.
+- **Trade-off, stated plainly:** the gate now trusts its own parse of the review
+  body rather than an explicit model declaration. The prompt therefore mandates
+  the label format (`**BLOCKING — <short title>**`), and the parser is pinned
+  against real review bodies in `tests/fixtures/review-verdict/` (private-repo
+  bodies are structure-preserving redactions — this repo is public).
 
 ## Skips stay green, and stay legible
 
@@ -156,10 +192,14 @@ Policy for what may skip at all: `.claude/conventions/mechanical-pr-review-skip.
 ## Positive control — required before trusting this green
 
 `tests/review-gate-exit-codes.py` (run by `test-review-gate.yml`) pins the exit-code
-contract against fixtures: BLOCKING → 1, PASS → 0, advisory-only → 0, stale nonce →
-1, absent marker → 1, unreadable comments → 1, unrecognised value → 1,
-BLOCKING+PASS → 1. Its own ability to go red was checked by mutation — flipping the
-BLOCKING branch to `exit 0` fails three checks.
+contract: the derivation against real review bodies and a label grammar, then
+derive → composite marker → gate under `bash -e -o pipefail` (PASS, BLOCKING,
+errored, no comment, other run, before the window, zero-turn, spoofed marker in a
+human comment, model-written marker, "No BLOCKING findings" prose, unreadable
+comments, missing parser, gate nonce/attempt mismatch). Its ability to go red was
+checked by mutation (dropping the login filter, the run binding, the window, the
+errored branch, the substance check or the gate nonce, or flipping BLOCKING to
+`exit 0`, each fails at least one check).
 
 **That proves the PARSER. It says nothing about the CONSEQUENCE** — that a real
 correctness bug actually makes the reviewer emit `BLOCKING`. Per
@@ -180,14 +220,14 @@ positive before its green is evidence. Force one, once, and record the run URL h
 
 Expected, and all three must hold:
 
-- the review comment lands and its findings are severity-prefixed;
-- its last line is `<!-- claude-review-verdict: BLOCKING run=… -->` with **this**
-  run's id;
+- the review comment lands and the defect is labelled `**BLOCKING — …**`;
+- the `Derive the review verdict` step summary shows the composite-authored
+  `<!-- claude-review-verdict: BLOCKING run=… -->` with **this** run's id;
 - the check concludes **failure**, with the `Claude Code Review — BLOCKING findings`
   step summary.
 
 4. Then push a commit fixing only that defect and confirm the same PR flips to a
-   `PASS` marker and a green check. That second half matters: a gate that reds on
+   derived `PASS` marker and a green check. That second half matters: a gate that reds on
    everything is as uninformative as one that greens on everything.
 5. Close the PR without merging, and paste both run URLs into the table below.
 

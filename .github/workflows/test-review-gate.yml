@@ -14,8 +14,10 @@ name: Test review-gate logic
 # Network-free and cheap. Mirrors the path-filtered, per-area pattern of
 # test-audit-logic.yml / test-release-thread.yml.
 #
-# It watches FOUR paths, and each one earns its place:
-#   * the composite action — where the review logic actually lives;
+# It watches these paths, and each one earns its place:
+#   * the composite action — where the review logic actually lives — plus its
+#     verdict parser (`derive_verdict.py`) and the real review bodies that parser
+#     is pinned against (`tests/fixtures/review-verdict/`, sre-brain#568);
 #   * claude-code-review.yml — the shim, asserted to stay thin (logic there is
 #     unmergeable to change, because claude-code-action validates that file
 #     against the default branch);
@@ -28,6 +30,8 @@ on:
   pull_request:
     paths:
       - '.github/actions/claude-review/action.yml'
+      - '.github/actions/claude-review/derive_verdict.py'
+      - 'tests/fixtures/review-verdict/**'
       - '.github/workflows/claude-code-review.yml'
       - '.github/workflows/pr.yml'
       - 'tests/review-gate-exit-codes.py'
@@ -36,6 +40,8 @@ on:
     branches: [main]
     paths:
       - '.github/actions/claude-review/action.yml'
+      - '.github/actions/claude-review/derive_verdict.py'
+      - 'tests/fixtures/review-verdict/**'
       - '.github/workflows/claude-code-review.yml'
       - '.github/workflows/pr.yml'
       - 'tests/review-gate-exit-codes.py'
