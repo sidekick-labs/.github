@@ -1,0 +1,20 @@
+name: estate-check (self)
+
+# Pilot caller: runs this repo's own reusable estate-check workflow by local path,
+# so changes to it are exercised before merge. Other repos call it at @main.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "23 2 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  estate-check:
+    uses: ./.github/workflows/estate-check.yml
+    with:
+      mode: report
