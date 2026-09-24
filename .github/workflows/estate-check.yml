@@ -45,7 +45,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: rarebit-one/estate-check@ee2755bb81ddf1519659d77b54db3d807cb14c66 # v1.0.0
+      - uses: rarebit-one/estate-check@4c19f6e7db0424a30262d493dc3336374ed6064a # v1.1.0
         with:
           mode: ${{ inputs.mode }}
           workspace: ${{ inputs.workspace }}
