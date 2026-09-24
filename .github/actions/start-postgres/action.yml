@@ -262,4 +262,4 @@ runs:
         fi
         echo "database-url=$url" >> "$GITHUB_OUTPUT"
 
-        echo "PostgreSQL $("$PGBIN/postgres" --version | awk '{print $NF}') on localhost:$PG_PORT_IN (user=$PG_USER${PG_DATABASE:+ db=$PG_DATABASE}${exts[*]:+ extensions=${exts[*]}}; runner.environment=${RUNNER_ENVIRONMENT:-unknown})"
+        echo "PostgreSQL $("$PGBIN/postgres" --version | awk '{print $3}') on localhost:$PG_PORT_IN (user=$PG_USER${PG_DATABASE:+ db=$PG_DATABASE}${exts[*]:+ extensions=${exts[*]}}; runner.environment=${RUNNER_ENVIRONMENT:-unknown})"
