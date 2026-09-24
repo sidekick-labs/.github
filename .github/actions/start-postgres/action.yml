@@ -76,7 +76,8 @@ inputs:
     default: "5432"
   database-url:
     description: >-
-      "true" exports DATABASE_URL for `database`. Off by default on purpose:
+      Exactly "true" or "false" (anything else fails). "true" exports
+      DATABASE_URL for `database`. Off by default on purpose:
       Rails merges DATABASE_URL over config/database.yml, which would point
       every parallel_tests worker at the same database.
     required: false
@@ -112,6 +113,7 @@ runs:
         pkgs=()
         [ -x "/usr/lib/postgresql/$PG_MAJOR/bin/initdb" ] || pkgs+=("postgresql-$PG_MAJOR")
         for ext in ${PG_EXTENSIONS//,/ }; do
+          [[ "$ext" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo "::error::start-postgres: extension names must be plain identifiers (got '$ext')"; exit 1; }
           if [ "$ext" = vector ] && [ ! -f "/usr/share/postgresql/$PG_MAJOR/extension/vector.control" ]; then
             pkgs+=("postgresql-$PG_MAJOR-pgvector")
           fi
@@ -134,7 +136,8 @@ runs:
         echo "deb [signed-by=/usr/share/keyrings/pgdg.asc] https://apt.postgresql.org/pub/repos/apt ${codename}-pgdg main" \
           | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
         sudo apt-get update -qq -o Acquire::Retries=3
-        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends -o Acquire::Retries=3 "${pkgs[@]}"
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends -o Acquire::Retries=3 "${pkgs[@]}" \
+          || { echo "::error::start-postgres: could not install ${pkgs[*]} from PGDG. PostgreSQL $PG_MAJOR is not available; refusing to fall back to another major."; exit 1; }
 
     - name: Start PostgreSQL ${{ inputs.major }}
       id: start
@@ -167,6 +170,8 @@ runs:
         fail() { echo "::error::start-postgres: $*"; exit 1; }
         case "$PG_MAJOR" in ''|*[!0-9]*) fail "input 'major' must be a bare major like 18 (got '$PG_MAJOR')" ;; esac
         case "$PG_PORT_IN" in ''|*[!0-9]*) fail "input 'port' must be numeric (got '$PG_PORT_IN')" ;; esac
+        [ "$PG_PORT_IN" -ge 1 ] && [ "$PG_PORT_IN" -le 65535 ] || fail "input 'port' must be 1-65535 (got '$PG_PORT_IN')"
+        case "$PG_EXPORT_URL" in true|false) ;; *) fail "input 'database-url' must be exactly \"true\" or \"false\" (got '$PG_EXPORT_URL')" ;; esac
         ident='^[A-Za-z_][A-Za-z0-9_]*$'
         [[ "$PG_USER" =~ $ident ]] || fail "input 'user' must be a plain identifier (got '$PG_USER')"
         [ -z "$PG_DATABASE" ] || [[ "$PG_DATABASE" =~ $ident ]] || fail "input 'database' must be a plain identifier (got '$PG_DATABASE')"
@@ -201,10 +206,21 @@ runs:
           --auth-local=trust --auth-host=trust --encoding=UTF8 "${locale_args[@]}" "${pwargs[@]}" >/dev/null
         rm -f "$root/pwfile"
 
-        opts="-p $PG_PORT_IN -c listen_addresses=localhost -c unix_socket_directories=$PGDATA"
-        opts+=" -c fsync=off -c synchronous_commit=off -c full_page_writes=off"
-        opts+=" -c dynamic_shared_memory_type=mmap"
-        if ! "$PGBIN/pg_ctl" --pgdata="$PGDATA" --options="$opts" --log="$LOG" --wait --timeout=60 start; then
+        # Written to postgresql.conf (quoted) rather than passed through
+        # `pg_ctl --options`, whose whitespace tokeniser would split a
+        # $RUNNER_TEMP containing a space.
+        cat >> "$PGDATA/postgresql.conf" <<CONF
+
+        # start-postgres (sidekick-labs/.github), rarebit-one/rarebit-sre#375
+        port = $PG_PORT_IN
+        listen_addresses = 'localhost'
+        unix_socket_directories = '$PGDATA'
+        fsync = off
+        synchronous_commit = off
+        full_page_writes = off
+        dynamic_shared_memory_type = mmap
+        CONF
+        if ! "$PGBIN/pg_ctl" --pgdata="$PGDATA" --log="$LOG" --wait --timeout=60 start; then
           echo '--- postgres server log ---'; cat "$LOG" || true
           fail "the server did not start (log above)"
         fi
@@ -212,7 +228,7 @@ runs:
         running="$("$PGBIN/psql" -h "$PGDATA" -p "$PG_PORT_IN" -U "$PG_USER" -d postgres -qAtX -v ON_ERROR_STOP=1 -c 'SHOW server_version_num')"
         [ "$((running / 10000))" = "$PG_MAJOR" ] || fail "the running server is version $running, expected major $PG_MAJOR"
 
-        sql() { "$PGBIN/psql" -h "$PGDATA" -p "$PG_PORT_IN" -U "$PG_USER" -qAtX -v ON_ERROR_STOP=1 "$@"; }
+        sql() { PGOPTIONS='-c client_min_messages=warning' "$PGBIN/psql" -h "$PGDATA" -p "$PG_PORT_IN" -U "$PG_USER" -qAtX -v ON_ERROR_STOP=1 "$@"; }
         for ext in "${exts[@]}"; do
           sql -d template1 -c "CREATE EXTENSION IF NOT EXISTS \"$ext\"" \
             || fail "CREATE EXTENSION $ext failed on PostgreSQL $PG_MAJOR (is its package in the runner image?)"

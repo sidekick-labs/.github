@@ -14,7 +14,11 @@ name: Test start-postgres
 #              sidekick consumer uses while RUNNER_LABEL_HEAVY is unset.
 #   pg16       the "server already present" path, the shape of the jdb lane
 #              (binaries baked, nothing to install for the server).
-#   missing    a major that does not exist must FAIL the action, never fall back.
+#   defaults   no extensions, no database, custom port, default database-url:
+#              the zero-install path (16 is preinstalled) and the "export
+#              nothing extra" contract.
+#   bad input  a major that does not exist must FAIL the action, never fall
+#              back; a non-boolean database-url must fail too.
 on:
   pull_request:
     paths:
@@ -113,8 +117,49 @@ jobs:
         if: failure() && env.START_POSTGRES_LOG != ''
         run: tail -n 200 "$START_POSTGRES_LOG" || true
 
-  missing-major:
-    name: start-postgres (missing major fails loudly)
+  defaults:
+    name: start-postgres (defaults, custom port)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Start PostgreSQL
+        id: pg
+        uses: ./.github/actions/start-postgres
+        with:
+          major: '16'
+          port: '5433'
+
+      - name: Assert the minimal contract
+        env:
+          OUTPUT_URL: ${{ steps.pg.outputs.database-url }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          [ "$PGHOST" = localhost ] || fail "PGHOST=$PGHOST"
+          [ "$PGPORT" = 5433 ] || fail "PGPORT=$PGPORT"
+          [ "$PGUSER" = postgres ] || fail "PGUSER=$PGUSER"
+          [ -z "${PGDATABASE:-}" ] || fail "PGDATABASE is set ($PGDATABASE) with no database input"
+          [ -z "${DATABASE_URL:-}" ] || fail "DATABASE_URL is set ($DATABASE_URL) although database-url defaults to false"
+          [ -z "$OUTPUT_URL" ] || fail "output database-url=$OUTPUT_URL with no database input"
+          version="$(psql -d postgres -qAtX -v ON_ERROR_STOP=1 -c 'SELECT version()')"
+          case "$version" in "PostgreSQL 16."*) ;; *) fail "expected PostgreSQL 16.x, got: $version";; esac
+          # The unix socket lives under PGDATA.
+          psql -h "$(dirname "$START_POSTGRES_LOG")/data" -d postgres -qAtX -v ON_ERROR_STOP=1 -c 'SELECT 1' >/dev/null \
+            || fail "no unix socket under PGDATA"
+          [ "$(psql -d postgres -qAtX -c 'SHOW port')" = 5433 ] || fail "server is not on 5433"
+          echo "start-postgres defaults: all assertions passed"
+
+      - name: Dump the postgres log on failure
+        if: failure() && env.START_POSTGRES_LOG != ''
+        run: tail -n 200 "$START_POSTGRES_LOG" || true
+
+  bad-input:
+    name: start-postgres (bad input fails loudly)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -130,12 +175,23 @@ jobs:
         with:
           major: '99'
 
-      - name: Assert the action failed and started nothing
+      - name: Pass a non-boolean database-url
+        id: badurl
+        continue-on-error: true
+        uses: ./.github/actions/start-postgres
+        with:
+          major: '16'
+          database: x
+          database-url: 'yes'
+
+      - name: Assert both failed and nothing started
         env:
           OUTCOME: ${{ steps.pg.outcome }}
+          BADURL: ${{ steps.badurl.outcome }}
         run: |
           set -euo pipefail
           [ "$OUTCOME" = failure ] || { echo "::error::start-postgres with major 99 returned '$OUTCOME', expected failure"; exit 1; }
+          [ "$BADURL" = failure ] || { echo "::error::start-postgres with database-url 'yes' returned '$BADURL', expected failure"; exit 1; }
           if pgrep -x postgres >/dev/null; then
             echo "::error::a postgres server is running after a failed start (fallback to another major?)"; exit 1
           fi
