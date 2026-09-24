@@ -1,0 +1,249 @@
+# Start a throwaway PostgreSQL server of an EXPLICIT major version as a job
+# STEP, replacing a `services: postgres` block. Consume it with:
+#
+#   - uses: sidekick-labs/.github/.github/actions/start-postgres@<sha> # main
+#     with:
+#       major: "18"            # REQUIRED; never guessed, never substituted
+#       extensions: vector     # created in template1 + `database`
+#       user: sidekick
+#       password: sidekick_dev
+#       database: sidekick_harness
+#       database-url: "true"   # opt in; see the input's note before a Rails app does
+#
+# WHY A STEP, NOT `services:`
+#   `services:` needs a docker daemon. The jumpdrive-broker (`jdb`) runner is a
+#   rootless podman CONTAINER with no docker daemon and no sudo, so a job with
+#   `services:` cannot run there. initdb + pg_ctl as the current non-root user
+#   runs identically on BOTH lanes, so routing a job to jdb and back is a
+#   one-variable change (rarebit-one/rarebit-sre#375).
+#
+# WHERE THE BINARIES COME FROM
+#   - jdb: the jumpdrive-ci-runner image bakes PGDG postgresql-16 and -18 plus
+#     pgvector for both under /usr/lib/postgresql/<major>/bin
+#     (rarebit-one/jumpdrive-runner#121). Nothing is installed at job time.
+#   - GitHub-hosted: ubuntu-24.04 ships only 16, so a missing major (and its
+#     pgvector) is installed from the same PGDG apt repo the image uses.
+#   A missing major on any other runner is a HARD FAILURE naming what is
+#   installed. The action never falls back to a different major: a silent
+#   16-instead-of-18 is the bug the required `major` input exists to prevent
+#   (the fundbright-web start-postgres lesson, fundbright-web#1665).
+#
+# A composite action has no `post:` hook, so the server log is dumped by the
+# start step itself when startup fails, and its path is exported as
+# START_POSTGRES_LOG for a consumer's `if: failure()` step to print when a
+# later step (the test suite) fails.
+name: Start PostgreSQL
+description: >-
+  Start a local PostgreSQL server of an explicit major (plus extensions such as
+  pgvector) as a job step, on GitHub-hosted runners and on the jumpdrive-broker
+  container runner alike. Exports PGHOST/PGPORT/PGUSER (and optionally
+  DATABASE_URL). Replaces a `services: postgres` block.
+
+inputs:
+  major:
+    description: >-
+      PostgreSQL major to run, e.g. "18". Required. If it is not installed
+      and cannot be installed (github-hosted only), the action fails; it never
+      substitutes another major.
+    required: true
+  extensions:
+    description: >-
+      Comma- or space-separated extensions to CREATE in template1 (so every
+      later CREATE DATABASE, including Rails `db:create` / `parallel:create`,
+      inherits them) and in `database`. `vector` also installs
+      postgresql-<major>-pgvector on github-hosted when missing. Contrib
+      extensions (pg_trgm, ...) ship with the server package.
+    required: false
+    default: ""
+  user:
+    description: Superuser role the cluster is initialised with.
+    required: false
+    default: postgres
+  password:
+    description: >-
+      Password set on `user`. Authentication is `trust` on this loopback-only,
+      throwaway cluster, so clients that send a password and clients that do
+      not both connect; setting it keeps password-bearing URLs honest.
+    required: false
+    default: ""
+  database:
+    description: Database to create (optional). Exported as PGDATABASE.
+    required: false
+    default: ""
+  port:
+    description: TCP port on localhost.
+    required: false
+    default: "5432"
+  database-url:
+    description: >-
+      "true" exports DATABASE_URL for `database`. Off by default on purpose:
+      Rails merges DATABASE_URL over config/database.yml, which would point
+      every parallel_tests worker at the same database.
+    required: false
+    default: "false"
+
+outputs:
+  database-url:
+    description: postgresql:// URL for `database` (empty when no database was requested).
+    value: ${{ steps.start.outputs.database-url }}
+  log-file:
+    description: Path of the server log (also exported as START_POSTGRES_LOG).
+    value: ${{ steps.start.outputs.log-file }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install PostgreSQL ${{ inputs.major }} from PGDG (github-hosted, only if missing)
+      if: runner.environment == 'github-hosted'
+      shell: bash
+      env:
+        PG_MAJOR: ${{ inputs.major }}
+        PG_EXTENSIONS: ${{ inputs.extensions }}
+        # The PGDG signing key, checksummed exactly as the jdb image does it
+        # (jumpdrive-runner Dockerfile, ARG PGDG_KEY_SHA256), so both lanes
+        # trust the same key. When PGDG re-publishes the key this step fails
+        # loudly; update both pins together.
+        PGDG_KEY_SHA256: 0144068502a1eddd2a0280ede10ef607d1ec592ce819940991203941564e8e76
+      run: |
+        set -euo pipefail
+        case "$PG_MAJOR" in
+          ''|*[!0-9]*) echo "::error::start-postgres: input 'major' must be a bare major like 18 (got '$PG_MAJOR')"; exit 1 ;;
+        esac
+        pkgs=()
+        [ -x "/usr/lib/postgresql/$PG_MAJOR/bin/initdb" ] || pkgs+=("postgresql-$PG_MAJOR")
+        for ext in ${PG_EXTENSIONS//,/ }; do
+          if [ "$ext" = vector ] && [ ! -f "/usr/share/postgresql/$PG_MAJOR/extension/vector.control" ]; then
+            pkgs+=("postgresql-$PG_MAJOR-pgvector")
+          fi
+        done
+        if [ "${#pkgs[@]}" -eq 0 ]; then
+          echo "PostgreSQL $PG_MAJOR and the requested extensions are already installed"
+          exit 0
+        fi
+        echo "Installing from apt.postgresql.org (PGDG): ${pkgs[*]}"
+        # No auto-created, auto-started `<major>/main` cluster: it would take the
+        # port before the initdb below can.
+        sudo install -d /etc/postgresql-common/createcluster.d
+        echo 'create_main_cluster = false' | sudo tee /etc/postgresql-common/createcluster.d/00-ci-no-main-cluster.conf >/dev/null
+        key="$RUNNER_TEMP/pgdg.asc"
+        curl -fsSL --retry 3 -o "$key" https://www.postgresql.org/media/keys/ACCC4CF8.asc
+        echo "$PGDG_KEY_SHA256  $key" | sha256sum -c - \
+          || { echo "::error::start-postgres: the PGDG signing key does not match the pinned sha256. Re-measure it and update PGDG_KEY_SHA256 here and in jumpdrive-runner's Dockerfile."; exit 1; }
+        sudo install -m 0644 "$key" /usr/share/keyrings/pgdg.asc
+        codename="$(. /etc/os-release && echo "$VERSION_CODENAME")"
+        echo "deb [signed-by=/usr/share/keyrings/pgdg.asc] https://apt.postgresql.org/pub/repos/apt ${codename}-pgdg main" \
+          | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+        sudo apt-get update -qq -o Acquire::Retries=3
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends -o Acquire::Retries=3 "${pkgs[@]}"
+
+    - name: Start PostgreSQL ${{ inputs.major }}
+      id: start
+      shell: bash
+      env:
+        PG_MAJOR: ${{ inputs.major }}
+        PG_EXTENSIONS: ${{ inputs.extensions }}
+        PG_USER: ${{ inputs.user }}
+        PG_PASSWORD: ${{ inputs.password }}
+        PG_DATABASE: ${{ inputs.database }}
+        PG_PORT_IN: ${{ inputs.port }}
+        PG_EXPORT_URL: ${{ inputs.database-url }}
+      # Server settings (rarebit-sre#375):
+      #   dynamic_shared_memory_type=mmap: podman gives the jdb container a 64 MB
+      #     /dev/shm, too small for the default `posix` segments under parallel
+      #     queries. mmap files live in PGDATA instead.
+      #   fsync/synchronous_commit/full_page_writes off: the equivalent of the old
+      #     tmpfs data dir. The cluster is thrown away with the job.
+      #   unix_socket_directories=$PGDATA: Ubuntu's default /var/run/postgresql
+      #     is not writable by the non-root runner user (`runner` hosted, `node`
+      #     on jdb), and postgres refuses to run as root.
+      #   listen_addresses=localhost: never reachable off the box, which is why
+      #     trust auth is acceptable.
+      # Encoding is pinned to UTF8 because the minimal jdb container has no
+      # locale and initdb would otherwise build a SQL_ASCII template there. On
+      # PG >= 17 the builtin C.UTF-8 provider gives Unicode-aware upper/lower
+      # with no OS locale dependency; PG 16 falls back to plain C.
+      run: |
+        set -euo pipefail
+        fail() { echo "::error::start-postgres: $*"; exit 1; }
+        case "$PG_MAJOR" in ''|*[!0-9]*) fail "input 'major' must be a bare major like 18 (got '$PG_MAJOR')" ;; esac
+        case "$PG_PORT_IN" in ''|*[!0-9]*) fail "input 'port' must be numeric (got '$PG_PORT_IN')" ;; esac
+        ident='^[A-Za-z_][A-Za-z0-9_]*$'
+        [[ "$PG_USER" =~ $ident ]] || fail "input 'user' must be a plain identifier (got '$PG_USER')"
+        [ -z "$PG_DATABASE" ] || [[ "$PG_DATABASE" =~ $ident ]] || fail "input 'database' must be a plain identifier (got '$PG_DATABASE')"
+        exts=()
+        for ext in ${PG_EXTENSIONS//,/ }; do
+          [[ "$ext" =~ $ident ]] || fail "extension names must be plain identifiers (got '$ext')"
+          exts+=("$ext")
+        done
+
+        PGBIN="/usr/lib/postgresql/$PG_MAJOR/bin"
+        if [ ! -x "$PGBIN/initdb" ] || [ ! -x "$PGBIN/pg_ctl" ] || [ ! -x "$PGBIN/psql" ]; then
+          installed="$(ls -1 /usr/lib/postgresql 2>/dev/null | tr '\n' ' ' || true)"
+          fail "PostgreSQL $PG_MAJOR is not installed on this runner (installed majors: ${installed:-none}; runner.environment=${RUNNER_ENVIRONMENT:-unknown}). Refusing to fall back to another major. On jdb the ci runner image must ship postgresql-$PG_MAJOR (jumpdrive-runner#121 and the broker image pin)."
+        fi
+
+        root="$RUNNER_TEMP/start-postgres"
+        PGDATA="$root/data"
+        LOG="$root/pg.log"
+        [ ! -e "$PGDATA" ] || fail "$PGDATA already exists; start-postgres runs once per job"
+        mkdir -p "$root"
+        echo "START_POSTGRES_LOG=$LOG" >> "$GITHUB_ENV"
+        echo "log-file=$LOG" >> "$GITHUB_OUTPUT"
+
+        locale_args=(--locale=C)
+        [ "$PG_MAJOR" -ge 17 ] && locale_args=(--locale-provider=builtin --builtin-locale=C.UTF-8 --locale=C)
+        pwargs=()
+        if [ -n "$PG_PASSWORD" ]; then
+          printf '%s\n' "$PG_PASSWORD" > "$root/pwfile"
+          pwargs=(--pwfile="$root/pwfile")
+        fi
+        "$PGBIN/initdb" --pgdata="$PGDATA" --username="$PG_USER" \
+          --auth-local=trust --auth-host=trust --encoding=UTF8 "${locale_args[@]}" "${pwargs[@]}" >/dev/null
+        rm -f "$root/pwfile"
+
+        opts="-p $PG_PORT_IN -c listen_addresses=localhost -c unix_socket_directories=$PGDATA"
+        opts+=" -c fsync=off -c synchronous_commit=off -c full_page_writes=off"
+        opts+=" -c dynamic_shared_memory_type=mmap"
+        if ! "$PGBIN/pg_ctl" --pgdata="$PGDATA" --options="$opts" --log="$LOG" --wait --timeout=60 start; then
+          echo '--- postgres server log ---'; cat "$LOG" || true
+          fail "the server did not start (log above)"
+        fi
+
+        running="$("$PGBIN/psql" -h "$PGDATA" -p "$PG_PORT_IN" -U "$PG_USER" -d postgres -qAtX -v ON_ERROR_STOP=1 -c 'SHOW server_version_num')"
+        [ "$((running / 10000))" = "$PG_MAJOR" ] || fail "the running server is version $running, expected major $PG_MAJOR"
+
+        sql() { "$PGBIN/psql" -h "$PGDATA" -p "$PG_PORT_IN" -U "$PG_USER" -qAtX -v ON_ERROR_STOP=1 "$@"; }
+        for ext in "${exts[@]}"; do
+          sql -d template1 -c "CREATE EXTENSION IF NOT EXISTS \"$ext\"" \
+            || fail "CREATE EXTENSION $ext failed on PostgreSQL $PG_MAJOR (is its package in the runner image?)"
+        done
+        if [ -n "$PG_DATABASE" ]; then
+          if [ "$(sql -d postgres -c "SELECT 1 FROM pg_database WHERE datname = '$PG_DATABASE'")" != 1 ]; then
+            sql -d postgres -c "CREATE DATABASE \"$PG_DATABASE\""
+          fi
+          for ext in "${exts[@]}"; do sql -d "$PG_DATABASE" -c "CREATE EXTENSION IF NOT EXISTS \"$ext\""; done
+        fi
+
+        # Server-matched client tools (psql, pg_dump) first on PATH: a pg_dump
+        # older than the server refuses to dump it.
+        echo "$PGBIN" >> "$GITHUB_PATH"
+        {
+          echo "PGHOST=localhost"
+          echo "PGPORT=$PG_PORT_IN"
+          echo "PGUSER=$PG_USER"
+          [ -z "$PG_DATABASE" ] || echo "PGDATABASE=$PG_DATABASE"
+        } >> "$GITHUB_ENV"
+
+        url=""
+        if [ -n "$PG_DATABASE" ]; then
+          enc() { local s="$1" out="" c i; for ((i = 0; i < ${#s}; i++)); do c="${s:i:1}"; case "$c" in [A-Za-z0-9._~-]) out+="$c" ;; *) out+="$(printf '%%%02X' "'$c")" ;; esac; done; printf '%s' "$out"; }
+          auth="$PG_USER"
+          [ -z "$PG_PASSWORD" ] || auth+=":$(enc "$PG_PASSWORD")"
+          url="postgresql://$auth@localhost:$PG_PORT_IN/$PG_DATABASE"
+          [ "$PG_EXPORT_URL" != true ] || echo "DATABASE_URL=$url" >> "$GITHUB_ENV"
+        elif [ "$PG_EXPORT_URL" = true ]; then
+          fail "database-url: true needs a database"
+        fi
+        echo "database-url=$url" >> "$GITHUB_OUTPUT"
+
+        echo "PostgreSQL $("$PGBIN/postgres" --version | awk '{print $NF}') on localhost:$PG_PORT_IN (user=$PG_USER${PG_DATABASE:+ db=$PG_DATABASE}${exts[*]:+ extensions=${exts[*]}}; runner.environment=${RUNNER_ENVIRONMENT:-unknown})"
