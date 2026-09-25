@@ -55,8 +55,10 @@ jobs:
 
       - name: Determine target SHA
         id: main
+        env:
+          REF_INPUT: ${{ inputs.ref }}
         run: |
-          REF="${{ inputs.ref }}"
+          REF="${REF_INPUT}"
           if [ -n "$REF" ]; then
             if ! git rev-parse --verify "$REF" &>/dev/null; then
               echo "::error::Ref '$REF' is not a valid commit"
@@ -217,8 +219,9 @@ jobs:
         id: do_deploy
         env:
           DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+          DO_APP_ID_INPUT: ${{ inputs.do_app_id }}
         run: |
-          APP_ID="${{ inputs.do_app_id }}"
+          APP_ID="${DO_APP_ID_INPUT}"
 
           # Install doctl
           wget -qO- https://github.com/digitalocean/doctl/releases/download/v1.115.0/doctl-1.115.0-linux-amd64.tar.gz | tar xz
@@ -274,8 +277,9 @@ jobs:
         if: steps.check.outputs.skip != 'true' && inputs.dry_run != true && steps.deployment.outputs.deployment_id != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_URL_INPUT: ${{ inputs.app_url }}
         run: |
-          APP_URL="${{ inputs.app_url }}"
+          APP_URL="${APP_URL_INPUT}"
           EXTRA_ARGS=""
           if [ -n "$APP_URL" ]; then
             EXTRA_ARGS="-f environment_url=$APP_URL"
