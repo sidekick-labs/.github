@@ -53,6 +53,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
       - name: Run release-thread logic tests
         run: bash .github/tests/release-thread-logic.sh
       - name: Run deployment-status logic tests
