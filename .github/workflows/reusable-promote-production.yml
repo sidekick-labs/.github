@@ -621,6 +621,8 @@ jobs:
       - name: Classify failure stage
         id: stage
         if: failure()
+        env:
+          DEPLOY_WORKFLOW_INPUT: ${{ inputs.deploy_production_workflow }}
         run: |
           if [ "${{ steps.app_token.outcome }}" = "failure" ]; then
             STAGE="GitHub App token mint (release_bot_client_id / RELEASE_BOT_PRIVATE_KEY missing/invalid, or App not installed)"
@@ -637,7 +639,7 @@ jobs:
           elif [ "${{ steps.ff_push.outcome }}" = "failure" ]; then
             STAGE="fast-forward push to production branch (non-FF history, or release-bot App missing from production ruleset bypass list?)"
           elif [ "${{ steps.dispatch_deploy.outcome }}" = "failure" ]; then
-            STAGE="dispatching production deploy (production branch advanced but deploy never started — re-dispatch ${{ inputs.deploy_production_workflow }} on the default branch with the same SHA in the 'ref' input; the step retries 3x, so a persistent failure is usually a bad input, a workflow-file/env-branch-policy mismatch, or a GitHub API outage — NOT a token-permission issue, the deploy is dispatched with the release-bot App token which already holds actions:write)"
+            STAGE="dispatching production deploy (production branch advanced but deploy never started — re-dispatch ${DEPLOY_WORKFLOW_INPUT} on the default branch with the same SHA in the 'ref' input; the step retries 3x, so a persistent failure is usually a bad input, a workflow-file/env-branch-policy mismatch, or a GitHub API outage — NOT a token-permission issue, the deploy is dispatched with the release-bot App token which already holds actions:write)"
           else
             STAGE="environment setup (doctl install, registry auth, …)"
           fi
