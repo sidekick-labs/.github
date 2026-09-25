@@ -172,8 +172,14 @@ jobs:
           # create-github-app-token narrows the token to ONLY the permission-*
           # scopes requested here, so actions:write must be listed explicitly
           # even though the App is granted it at the installation level.
+          #   workflows:write → the FF-push must be allowed to move commits that
+          #     touch .github/workflows/*; without it GitHub rejects the push
+          #     with GH013 whenever the promoted range edits a workflow file
+          #     (sidekick-web run 36042681404). The App already holds
+          #     Workflows: read & write at the installation level.
           permission-contents: write
           permission-actions: write
+          permission-workflows: write
 
       - name: Checkout (full history for ancestor check)
         id: checkout
