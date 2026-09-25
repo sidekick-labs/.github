@@ -150,6 +150,7 @@ jobs:
           # Build the image from the exact SHA CI validated, not whatever is
           # currently at the tip of the default branch.
           ref: ${{ inputs.deploy_sha }}
+          persist-credentials: false
 
       - name: Install doctl
         # Use the org-standard action (same SHA-pinned version as the
