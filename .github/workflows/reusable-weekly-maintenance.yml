@@ -170,7 +170,15 @@ env:
 jobs:
   maintenance:
     name: Weekly Maintenance (${{ inputs.stack }})
-    runs-on: ubuntu-latest
+    # Homelab-routable via the CALLER's RUNNER_LABEL (repo scope only; see
+    # claude-code-review.yml). The `kmp` stack stays hosted: its Gradle build
+    # needs an Android SDK the jdb image does not ship (sre-brain#457). The other
+    # stacks' setup-* actions are proven on jdb: setup-ruby + bundler-cache in
+    # sidekick-web's push-lane Ruby Checks, setup-python in sidekick-inference,
+    # setup-node in sidekick-harness. jdb runners are single-use JIT containers
+    # (`podman run --rm`), so no checkout credentials outlive the job.
+    # Rollback: delete the caller's RUNNER_LABEL.
+    runs-on: ${{ inputs.stack != 'kmp' && vars.RUNNER_LABEL || 'ubuntu-latest' }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
 
     permissions:

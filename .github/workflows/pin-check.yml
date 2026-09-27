@@ -63,7 +63,8 @@ env:
 jobs:
   pin-check:
     name: Actions pinning gate
-    runs-on: ubuntu-latest
+    # Homelab-routable via the CALLER's RUNNER_LABEL (repo scope only; see claude-code-review.yml).
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     timeout-minutes: 10
     permissions:
       contents: read

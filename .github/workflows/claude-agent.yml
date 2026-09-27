@@ -12,6 +12,7 @@ env:
 jobs:
   claude:
     name: Claude Code Agent
+    # stays hosted (CI-021): mints a sidekick-release-bot App token from the org key.
     runs-on: ubuntu-latest
     timeout-minutes: 30
 

@@ -62,6 +62,7 @@ permissions:
 jobs:
   sweep:
     name: Sweep eligible PRs
+    # stays hosted (CI-021): mints a merge-capable App token (plus AUTOLAND_PAT).
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # Serialise sweeps here, not only in the caller: overlapping runs could both
