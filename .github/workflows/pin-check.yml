@@ -118,7 +118,12 @@ jobs:
         if: steps.prep.outputs.paths != ''
         env:
           ZIZMOR_VERSION: ${{ inputs.zizmor-version }}
-        run: pipx install "zizmor==${ZIZMOR_VERSION}"
+        # pipx drops the binary in ~/.local/bin. Hosted images already have it on
+        # PATH; jdb (self-hosted, single-use podman) does not, so add it — a no-op
+        # on hosted. Without this, every later `zizmor` call exits 127 on jdb.
+        run: |
+          pipx install "zizmor==${ZIZMOR_VERSION}"
+          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
 
       - name: zizmor — full audit (informational, non-blocking)
         if: steps.prep.outputs.paths != ''
@@ -187,7 +192,10 @@ jobs:
             "https://github.com/suzuki-shunsuke/pinact/releases/download/v${PINACT_VERSION}/pinact_linux_amd64.tar.gz"
           echo "${PINACT_SHA256}  pinact.tar.gz" | sha256sum -c -
           tar -xzf pinact.tar.gz pinact
-          install -m 0755 pinact /usr/local/bin/pinact
+          # Install under RUNNER_TEMP, not /usr/local/bin: jdb runs without root.
+          mkdir -p "${RUNNER_TEMP}/bin"
+          install -m 0755 pinact "${RUNNER_TEMP}/bin/pinact"
+          export PATH="${RUNNER_TEMP}/bin:${PATH}"
           pinact --version
 
           cat > /tmp/pinact.yaml <<EOF
