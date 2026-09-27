@@ -451,7 +451,7 @@ runs:
       # The step's own conclusion stays honest in the UI; the verify step
       # decides the JOB conclusion.
       continue-on-error: true
-      uses: anthropics/claude-code-action@4036a180cf690f49529f5d8c79c998855287f590 # v1.0.230 (bundled CLI validates OAuth after 2026-07-07 Anthropic auth change; old pins 401). Dependabot does NOT scan composites — keep in step with the pin the workflows use.
+      uses: anthropics/claude-code-action@756cc22e19660d20e8cc9496b4f242475a7f7790 # v1.0.235 (bundled CLI 2.1.283: claude-opus-5-5 needs CLI >=2.1.280; OAuth needs >=v1.0.168 since the 2026-07-07 auth change). Dependabot does NOT scan composites — keep in step with the pin the workflows use.
       with:
         claude_code_oauth_token: ${{ inputs.claude_code_oauth_token }}
         track_progress: true
@@ -542,7 +542,7 @@ runs:
       id: review_retry
       if: steps.review.outcome == 'failure'
       continue-on-error: true
-      uses: anthropics/claude-code-action@4036a180cf690f49529f5d8c79c998855287f590 # v1.0.230 (bundled CLI validates OAuth after 2026-07-07 Anthropic auth change; old pins 401). Dependabot does NOT scan composites — keep in step with the pin the workflows use.
+      uses: anthropics/claude-code-action@756cc22e19660d20e8cc9496b4f242475a7f7790 # v1.0.235 (bundled CLI 2.1.283: claude-opus-5-5 needs CLI >=2.1.280; OAuth needs >=v1.0.168 since the 2026-07-07 auth change). Dependabot does NOT scan composites — keep in step with the pin the workflows use.
       with:
         claude_code_oauth_token: ${{ inputs.claude_code_oauth_token }}
         track_progress: true
