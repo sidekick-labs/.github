@@ -611,4 +611,12 @@ jobs:
           if __name__ == "__main__":
               sys.exit(main())
           WFRUN_CHECK_EOF
-          python3 "${RUNNER_TEMP}/wfrun_check.py" .
+          # Hosted images ship PyYAML; jdb's single-use containers don't (and PEP
+          # 668 blocks a bare `pip install`), so use a throwaway venv only there.
+          PY=python3
+          if ! python3 -c 'import yaml' 2>/dev/null; then
+            python3 -m venv "${RUNNER_TEMP}/pyyaml-venv"
+            "${RUNNER_TEMP}/pyyaml-venv/bin/pip" install --quiet 'pyyaml==6.0.2'
+            PY="${RUNNER_TEMP}/pyyaml-venv/bin/python"
+          fi
+          "${PY}" "${RUNNER_TEMP}/wfrun_check.py" .
