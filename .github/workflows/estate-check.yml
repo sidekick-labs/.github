@@ -39,7 +39,8 @@ permissions:
 
 jobs:
   estate-check:
-    runs-on: ubuntu-latest
+    # Homelab-routable via the CALLER's RUNNER_LABEL (repo scope only; see claude-code-review.yml).
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

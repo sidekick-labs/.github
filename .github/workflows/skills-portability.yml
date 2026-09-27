@@ -50,7 +50,8 @@ permissions: {}
 jobs:
   scan:
     name: No laptop-only skill paths
-    runs-on: ubuntu-latest
+    # Homelab-routable via the CALLER's RUNNER_LABEL (repo scope only; see claude-code-review.yml).
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     permissions:
       contents: read
     steps:
