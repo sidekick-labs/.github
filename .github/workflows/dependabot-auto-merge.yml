@@ -49,8 +49,11 @@ name: Auto-lander (Dependabot + autonomous engine PRs)
 # MERGED) and the step fails if nothing was queued — `gh pr merge --auto` can
 # report success while queueing nothing, and a swallowed failure reads green.
 #
-# CI-021: this job mints a write-capable App token, so it is pinned to a
-# GitHub-hosted runner (`ubuntu-latest`), never a self-hosted label.
+# CI-021 (relaxed 2026-09-28 for jdb): this job mints a write-capable App token.
+# It may run on the jdb pool because every jdb job is a single-use
+# `podman run --rm` JIT container, so the token never outlives the job. It must
+# never run on a PERSISTENT self-hosted runner. `runs-on` follows the caller's
+# RUNNER_LABEL (product repos) or RUNNER_LABEL_BEAT (brains), else ubuntu-latest.
 
 on:
   workflow_call:
@@ -72,7 +75,7 @@ jobs:
           startsWith(github.event.pull_request.head.ref, 'sentry-autofix/')
         )
       )
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_LABEL || vars.RUNNER_LABEL_BEAT || 'ubuntu-latest' }}
     # Runaway-hang cap. Only reads metadata + calls the gh API (no checkout/build);
     # real runs finish in seconds. 5 replaces the implicit 360-min (6h) default and
     # protects every repo that calls this reusable.

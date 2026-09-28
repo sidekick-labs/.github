@@ -12,8 +12,12 @@ env:
 jobs:
   claude:
     name: Claude Code Agent
-    # stays hosted (CI-021): mints a sidekick-release-bot App token from the org key.
-    runs-on: ubuntu-latest
+    # Routed to the caller's jdb pool with a hosted fallback. `vars` resolves in the
+    # CALLER (product repos set RUNNER_LABEL, brains RUNNER_LABEL_BEAT); unset means
+    # ubuntu-latest. CI-021 was relaxed on 2026-09-28 for jdb only: every jdb job is
+    # a single-use `podman run --rm` JIT container, so the App token minted here
+    # dies with the job's container. CI-021 still bars persistent self-hosted runners.
+    runs-on: ${{ vars.RUNNER_LABEL || vars.RUNNER_LABEL_BEAT || 'ubuntu-latest' }}
     timeout-minutes: 30
 
     steps:
