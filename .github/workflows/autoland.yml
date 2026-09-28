@@ -62,8 +62,13 @@ permissions:
 jobs:
   sweep:
     name: Sweep eligible PRs
-    # stays hosted (CI-021): mints a merge-capable App token (plus AUTOLAND_PAT).
-    runs-on: ubuntu-latest
+    # Routed to the caller's jdb pool with a hosted fallback. `vars` resolves in the
+    # CALLER (product repos set RUNNER_LABEL, brains RUNNER_LABEL_BEAT); unset means
+    # ubuntu-latest. CI-021 was relaxed on 2026-09-28 for jdb only: every jdb job is
+    # a single-use `podman run --rm` JIT container, so the App token minted here
+    # (and AUTOLAND_PAT) dies with the job's container. CI-021 still bars
+    # persistent self-hosted runners.
+    runs-on: ${{ vars.RUNNER_LABEL || vars.RUNNER_LABEL_BEAT || 'ubuntu-latest' }}
     timeout-minutes: 10
     # Serialise sweeps here, not only in the caller: overlapping runs could both
     # see no open heartbeat issue and open two.
