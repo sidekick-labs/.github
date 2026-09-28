@@ -27,9 +27,8 @@ name: Skills Portability
 # `.agents/skills` tree. Repos on estate-sync keep their skills in
 # `.agents/skills` (`.claude/skills` becomes a symlink to it), so both trees are
 # in the default scope. It does not flag every `/Users/` or `~/` string in
-# `.claude/`, because several
-# are legitimate (a documented devcontainer `REMOTE_PATH` default, a table of
-# env-var defaults). The failure class here is specifically "an instruction to
+# `.claude/` or `.agents/`, because several are legitimate (a documented
+# devcontainer `REMOTE_PATH` default, a table of env-var defaults). The failure class here is specifically "an instruction to
 # resolve a skill from a filesystem path", which is never portable.
 #
 # Consume from a PR workflow:
@@ -117,18 +116,39 @@ jobs:
           # `.claude/settings.local.json` is per-developer machine state, not an
           # instruction the agent follows. Skip it (some repos commit one).
           hits=0
+          scanned=0
+          root="$(pwd -P)"
           for f in "${files[@]}"; do
             case "$f" in
               */settings.local.json|settings.local.json) continue ;;
             esac
             # `.claude/skills` is a tracked symlink to `.agents/skills` in estate-sync
-            # repos; its files are scanned under `.agents/`, so skip the link itself.
-            [ -d "$f" ] && continue
+            # repos. Skip a directory link only when it resolves inside this repo's
+            # own .claude/ or .agents/ tree, whose tracked files are already listed;
+            # a link anywhere else would hide files from the scan, so that is UNKNOWN.
+            if [ -d "$f" ]; then
+              target="$(realpath -- "$f")"
+              case "$target/" in
+                "$root"/.agents/*|"$root"/.claude/*|"$root"/*/.agents/*|"$root"/*/.claude/*) continue ;;
+              esac
+              echo "::error file=${f},title=Unscanned directory link::${f} links to ${target}, outside this repo's .claude/.agents trees. Result is UNKNOWN, not clean."
+              exit 1
+            fi
+            # grep exits 1 on no match (clean) and 2 on a read error (a broken link,
+            # a missing file): the latter is UNKNOWN, never clean.
+            out="$(grep -nE "$PATTERN" "$f")"
+            rc=$?
+            if [ "$rc" -ge 2 ]; then
+              echo "::error file=${f},title=Unreadable file::grep could not read ${f} (exit ${rc}). Result is UNKNOWN, not clean."
+              exit 1
+            fi
+            scanned=$((scanned + 1))
+            [ "$rc" -eq 0 ] || continue
             while IFS= read -r line; do
               hits=$((hits + 1))
               n="${line%%:*}"
               echo "::error file=${f},line=${n},title=Laptop-only skill path::${line#*:}"
-            done < <(grep -nE "$PATTERN" "$f" || true)
+            done <<< "$out"
           done
 
           if [ "$hits" -gt 0 ]; then
@@ -151,6 +171,6 @@ jobs:
           {
             echo "### Skills Portability: clean"
             echo
-            echo "Scanned \`${#files[@]}\` tracked \`.claude/\`/\`.agents/\` file(s); no skill referenced by filesystem path."
+            echo "Scanned \`${scanned}\` tracked \`.claude/\`/\`.agents/\` file(s); no skill referenced by filesystem path."
             echo "Matcher verified against a known-bad and a known-good fixture this run."
           } >> "$GITHUB_STEP_SUMMARY"

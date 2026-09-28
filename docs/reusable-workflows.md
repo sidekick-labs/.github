@@ -334,10 +334,13 @@ belongs to the plugin (`/babysit`), never to a path.
 **Scope is deliberately narrow:** only home-relative or absolute paths pointing
 into a `.claude/skills` or `.agents/skills` tree. Repos on estate-sync keep their
 skills in `.agents/skills` (`.claude/skills` is a symlink to it), so the default
-scope covers every tracked file under either tree. It does *not* flag every `~/` or `/Users/` string
-under `.claude/`, because some are legitimate (a documented devcontainer
-`REMOTE_PATH` default, a table of env-var defaults). `settings.local.json` is
-skipped — per-developer machine state, not an instruction.
+scope covers every tracked file under either tree. It does *not* flag every
+`~/` or `/Users/` string under `.claude/` or `.agents/`, because some are
+legitimate (a documented devcontainer `REMOTE_PATH` default, a table of env-var
+defaults). `settings.local.json` is skipped — per-developer machine state, not an
+instruction. A tracked directory link (the `.claude/skills` symlink) is skipped
+only when it resolves inside the repo's own `.claude/` or `.agents/` tree; a link
+elsewhere, or a file `grep` can't read, makes the result UNKNOWN (exit 1).
 
 **It carries its own controls.** Each run first asserts the matcher still flags
 the known-bad line and still passes the correct plugin wording; either control
