@@ -18,8 +18,8 @@ Available reusable workflows:
   isn't SHA-pinned (the actions-pinning self-healer's SENSOR). See
   [Actions pinning self-healer](#actions-pinning-self-healer).
 - **`skills-portability.yml`** — reusable PR gate that fails when a committed
-  `.claude/` file references a skill by filesystem path instead of invoking the
-  plugin skill. See [Skills portability](#skills-portability).
+  `.claude/` or `.agents/` file references a skill by filesystem path instead of
+  invoking the plugin skill. See [Skills portability](#skills-portability).
 - **`sentry-fix-trailer.yml`** — ADVISORY PR check that posts a sticky comment
   when a PR references a Sentry short-code (`SIDEKICK-WEB-1C`) but neither the
   PR description nor a commit carries `Fixes <code>`, so the Sentry issue would
@@ -319,8 +319,8 @@ no per-repo wiring needed for the actuator.
 
 ## Skills portability
 
-`skills-portability.yml` fails a PR when a committed `.claude/` file tells the
-agent to **read a skill off somebody's local disk**.
+`skills-portability.yml` fails a PR when a committed `.claude/` or `.agents/`
+file tells the agent to **read a skill off somebody's local disk**.
 
 The motivating bug: `/ship` in five of eight repos ended its babysit hand-off
 with
@@ -338,7 +338,9 @@ as the `sidekick-workflows` marketplace plugin, so a cross-repo skill reference
 belongs to the plugin (`/babysit`), never to a path.
 
 **Scope is deliberately narrow:** only home-relative or absolute paths pointing
-into a `.claude/skills` tree. It does *not* flag every `~/` or `/Users/` string
+into a `.claude/skills` or `.agents/skills` tree. Repos on estate-sync keep their
+skills in `.agents/skills` (`.claude/skills` is a symlink to it), so the default
+scope covers every tracked file under either tree. It does *not* flag every `~/` or `/Users/` string
 under `.claude/`, because some are legitimate (a documented devcontainer
 `REMOTE_PATH` default, a table of env-var defaults). `settings.local.json` is
 skipped — per-developer machine state, not an instruction.
