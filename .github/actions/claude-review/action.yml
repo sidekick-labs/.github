@@ -521,7 +521,7 @@ runs:
         # reasoning from `gh pr diff` alone. Deliberately read-only — no Edit
         # or mutating Bash — so the workflow stays fork-safe and resistant to
         # prompt injection from untrusted PR content.
-        claude_args: '--model ${{ inputs.claude_model }} --allowed-tools "Read,Glob,Grep,Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)" --effort medium'
+        claude_args: '--model ${{ inputs.claude_model }} --allowed-tools "Read,Glob,Grep,Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)" --effort high'
 
     # ---------------------------------------------------------------------
     # Retry once before giving up.
@@ -607,7 +607,7 @@ runs:
           - Do not add any verdict marker or HTML comment: the workflow derives
             and records the verdict itself from your labels.
 
-        claude_args: '--model ${{ inputs.claude_model }} --allowed-tools "Read,Glob,Grep,Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)" --effort medium'
+        claude_args: '--model ${{ inputs.claude_model }} --allowed-tools "Read,Glob,Grep,Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)" --effort high'
 
     # ---------------------------------------------------------------------
     # Maps the review outcome onto the JOB conclusion.
