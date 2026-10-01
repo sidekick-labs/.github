@@ -1,6 +1,13 @@
 # Weekly Actions Audit Automation — Plan
 
-Status: **deferred** (not started)
+> **Historical.** This plan was built. The audit's scripts (`audit/*.py`) and their
+> tests live in this repo. The scheduled workflow (`weekly-actions-audit.yml`) runs
+> from `sidekick-labs/sre-brain`, which checks this repo out at a pinned commit
+> (`DOTGITHUB_REF`); after changing a script here, bump that ref there. The
+> sre-brain CI fix sweep acts on the `ci-audit` issues the audit files. The rest
+> of this page is the original plan, kept for context.
+
+Status: **built** (originally deferred)
 Owner: jaryl
 Drafted: 2026-05-28 · Rewritten: 2026-06-02 to reconcile against the now-shipped weekly-maintenance machinery
 Tracking issue: [octo-brain#9](https://github.com/sidekick-labs/octo-brain/issues/9)
