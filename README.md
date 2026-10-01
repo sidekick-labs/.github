@@ -81,6 +81,17 @@ Promotes the main branch to production with release tagging and Sentry deploy no
 
 Creates a Sentry release with optional frontend source map upload.
 
+## Scheduled org sweeps live in sre-brain
+
+The four scheduled org-wide sweeps that used to run here (`pin-sweep.yml`,
+`dependabot-sweep.yml`, `pr-health-sweep.yml`, `weekly-actions-audit.yml`) now run
+from `sidekick-labs/sre-brain`.
+
+Their scripts stay here, with their tests: `.github/scripts/dependabot-sweep.sh`,
+`.github/scripts/pr-health-sweep.sh` and `audit/*.py`. The sre-brain workflows
+check this repo out at a pinned commit (`DOTGITHUB_REF`), so after changing one
+of these scripts, bump that ref in sre-brain to put the change live.
+
 ## DOCR Setup
 
 See [DOCR-SETUP.md](DOCR-SETUP.md) for the manual provisioning checklist.
