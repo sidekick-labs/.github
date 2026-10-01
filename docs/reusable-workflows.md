@@ -264,7 +264,8 @@ only sidekick-labs-specific wiring is the release-bot credential in the sweep.
   uses a **runtime-synthesized** `/tmp/pinact.yaml` derived from
   `github.repository_owner` — it deliberately does **not** rely on a committed
   `.pinact.yaml`, so it behaves identically on every repo.
-- **`pin-sweep.yml`** (ACTUATOR) — weekly (+ `workflow_dispatch`) self-healer.
+- **`pin-sweep.yml`** (ACTUATOR, runs in `sidekick-labs/sre-brain`) — weekly
+  (+ `workflow_dispatch`) self-healer.
   Enumerates non-archived org repos via the **release-bot App token**
   (`vars.SIDEKICK_RELEASE_BOT_APP_ID` + `secrets.SIDEKICK_RELEASE_BOT_PRIVATE_KEY`),
   runs `pinact run` against the same runtime-synthesized config, and opens a
