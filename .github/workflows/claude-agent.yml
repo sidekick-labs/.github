@@ -30,8 +30,12 @@ jobs:
       # claude-plugins repo, used ONLY to authenticate the marketplace clone below.
       # Callers pass `secrets: inherit` and the app private key is now scoped to these
       # code repos, so the mint works here. Scoped to just claude-plugins, contents:read.
+      # Optional: a caller that is NOT on the key's repo list (e.g. a public repo, kept off
+      # it by sidekick-labs/sre-brain#642) gets no token. The agent then runs without the org plugins
+      # instead of failing outright.
       - name: Mint plugin-marketplace read token
         id: plugin-token
+        continue-on-error: true
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ vars.SIDEKICK_RELEASE_BOT_APP_ID }}
@@ -44,7 +48,12 @@ jobs:
       # (it does NOT use github_token for that — verified via octo-brain#174 smoke test).
       # Configure the ambient git credential with the read token so the private clone
       # authenticates via url.insteadOf rewrite. Scoped to this job only.
+      - name: Warn when running without org plugins
+        if: steps.plugin-token.outcome == 'failure'
+        run: echo "::warning::Could not mint the plugin-marketplace token (caller not on SIDEKICK_RELEASE_BOT_PRIVATE_KEY, or the key/App ID is wrong). Running @claude without the sidekick-workflows plugin."
+
       - name: Configure git auth for private marketplace clone
+        if: steps.plugin-token.outputs.token != ''
         run: |
           git config --global url."https://x-access-token:${{ steps.plugin-token.outputs.token }}@github.com/".insteadOf "https://github.com/"
 
@@ -64,5 +73,6 @@ jobs:
           # #135 Phase 2). claude-code-action does NOT read /etc/claude-code/managed-settings.json
           # on ubuntu-latest (no MDM context) — that file is the laptop/MDM channel only; CI uses
           # these native inputs. This is the primary CI lane for org skills (/ship, /land, …).
-          plugin_marketplaces: https://github.com/sidekick-labs/claude-plugins.git
-          plugins: sidekick-workflows@sidekick-ops
+          # Empty when no marketplace token could be minted (see the mint step).
+          plugin_marketplaces: ${{ steps.plugin-token.outputs.token != '' && 'https://github.com/sidekick-labs/claude-plugins.git' || '' }}
+          plugins: ${{ steps.plugin-token.outputs.token != '' && 'sidekick-workflows@sidekick-ops' || '' }}
