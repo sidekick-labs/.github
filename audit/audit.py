@@ -39,6 +39,9 @@ CORE_REPOS = [
     "sidekick-admin-kit",
     "sidekick-companion-kit",
 ]
+# Standalone projects the audit must not scan or list in its public report.
+# sidekick-agentic-browser: a standalone prototype kept outside the product stack.
+EXCLUDED_REPOS = {"sidekick-agentic-browser"}
 
 
 def gh_api(path: str, paginate: bool = False) -> list | dict:
@@ -75,7 +78,7 @@ def discover_repos(scope: str) -> list[str]:
     repos = gh_api(f"/orgs/{ORG}/repos?per_page=100", paginate=True)
     if isinstance(repos, dict):
         repos = repos.get("items", [])
-    names = [r["name"] for r in repos if not r.get("archived")]
+    names = [r["name"] for r in repos if not r.get("archived") and r["name"] not in EXCLUDED_REPOS]
     return sorted(names)
 
 

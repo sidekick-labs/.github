@@ -80,6 +80,11 @@ jobs:
           # Non-archived repos the release-bot App is installed on.
           NAMES="$(gh api /installation/repositories --paginate \
             --jq '.repositories[] | select(.archived == false) | .name')"
+          # Standalone projects the bot sweeps must not touch or list in public
+          # output. sidekick-agentic-browser: a standalone prototype kept
+          # outside the product stack.
+          EXCLUDED_REPOS="sidekick-agentic-browser"
+          NAMES="$(printf '%s\n' "$NAMES" | grep -vFx -f <(printf '%s\n' $EXCLUDED_REPOS) || true)"
           if [ -n "${ONLY_REPO:-}" ]; then
             NAMES="$(printf '%s\n' "$NAMES" | grep -Fx "$ONLY_REPO" || true)"
             if [ -z "$NAMES" ]; then
