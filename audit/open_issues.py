@@ -45,7 +45,7 @@ entirely. `--no-close` disables the reconcile pass for manual/validation runs.
 
 Reads recommendations.json (the partition output): `judgment[]` (issues to open)
 and `scanned_repos[]` (the close-scope). Auth: GH_TOKEN env (read by `gh`) — the
-minted sidekick-release-bot token, which has issues:write org-wide. Diagnostics +
+minted sidekick-labs-bot token, which has issues:write org-wide. Diagnostics +
 created/skipped/closed counts to stderr.
 
 The workflow gates this to non-dry-run, exactly as the old Linear step was gated.
@@ -60,7 +60,7 @@ import subprocess
 import sys
 
 # Central tracker = sre-brain (infra/CI-health). Per-repo routing is the
-# alternative: file in the audited repo (sidekick-release-bot has org-wide
+# alternative: file in the audited repo (sidekick-labs-bot has org-wide
 # issues:write) — switchable via the AUDIT_TRACKER_REPO env or this default.
 TRACKER_REPO = os.environ.get("AUDIT_TRACKER_REPO", "sidekick-labs/sre-brain")
 LABEL = "ci-audit"

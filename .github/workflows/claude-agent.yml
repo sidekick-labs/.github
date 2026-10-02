@@ -26,7 +26,7 @@ jobs:
         with:
           fetch-depth: 1
 
-      # Mint a read-only sidekick-release-bot token that can read the PRIVATE
+      # Mint a read-only sidekick-labs-bot token that can read the PRIVATE
       # claude-plugins repo, used ONLY to authenticate the marketplace clone below.
       # Callers pass `secrets: inherit` and the app private key is now scoped to these
       # code repos, so the mint works here. Scoped to just claude-plugins, contents:read.
