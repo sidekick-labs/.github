@@ -11,15 +11,17 @@ name: Reusable — Promote to Production
 # explicit by design.
 #
 # The FF-push is authenticated by a GitHub App installation token
-# (`sidekick-release-bot`), NOT GITHUB_TOKEN — github-actions[bot] has no
-# stable identity for the production-ruleset bypass list, so we use an App that
-# IS on the bypass list. Extracted from sidekick-inference's inline
+# (`sidekick-labs-bot`, App id 3877791), NOT GITHUB_TOKEN — github-actions[bot]
+# has no stable identity for the production-ruleset bypass list, so we use an
+# App that IS on the bypass list. Extracted from sidekick-inference's inline
 # promote-production.yml (originally from sidekick-web PR #1023).
 #
 # CALLER SETUP (passed in as inputs/secrets):
-#   - vars.RELEASE_BOT_CLIENT_ID      → input  release_bot_client_id
-#   - secrets.RELEASE_BOT_PRIVATE_KEY → secret RELEASE_BOT_PRIVATE_KEY
-#   - vars.DO_PRODUCTION_APP_ID       → input  do_production_app_id
+#   - vars.SIDEKICK_RELEASE_BOT_CLIENT_ID      → input  release_bot_client_id
+#   - secrets.SIDEKICK_RELEASE_BOT_PRIVATE_KEY → secret RELEASE_BOT_PRIVATE_KEY
+#   - vars.DO_PRODUCTION_APP_ID                → input  do_production_app_id
+#   The two release-bot values are ORG-level, so a key rotation updates one
+#   secret. Don't add per-repo copies (sidekick-labs/sre-brain#642).
 #   Plus: the App installed on the caller repo + on the `production` ruleset
 #   bypass list, and the caller's production deploy workflow filename.
 #
@@ -56,7 +58,7 @@ on:
         required: true
         type: string
       release_bot_client_id:
-        description: "sidekick-release-bot GitHub App Client ID (caller's vars.RELEASE_BOT_CLIENT_ID). Public, not a secret."
+        description: "sidekick-labs-bot GitHub App Client ID (caller's org-level vars.SIDEKICK_RELEASE_BOT_CLIENT_ID). Public, not a secret."
         required: true
         type: string
       target_ref:
@@ -150,7 +152,7 @@ jobs:
       - name: Mint GitHub App installation token
         # The fast-forward push to `production` is rejected by branch protection
         # unless the actor is on the ruleset's bypass list. The
-        # `sidekick-release-bot` GitHub App IS on that list, so we mint a
+        # `sidekick-labs-bot` GitHub App IS on that list, so we mint a
         # short-lived installation token and use it for checkout + FF-push.
         #
         # Note: v3 of this action uses `client-id` (the App Client ID from
