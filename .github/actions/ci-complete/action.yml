@@ -1,0 +1,83 @@
+# The body of a repo's `CI Complete` aggregator: fail unless every upstream job
+# succeeded or was skipped. Consume it from ONE hosted job that is the repo's
+# only required CI context:
+#
+#   ci_complete:
+#     name: CI Complete
+#     # Hosted on purpose (GHA-014 reason 1): a gate never depends on the
+#     # hardware it gates. A jdb runner that never starts leaves this queued,
+#     # and a required check that never reports blocks with nothing red.
+#     runs-on: ubuntu-latest
+#     timeout-minutes: 5
+#     # always(), NOT !cancelled(): on a cancelled run !cancelled() SKIPS this
+#     # job, and GitHub counts a skipped required check as passing.
+#     if: always()
+#     needs: [lint, test, build]
+#     permissions: {}
+#     steps:
+#       - uses: sidekick-labs/.github/.github/actions/ci-complete@<sha> # main
+#         with:
+#           results: ${{ toJSON(needs) }}
+#
+# WHY A SHARED ACTION
+#   Every hand-written aggregator in the estate had the same three bugs to
+#   avoid: `contains(needs.*.result, 'failure')` is FALSE for a cancelled job
+#   (what an offline self-hosted runner produces); an enumerated list drifts
+#   when a job is added to `needs:` but not to the list; and `!cancelled()`
+#   lets a cancelled run pass. This asserts over the WHOLE `needs` context,
+#   so a job added to `needs:` is covered without a second edit.
+#
+# WHAT PASSES
+#   `success` and `skipped` only. Skipped is legitimate (path filters,
+#   event-gated jobs). `failure`, `cancelled` and anything else fail, each with
+#   its own annotation. An empty or non-object `results` also fails: a gate over
+#   nothing would pass vacuously, which is a misconfiguration, never a green.
+#
+# Layer 2 of rarebit-one/jumpdrive-broker ADR 0003 (required-check resilience).
+name: CI Complete
+description: >-
+  Fail unless every job in `needs` succeeded or was skipped. Pass the
+  aggregator job's toJSON(needs) as `results` from a hosted, `if: always()` job.
+inputs:
+  results:
+    description: 'The aggregator job''s needs context, as toJSON(needs).'
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Assert every upstream job succeeded or was skipped
+      shell: bash
+      env:
+        RESULTS: ${{ inputs.results }}
+      run: |
+        set -euo pipefail
+        if ! printf '%s' "$RESULTS" | jq -e 'type == "object"' >/dev/null 2>&1; then
+          echo "::error title=CI Complete::results is not a JSON object; pass toJSON(needs) from the aggregator job"
+          exit 1
+        fi
+        count="$(printf '%s' "$RESULTS" | jq 'length')"
+        if [ "$count" -eq 0 ]; then
+          echo "::error title=CI Complete::no upstream jobs in results; a gate over nothing would pass vacuously"
+          exit 1
+        fi
+
+        {
+          echo "### CI Complete"
+          echo
+          echo "| Job | Result |"
+          echo "|---|---|"
+          printf '%s' "$RESULTS" | jq -r 'to_entries[] | "| `\(.key)` | \(.value.result // "none") |"'
+        } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+        bad="$(printf '%s' "$RESULTS" | jq -r '
+          to_entries[]
+          | select(.value.result != "success" and .value.result != "skipped")
+          | "\(.key)=\(.value.result // "none")"')"
+        if [ -n "$bad" ]; then
+          while IFS= read -r line; do
+            echo "::error title=CI Complete::upstream job ${line%%=*} => ${line#*=}"
+          done <<< "$bad"
+          echo "CI Complete: $(printf '%s\n' "$bad" | wc -l) of $count upstream job(s) did not succeed."
+          exit 1
+        fi
+        echo "All $count upstream job(s) succeeded or were skipped."
