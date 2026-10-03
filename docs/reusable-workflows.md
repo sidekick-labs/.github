@@ -18,8 +18,8 @@ Available reusable workflows:
   isn't SHA-pinned (the actions-pinning self-healer's SENSOR). See
   [Actions pinning self-healer](#actions-pinning-self-healer).
 - **`skills-portability.yml`** — reusable PR gate that fails when a committed
-  `.claude/` file references a skill by filesystem path instead of invoking the
-  plugin skill. See [Skills portability](#skills-portability).
+  `.claude/` or `.agents/` file references a skill by filesystem path instead of
+  invoking the plugin skill. See [Skills portability](#skills-portability).
 
 > **Removed:** `reusable-sentry-autofix.yml` — the Sentry autofix moved to the
 > one-workflow-per-org model: `sidekick-labs/sre-brain`'s `sentry-sweep.yml` +
@@ -314,8 +314,8 @@ no per-repo wiring needed for the actuator.
 
 ## Skills portability
 
-`skills-portability.yml` fails a PR when a committed `.claude/` file tells the
-agent to **read a skill off somebody's local disk**.
+`skills-portability.yml` fails a PR when a committed `.claude/` or `.agents/`
+file tells the agent to **read a skill off somebody's local disk**.
 
 The motivating bug: `/ship` in five of eight repos ended its babysit hand-off
 with
@@ -333,10 +333,15 @@ as the `sidekick-workflows` marketplace plugin, so a cross-repo skill reference
 belongs to the plugin (`/babysit`), never to a path.
 
 **Scope is deliberately narrow:** only home-relative or absolute paths pointing
-into a `.claude/skills` tree. It does *not* flag every `~/` or `/Users/` string
-under `.claude/`, because some are legitimate (a documented devcontainer
-`REMOTE_PATH` default, a table of env-var defaults). `settings.local.json` is
-skipped — per-developer machine state, not an instruction.
+into a `.claude/skills` or `.agents/skills` tree. Repos on estate-sync keep their
+skills in `.agents/skills` (`.claude/skills` is a symlink to it), so the default
+scope covers every tracked file under either tree. It does *not* flag every
+`~/` or `/Users/` string under `.claude/` or `.agents/`, because some are
+legitimate (a documented devcontainer `REMOTE_PATH` default, a table of env-var
+defaults). `settings.local.json` is skipped — per-developer machine state, not an
+instruction. A tracked directory link (the `.claude/skills` symlink) is skipped
+only when it resolves inside the repo's own `.claude/` or `.agents/` tree; a link
+elsewhere, or a file `grep` can't read, makes the result UNKNOWN (exit 1).
 
 **It carries its own controls.** Each run first asserts the matcher still flags
 the known-bad line and still passes the correct plugin wording; either control
