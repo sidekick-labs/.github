@@ -329,3 +329,5 @@ preserving every existing check — and confirm first that the repo's caller hon
 all three obligations above. The 17 callers outside the four target repos still
 carry `paths-ignore`; that is harmless while the context is not required there, and
 must be fixed before it is.
+
+<!-- shim smoke: verifies the review composite resolves via the thin caller (2026-09-22) -->
