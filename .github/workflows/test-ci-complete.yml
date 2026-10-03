@@ -1,0 +1,112 @@
+name: Test ci-complete
+
+# Exercises .github/actions/ci-complete. A gate's failure mode is a confident
+# pass, so every "must fail" case sits beside a "must pass" control: an action
+# that always exited 0 (or always 1) cannot get this workflow green.
+#
+# Hosted only: this repo is public, and the jdb fleet refuses public repos.
+on:
+  pull_request:
+    paths:
+      - '.github/actions/ci-complete/**'
+      - '.github/workflows/test-ci-complete.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/actions/ci-complete/**'
+      - '.github/workflows/test-ci-complete.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cases:
+    name: ci-complete (${{ matrix.case }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - case: all success
+            results: '{"lint":{"result":"success","outputs":{}},"test":{"result":"success","outputs":{}}}'
+            want: success
+          - case: success and skipped
+            results: '{"lint":{"result":"success","outputs":{}},"e2e":{"result":"skipped","outputs":{}}}'
+            want: success
+          - case: one failure
+            results: '{"lint":{"result":"success","outputs":{}},"test":{"result":"failure","outputs":{}}}'
+            want: failure
+          - case: one cancelled
+            results: '{"lint":{"result":"success","outputs":{}},"test":{"result":"cancelled","outputs":{}}}'
+            want: failure
+          - case: empty needs
+            results: '{}'
+            want: failure
+          - case: not an object
+            results: '["success"]'
+            want: failure
+          - case: missing result
+            results: '{"lint":{"outputs":{}}}'
+            want: failure
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run ci-complete
+        id: gate
+        continue-on-error: true
+        uses: ./.github/actions/ci-complete
+        with:
+          results: ${{ matrix.results }}
+
+      - name: Assert the outcome
+        env:
+          GOT: ${{ steps.gate.outcome }}
+          WANT: ${{ matrix.want }}
+        run: |
+          if [ "$GOT" != "$WANT" ]; then
+            echo "::error::ci-complete returned $GOT, want $WANT"
+            exit 1
+          fi
+          echo "ci-complete returned $GOT as expected."
+
+  # The real shape: an always() aggregator over a job that succeeded and one
+  # that was skipped, fed by the live needs context rather than a fixture.
+  upstream_ok:
+    name: upstream (success)
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - run: echo ok
+
+  upstream_skipped:
+    name: upstream (skipped)
+    # Never true on this repo's triggers, so the job reports "skipped".
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - run: echo never
+
+  live:
+    name: ci-complete (live needs)
+    if: always()
+    needs: [upstream_ok, upstream_skipped]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/ci-complete
+        with:
+          results: ${{ toJSON(needs) }}

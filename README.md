@@ -81,6 +81,15 @@ Promotes the main branch to production with release tagging and Sentry deploy no
 
 Creates a Sentry release with optional frontend source map upload.
 
+## Composite actions
+
+Located under `.github/actions/`. Consumed via
+`uses: sidekick-labs/.github/.github/actions/<name>@<sha> # main`.
+
+| Action | Purpose |
+|--------|---------|
+| `ci-complete` | The body of a repo's `CI Complete` aggregator: fails unless every job in `needs` succeeded or was skipped, with one annotation per failing job. Use it from a hosted, `if: always()` job with `results: ${{ toJSON(needs) }}`, pinned by SHA. Tested by `test-ci-complete.yml`. Layer 2 of rarebit-one/jumpdrive-broker ADR 0003. |
+
 ## Scheduled org sweeps live in sre-brain
 
 The four scheduled org-wide sweeps that used to run here (`pin-sweep.yml`,
