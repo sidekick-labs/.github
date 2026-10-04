@@ -20,6 +20,11 @@ Available reusable workflows:
 - **`skills-portability.yml`** — reusable PR gate that fails when a committed
   `.claude/` file references a skill by filesystem path instead of invoking the
   plugin skill. See [Skills portability](#skills-portability).
+- **`sentry-fix-trailer.yml`** — ADVISORY PR check that posts a sticky comment
+  when a PR references a Sentry short-code (`SIDEKICK-WEB-1C`) but neither the
+  PR description nor a commit carries `Fixes <code>`, so the Sentry issue would
+  not auto-resolve.
+  See [Sentry fix-trailer guard](#sentry-fix-trailer-guard).
 
 > **Removed:** `reusable-sentry-autofix.yml` — the Sentry autofix moved to the
 > one-workflow-per-org model: `sidekick-labs/sre-brain`'s `sentry-sweep.yml` +
@@ -361,3 +366,54 @@ jobs:
     # once a v3 or later cuts.
     uses: sidekick-labs/.github/.github/workflows/skills-portability.yml@main
 ```
+
+## Sentry fix-trailer guard
+
+`sentry-fix-trailer.yml` catches a fix that will silently fail to resolve its
+Sentry issue. Sentry resolves an issue when a merged commit message, or the PR
+description, carries `Fixes <SHORT-CODE>` (also Resolves/Closes). A PR that only
+closes its tracker issue leaves the Sentry issue `unresolved`. The guard reads
+mentions and `Fixes` lines from the PR description (re-read through the API, so
+a re-run sees the current body) and from the commits, and upserts one sticky
+comment (marker `<!-- sentry-fix-trailer-guard -->`) listing the gap. It deletes
+the comment once every mentioned code is covered.
+
+**The PR description is where the line belongs.** The Sentry repos squash-merge
+with `squash_merge_commit_message=PR_BODY`, so the commit on main is the PR
+title plus description, and branch commit messages are discarded. The harness
+original (sidekick-harness#847) counted only commit trailers and said the opposite; that was
+fixed when the guard moved here (octo-brain#558). Commit messages still count,
+for a rebase merge.
+
+It is **advisory and never blocks**: a PR may legitimately mention an issue it
+does not fix. Do not make it a required check. Every comment write is wrapped so
+a read-only fork token degrades to a `::warning::` instead of a red run.
+
+The Sentry project prefix list lives only in this workflow. Keep it in sync with
+sre-brain `sources.yaml sentry.projects`. Logic tests:
+`tests/sentry-fix-trailer-logic.py` (run by `test-sentry-fix-trailer.yml`).
+Born inline as sidekick-harness#847, moved here for octo-brain#558.
+
+### Per-repo adoption
+
+```yaml
+# .github/workflows/sentry-fix-trailer.yml in the consumer repo
+name: Sentry fix-trailer check
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+permissions: {}
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  sentry-fix-trailer:
+    name: Sentry fix-trailer check
+    permissions:
+      contents: read
+      pull-requests: write
+    uses: sidekick-labs/.github/.github/workflows/sentry-fix-trailer.yml@main
+```
+
+The check reports as `Sentry fix-trailer check / Sentry fix-trailer check`.
+Its runner follows the caller's `vars.RUNNER_LABEL`, else `ubuntu-latest`.
