@@ -1,0 +1,254 @@
+name: Sentry fix-trailer check
+
+# Reusable (workflow_call) home of the guard, so every repo that ships to a
+# Sentry project runs the SAME prefix list and the SAME comment logic. It was
+# born inline as sidekick-harness#847 and moved here for octo-brain#558, when
+# web, inference and companion-kit adopted it too.
+#
+# Catches a fix that will silently fail to resolve its Sentry issue.
+#
+# Sentry auto-resolves an issue when a merged commit message, or the PR
+# description, carries `Fixes <SHORT-CODE>` (also Resolves/Closes). A PR that fixes a Sentry issue but only closes the
+# tracker issue (`Fixes sre-brain#NNN`) leaves the Sentry issue `unresolved` — so
+# the next sentry-sweep re-files a brand-new tracker for a bug that is already
+# dead. This has bitten the estate repeatedly (SIDEKICK-WEB-1C was fixed
+# 2026-06-26 and re-surfaced 2026-07-05; four SIDEKICK-HARNESS issues were fixed
+# on 2026-07-30 and had to be resolved by hand afterwards).
+#
+# WHERE THE TRAILER MUST LIVE: THE PR DESCRIPTION. The Sentry repos squash-merge
+# with `squash_merge_commit_message=PR_BODY` (merge commits are disabled), so the
+# commit that lands on main is the PR title plus the PR description, and branch
+# commit messages are DISCARDED. Sentry also resolves straight from a PR
+# description (`set_resolved_in_pull_request`, e.g. HARNESS-21/22/2R, WEB-2E). A
+# `Fixes` line only in a branch commit therefore never reaches main. The harness
+# original (sidekick-harness#847) had this backwards: it counted only commit trailers and told
+# people to move the line out of the description (octo-brain#558). Commit
+# messages still count too, for a rebase merge or a repo that merge-commits.
+#
+# ADVISORY, NOT BLOCKING — deliberately. Referencing a short-code is not the same
+# as fixing it: incident write-ups, analysis PRs and comments legitimately mention
+# issues they do not resolve, and failing those would train people to ignore the
+# check.
+#
+# But it posts a VISIBLE STICKY COMMENT rather than only a `::warning::`
+# annotation. That is the lesson from the review-lane work (sre-brain#284/#286): a
+# warning on an otherwise-green run is read by nobody, so an advisory signal has to
+# land somewhere a human actually looks.
+#
+# CALLER CONTRACT. Copy this into `.github/workflows/sentry-fix-trailer.yml` in
+# the consumer repo:
+#
+#   name: Sentry fix-trailer check
+#   on:
+#     pull_request:
+#       types: [opened, synchronize, reopened, edited]  # `edited`: a body change
+#                                                      # can add or drop a mention
+#   permissions: {}
+#   concurrency:
+#     group: ${{ github.workflow }}-${{ github.ref }}
+#     cancel-in-progress: true
+#   jobs:
+#     sentry-fix-trailer:
+#       name: Sentry fix-trailer check
+#       permissions:
+#         contents: read
+#         pull-requests: write
+#       uses: sidekick-labs/.github/.github/workflows/sentry-fix-trailer.yml@main
+#
+# * `@main` matches the other PR gates here (pin-check, skills-portability): a
+#   first-party ref-pin, which pin-check's zizmor policy allows.
+# * Concurrency lives in the CALLER only. A called workflow sees the caller's
+#   `github.workflow`, so repeating the same group here would make the callee
+#   collide with its own caller.
+# * The check reports as `Sentry fix-trailer check / Sentry fix-trailer check`
+#   (caller job name / this job's name). It is advisory and must never be made a
+#   required check: it cannot fail on a finding, only on its own breakage.
+# * `runs-on` reads the CALLER's `vars.RUNNER_LABEL` (a called workflow sees the
+#   caller's `vars`), matching pin-check. The job needs only the GitHub API.
+#
+# Tested by tests/sentry-fix-trailer-logic.py (test-sentry-fix-trailer.yml),
+# which runs the inline script below against a mocked GitHub API.
+
+on:
+  workflow_call:
+
+permissions: {}
+
+jobs:
+  check:
+    name: Sentry fix-trailer check
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    permissions:
+      contents: read # read the PR body and list its commits
+      pull-requests: write # upsert/delete the sticky guard comment
+    steps:
+      - name: Look for referenced short-codes without a Fixes trailer
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            // Sentry project prefixes for this org. An explicit list, NOT a loose
+            // `SIDEKICK-\w+` pattern: without it, `sidekick-harness#843` (a repo
+            // reference) and bare project names read as short-codes and the check
+            // cries wolf. Keep in sync with sre-brain `sources.yaml sentry.projects`.
+            // This is the org's ONE copy of the list: callers do not pass their own.
+            const PREFIXES = [
+              'SIDEKICK-WEB',
+              'SIDEKICK-HARNESS',
+              'SIDEKICK-INFERENCE',
+              'SIDEKICK-RDP-CLIENT',
+              'SIDEKICK-ADMIN-KIT',
+              'SIDEKICK-COMPANION-KIT',
+            ];
+            const alt = PREFIXES.join('|');
+            // Short-code suffixes are short base32-ish tokens: -22, -1C, -1Y, -M.
+            const MENTION = new RegExp(`\\b(?:${alt})-[A-Z0-9]{1,5}\\b`, 'g');
+            // Sentry accepts fixes/resolves/closes. Case-insensitive: a lowercase
+            // trailer still resolves the issue, so it must still satisfy us.
+            const TRAILER = new RegExp(`\\b(?:fixes|resolves|closes)\\s+((?:${alt})-[A-Z0-9]{1,5})\\b`, 'gi');
+
+            const pr = context.payload.pull_request;
+            // Only meaningful on a pull_request event. A caller wired to any other
+            // trigger gets a no-op rather than a TypeError (which would go red).
+            if (!pr) {
+              core.info('Not a pull_request event; nothing to check.');
+              return;
+            }
+            // Re-read the body from the API rather than trusting the event payload: a
+            // re-run replays the ORIGINAL payload, so after an `edited` that added the
+            // trailer, a re-run of an older event would still see the old body. Fall
+            // back to the payload body if the read fails, so this never goes red.
+            let prBody = pr.body || '';
+            try {
+              const { data } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr.number,
+              });
+              prBody = data.body || '';
+            } catch (err) {
+              core.warning(`Could not re-read the PR body, using the event payload: ${err.message}`);
+            }
+            const commits = await github.paginate(github.rest.pulls.listCommits, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+              per_page: 100,
+            });
+            const commitText = commits.map((c) => c.commit.message).join('\n');
+
+            // Mentions AND trailers are read from the PR body and the commits. The PR
+            // body is the one that matters for a squash merge (it becomes the commit
+            // on main, and Sentry resolves from it directly); commit messages count
+            // for a rebase merge or a merge-commit repo.
+            const allText = `${prBody}\n${commitText}`;
+            const mentioned = new Set([...allText.matchAll(MENTION)].map((m) => m[0]));
+            const trailered = new Set([...allText.matchAll(TRAILER)].map((m) => m[1].toUpperCase()));
+            const missing = [...mentioned].filter((c) => !trailered.has(c)).sort();
+
+            const MARKER = '<!-- sentry-fix-trailer-guard -->';
+            const existing = (
+              await github.paginate(github.rest.issues.listComments, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                per_page: 100,
+              })
+            ).find((c) => (c.body || '').includes(MARKER));
+
+            // This check must NEVER go red — that is its whole design premise, and a
+            // red advisory check is worse than none because people stop reading it.
+            // So every write is wrapped: on a fork-originated `pull_request`,
+            // GITHUB_TOKEN is forced READ-ONLY regardless of the `permissions:` block
+            // above, and an uncaught 403 from createComment/updateComment/
+            // deleteComment would fail the step and invert the entire intent.
+            //
+            // Falling back to `core.warning` keeps the finding visible somewhere
+            // rather than swallowing it. That is strictly worse than the comment (a
+            // warning on a green run is read by nobody — the very lesson this
+            // workflow is built on), but "less visible" beats "the check is red and
+            // now distrusted". Making the guarantee structural rather than relying on
+            // this repo never seeing a fork PR.
+            //
+            // Deliberately NOT `continue-on-error: true` on the step. That would make
+            // the job green on ANY failure, including our own — a bad regex, a broken
+            // API call, a typo — which is precisely the green-on-model-error trap
+            // sre-brain#284/#286 exists to describe: a check that cannot fail is a
+            // check nobody can tell is dead. The narrow catch keeps the EXPECTED
+            // environmental failure quiet while leaving an unexpected one red.
+            async function tryWrite(label, fn) {
+              try {
+                await fn();
+                return true;
+              } catch (err) {
+                core.warning(
+                  `Could not ${label} (likely a read-only token on a fork PR): ${err.message}`,
+                );
+                return false;
+              }
+            }
+
+            if (missing.length === 0) {
+              core.info(
+                mentioned.size === 0
+                  ? 'No Sentry short-codes referenced.'
+                  : `All referenced short-codes carry a Fixes trailer: ${[...mentioned].join(', ')}`,
+              );
+              // Remove a stale prompt so a PR that has since been fixed up does not
+              // keep showing a resolved warning.
+              if (existing) {
+                await tryWrite('delete the stale guard comment', () =>
+                  github.rest.issues.deleteComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    comment_id: existing.id,
+                  }),
+                );
+              }
+              return;
+            }
+
+            const list = missing.map((c) => `- \`${c}\``).join('\n');
+            const body = [
+              MARKER,
+              '### Sentry issue may not auto-resolve',
+              '',
+              'These Sentry short-codes are referenced by this PR, but neither the **PR description** nor any commit message carries a `Fixes` line for them:',
+              '',
+              list,
+              '',
+              '**If this PR fixes them**, add a line like this to the **PR description**:',
+              '',
+              '```',
+              `Fixes ${missing[0]}`,
+              '```',
+              '',
+              'This repo squash-merges with the PR description as the commit message, so the description is what lands on main; a line that exists only in a branch commit is discarded at merge. Sentry also resolves directly from the PR description.',
+              '',
+              'Without it the Sentry issue stays `unresolved` even after this merges, and the next sentry-sweep re-files a brand-new tracker issue for a bug that is already dead.',
+              '',
+              '**If this PR only references them** — an incident write-up, an analysis, a partial fix — ignore this. The check is advisory and never blocks; it cannot tell discussing an issue from fixing one.',
+              '',
+              'If the work is already merged elsewhere, resolve at the source instead: `sentry-cli issues resolve -p <project> --id <numeric-id>`.',
+            ].join('\n');
+
+            if (existing) {
+              await tryWrite('update the guard comment', () =>
+                github.rest.issues.updateComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: existing.id,
+                  body,
+                }),
+              );
+            } else {
+              await tryWrite('post the guard comment', () =>
+                github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: pr.number,
+                  body,
+                }),
+              );
+            }
+            core.warning(`Referenced without a Fixes trailer: ${missing.join(', ')}`);

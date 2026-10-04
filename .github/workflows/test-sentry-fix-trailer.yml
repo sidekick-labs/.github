@@ -1,0 +1,41 @@
+name: Test sentry-fix-trailer logic
+
+# Regression gate for the reusable Sentry fix-trailer guard. Four product repos
+# call it at `@main` and it is advisory (green by design), so a broken regex or
+# comment upsert would ship everywhere with no red run anywhere. The test runs
+# the workflow's inline github-script against a mocked GitHub API and asserts on
+# the comment writes (including the PR-body-is-primary premise). Network-free. Mirrors the path-filtered pattern of
+# test-review-gate.yml.
+#
+# Hosted only: this repo is public, and the jdb fleet refuses public repos.
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/sentry-fix-trailer.yml'
+      - 'tests/sentry-fix-trailer-logic.py'
+      - '.github/workflows/test-sentry-fix-trailer.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/sentry-fix-trailer.yml'
+      - 'tests/sentry-fix-trailer-logic.py'
+      - '.github/workflows/test-sentry-fix-trailer.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sentry-fix-trailer-logic:
+    name: sentry-fix-trailer logic
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run sentry-fix-trailer logic tests
+        run: python3 tests/sentry-fix-trailer-logic.py
