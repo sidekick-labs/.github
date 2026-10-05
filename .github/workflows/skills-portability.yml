@@ -66,8 +66,10 @@ jobs:
         env:
           INPUT_PATHS: ${{ inputs.paths }}
         run: |
-          # No `-e`: grep's exit 1 on "no match" is the normal path here and is
-          # handled explicitly below. Every real failure calls `exit 1` itself.
+          # Actions runs this step as `bash -e` (set -e is ON despite the line
+          # below). grep's exit 1 on "no match" is the normal path, so every grep
+          # here sits in an `if` or behind `|| rc=$?`. Every real failure calls
+          # `exit 1` itself.
           set -uo pipefail
 
           # A home-relative or absolute path reaching into a `.claude/skills` or
@@ -135,9 +137,11 @@ jobs:
               exit 1
             fi
             # grep exits 1 on no match (clean) and 2 on a read error (a broken link,
-            # a missing file): the latter is UNKNOWN, never clean.
-            out="$(grep -nE "$PATTERN" "$f")"
-            rc=$?
+            # a missing file): the latter is UNKNOWN, never clean. Actions runs
+            # this step as `bash -e`, so capture the status with `|| rc=$?`: a bare
+            # `out="$(grep ...)"` aborts the step on the first clean file.
+            rc=0
+            out="$(grep -nE "$PATTERN" "$f")" || rc=$?
             if [ "$rc" -ge 2 ]; then
               echo "::error file=${f},title=Unreadable file::grep could not read ${f} (exit ${rc}). Result is UNKNOWN, not clean."
               exit 1
