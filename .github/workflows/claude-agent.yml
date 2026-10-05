@@ -58,7 +58,7 @@ jobs:
           git config --global url."https://x-access-token:${{ steps.plugin-token.outputs.token }}@github.com/".insteadOf "https://github.com/"
 
       - name: Run Claude Code
-        uses: anthropics/claude-code-action@8ce9314fa9a404564fa7e954cd84f25bcba2b829 # v1.0.236 (bundled CLI 2.1.284, the first to name claude-sonnet-5-5; claude-opus-5-5 needs CLI >=2.1.280; OAuth needs >=v1.0.168 since the 2026-07-07 auth change)
+        uses: anthropics/claude-code-action@ed670b4cf9de2a5a570d130d2f6197b9e543cd64 # v1.0.236 (bundled CLI 2.1.284, the first to name claude-sonnet-5-5; claude-opus-5-5 needs CLI >=2.1.280; OAuth needs >=v1.0.168 since the 2026-07-07 auth change)
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           # NB: github_token is deliberately NOT overridden — @claude's identity/writes stay
