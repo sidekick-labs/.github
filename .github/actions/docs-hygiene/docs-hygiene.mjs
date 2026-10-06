@@ -77,7 +77,7 @@
 // Usage
 // -----
 //   node docs-hygiene.mjs [--root DIR] [--warn-only] [--json]
-//   node docs-hygiene.mjs --drift [--root DIR] [--json]
+//   node docs-hygiene.mjs --drift [--root DIR] [--json] [--json-out FILE]
 //   node docs-hygiene.mjs --self-test [--fixtures DIR]
 //   node docs-hygiene.mjs --materialise FIXTURE --out DIR   (test helper)
 
@@ -966,6 +966,7 @@ export function runDrift(root) {
         ...finding('drift', 'covers-drift', file, 1, `${commits.length} commit(s) touched its covers since verified ${d.verified}`),
         commits: commits.length,
         verified: d.verified,
+        covers: d.covers,
         latest: commits[0],
       });
     }
@@ -1031,7 +1032,10 @@ function stepSummary(result, { mode, blocking }) {
 }
 
 function emit(result, opts) {
-  const { json, mode, blocking } = opts;
+  const { json, jsonOut, mode, blocking } = opts;
+  // --json-out keeps the human log AND hands machine output to a later step
+  // (drift-issue.mjs reads it to file the brain issue).
+  if (jsonOut) fs.writeFileSync(jsonOut, JSON.stringify({ mode, blocking, ...result, counts: counts(result.findings) }, null, 2) + '\n');
   if (json) {
     process.stdout.write(JSON.stringify({ mode, blocking, ...result, counts: counts(result.findings) }, null, 2) + '\n');
   } else {
@@ -1198,6 +1202,7 @@ function parseArgs(argv) {
     const a = argv[i];
     if (a === '--root') o.root = argv[++i];
     else if (a === '--json') o.json = true;
+    else if (a === '--json-out') o.jsonOut = argv[++i];
     else if (a === '--warn-only') o.warnOnly = true;
     else if (a === '--drift') o.drift = true;
     else if (a === '--self-test') o.selfTest = true;
@@ -1216,7 +1221,7 @@ function main() {
   const o = parseArgs(process.argv.slice(2));
   if (o.help || o.bad || (o.root ?? '') === '') {
     if (o.bad) console.error(`unknown argument: ${o.bad}`);
-    console.error('usage: docs-hygiene.mjs [--root DIR] [--warn-only] [--json] | --drift [--root DIR] [--json] | --self-test [--fixtures DIR]');
+    console.error('usage: docs-hygiene.mjs [--root DIR] [--warn-only] [--json] [--json-out FILE] | --drift [--root DIR] [--json] [--json-out FILE] | --self-test [--fixtures DIR]');
     return o.help ? 0 : 2;
   }
   if (o.selfTest) return selfTest(o.fixtures);
@@ -1233,12 +1238,12 @@ function main() {
   try {
     if (o.drift) {
       const r = runDrift(root);
-      emit(r, { json: o.json, mode: 'drift', blocking: false });
+      emit(r, { json: o.json, jsonOut: o.jsonOut, mode: 'drift', blocking: false });
       return 0; // report-only, by design
     }
     const r = runChecks(root);
     const blocking = !o.warnOnly;
-    emit(r, { json: o.json, mode: blocking ? 'block' : 'warn', blocking });
+    emit(r, { json: o.json, jsonOut: o.jsonOut, mode: blocking ? 'block' : 'warn', blocking });
     return r.findings.length > 0 && blocking ? 1 : 0;
   } catch (e) {
     if (e instanceof Unknown) {

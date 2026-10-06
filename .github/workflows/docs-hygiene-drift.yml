@@ -12,9 +12,15 @@ name: Docs Drift Report
 # what the verifier read. Archived/superseded docs and `type: report` docs are
 # skipped (point-in-time by definition).
 #
-# Output: annotations plus a table in the run's step summary.
-# TODO (follow-up): open or refresh one issue per repo in the owning brain, as
-# rule 5 describes. Not built yet; the step summary is the report for now.
+# Output: annotations plus a table in the run's step summary and, when the
+# caller passes `brain-repo`, ONE issue per repo in that brain (rule 5): titled
+# `[docs-drift] <repo>: N docs changed since verified`, labelled `docs-drift`,
+# refreshed in place each run, closed with a comment once drift is zero
+# (drift-issue.mjs in the action). The brain write uses the sidekick-labs
+# release-bot App token (SIDEKICK_RELEASE_BOT_PRIVATE_KEY, so callers pass
+# `secrets: inherit`), the same credential the system-tests failure sink uses.
+# A repo the key is not shared with (a public repo, per sre-brain#642) gets a
+# warning and the step summary only. Filing never fails the run.
 #
 # Consume from a scheduled workflow:
 #
@@ -27,9 +33,26 @@ name: Docs Drift Report
 #       permissions:
 #         contents: read
 #       uses: sidekick-labs/.github/.github/workflows/docs-hygiene-drift.yml@main
+#       with:
+#         brain-repo: sidekick-labs/core-platform-brain
+#       secrets: inherit
 
 on:
   workflow_call:
+    inputs:
+      brain-repo:
+        description: OWNER/NAME of the owning brain to file the drift issue in. Empty = step summary only.
+        type: string
+        required: false
+        default: ''
+      dry-run:
+        description: Print the would-be issue (and whether it would create/refresh/close) instead of writing it.
+        type: boolean
+        required: false
+        default: false
+    secrets:
+      SIDEKICK_RELEASE_BOT_PRIVATE_KEY:
+        required: false
 
 permissions: {}
 
@@ -50,7 +73,37 @@ jobs:
           # script exit 3 (UNKNOWN) rather than report "no drift".
           fetch-depth: 0
 
+      - name: Resolve the brain repo name
+        id: brain
+        if: inputs.brain-repo != ''
+        env:
+          BRAIN_REPO: ${{ inputs.brain-repo }}
+        run: |
+          set -euo pipefail
+          case "$BRAIN_REPO" in
+            sidekick-labs/?*) echo "name=${BRAIN_REPO#sidekick-labs/}" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error title=docs-drift::brain-repo must be sidekick-labs/<name> (got '${BRAIN_REPO}')"; exit 2 ;;
+          esac
+
+      # issues:write on the brain only. continue-on-error is load-bearing: a
+      # caller the key is not shared with must still get its report, with a
+      # warning from drift-issue.mjs, not a red run.
+      - name: Mint an issues token for the brain
+        id: brain-token
+        if: inputs.brain-repo != ''
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.SIDEKICK_RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.SIDEKICK_RELEASE_BOT_PRIVATE_KEY }}
+          owner: sidekick-labs
+          repositories: ${{ steps.brain.outputs.name }}
+          permission-issues: write
+
       - name: Docs drift report
         uses: sidekick-labs/.github/.github/actions/docs-hygiene@v3  # moving release tag — see #1/v3
         with:
           mode: drift
+          brain-repo: ${{ inputs.brain-repo }}
+          issue-token: ${{ steps.brain-token.outputs.token }}
+          dry-run: ${{ inputs.dry-run }}

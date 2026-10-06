@@ -24,6 +24,21 @@ inputs:
     description: Repo root to check, relative to the workspace. Must be the top level of a git work tree.
     required: false
     default: '.'
+  brain-repo:
+    description: >-
+      (mode drift) OWNER/NAME of the owning brain. When set, the report is also
+      filed as ONE `docs-drift` issue there, refreshed in place each run and
+      closed when drift reaches zero (drift-issue.mjs). Empty: step summary only.
+    required: false
+    default: ''
+  issue-token:
+    description: (mode drift) Token with issues:write on brain-repo. Empty means the issue is skipped with a warning (report-only).
+    required: false
+    default: ''
+  dry-run:
+    description: (mode drift) `true` prints the would-be issue (and, with a token, whether it would create/refresh/close) instead of writing.
+    required: false
+    default: 'false'
 runs:
   using: composite
   steps:
@@ -36,7 +51,15 @@ runs:
     # longer go red fails here instead of reporting a reassuring green.
     - name: Self-test (positive control)
       shell: bash
-      run: node "${GITHUB_ACTION_PATH}/docs-hygiene.mjs" --self-test
+      env:
+        MODE: ${{ inputs.mode }}
+        BRAIN_REPO: ${{ inputs.brain-repo }}
+      run: |
+        set -euo pipefail
+        node "${GITHUB_ACTION_PATH}/docs-hygiene.mjs" --self-test
+        if [ "$MODE" = drift ] && [ -n "$BRAIN_REPO" ]; then
+          node "${GITHUB_ACTION_PATH}/drift-issue.mjs" --self-test
+        fi
 
     - name: Docs hygiene (${{ inputs.mode }})
       shell: bash
@@ -51,7 +74,25 @@ runs:
         case "$MODE" in
           warn)  flags=(--warn-only) ;;
           block) flags=() ;;
-          drift) flags=(--drift) ;;
+          drift) flags=(--drift --json-out "${RUNNER_TEMP}/docs-drift.json") ;;
           *) echo "::error title=docs-hygiene::mode must be warn, block or drift (got '${MODE}')"; exit 2 ;;
         esac
         node "${GITHUB_ACTION_PATH}/docs-hygiene.mjs" --root "$ROOT" "${flags[@]}"
+
+    # Files the report in the owning brain. Report-only: drift-issue.mjs exits 0
+    # on findings AND on its own filing failures (warnings), so only the scan
+    # above (exit 3 = UNKNOWN) can fail a drift run.
+    - name: File or refresh the brain issue
+      if: inputs.mode == 'drift' && inputs.brain-repo != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.issue-token }}
+        BRAIN_REPO: ${{ inputs.brain-repo }}
+        DRY_RUN: ${{ inputs.dry-run }}
+        REPO: ${{ github.repository }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        set -uo pipefail
+        args=(--report "${RUNNER_TEMP}/docs-drift.json" --repo "$REPO" --brain "$BRAIN_REPO" --run-url "$RUN_URL")
+        if [ "$DRY_RUN" = true ]; then args+=(--dry-run); fi
+        node "${GITHUB_ACTION_PATH}/drift-issue.mjs" "${args[@]}"

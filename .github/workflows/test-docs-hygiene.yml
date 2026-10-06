@@ -11,6 +11,10 @@ name: Test docs-hygiene
 #      clean tree must pass in block mode, the broken tree must FAIL in block
 #      mode and PASS in warn mode. This pins the exit-code contract through the
 #      action wiring (GITHUB_ACTION_PATH, the mode switch), not just the script.
+#   3. The drift brain-issue path: drift-issue.mjs `--self-test` (create,
+#      refresh in place, ignore other repos, close on zero, never file on a
+#      failed read) against an in-memory GitHub, then the action in drift mode
+#      on the drift fixture with `dry-run`, asserting the would-be issue body.
 on:
   pull_request:
     paths:
@@ -47,11 +51,15 @@ jobs:
       - name: Self-test (fixtures)
         run: node .github/actions/docs-hygiene/docs-hygiene.mjs --self-test
 
+      - name: Self-test (drift brain issue)
+        run: node .github/actions/docs-hygiene/drift-issue.mjs --self-test
+
       - name: Materialise clean and broken fixture repos
         run: |
           set -euo pipefail
           node .github/actions/docs-hygiene/docs-hygiene.mjs --materialise clean --out "$RUNNER_TEMP/clean"
           node .github/actions/docs-hygiene/docs-hygiene.mjs --materialise broken-path --out "$RUNNER_TEMP/broken"
+          node .github/actions/docs-hygiene/docs-hygiene.mjs --materialise drift --out "$RUNNER_TEMP/drift"
 
       - name: Action, block mode, clean tree (must pass)
         uses: ./.github/actions/docs-hygiene
@@ -82,3 +90,20 @@ jobs:
             exit 1
           fi
           echo "block mode failed on the broken tree, as it must."
+
+      - name: Action, drift mode, brain issue dry run (must pass, no token)
+        uses: ./.github/actions/docs-hygiene
+        with:
+          mode: drift
+          root: ${{ runner.temp }}/drift
+          brain-repo: sidekick-labs/octo-brain
+          dry-run: 'true'
+
+      - name: Assert the drift report carries the fixture's drifted doc
+        run: |
+          set -euo pipefail
+          node .github/actions/docs-hygiene/drift-issue.mjs --dry-run --report "$RUNNER_TEMP/docs-drift.json" \
+            --repo sidekick-labs/fixture --brain sidekick-labs/octo-brain | tee "$RUNNER_TEMP/dry-run.txt"
+          grep -q '^title: \[docs-drift\] fixture: 1 doc changed since verified$' "$RUNNER_TEMP/dry-run.txt"
+          grep -q 'docs/guides/engine.md' "$RUNNER_TEMP/dry-run.txt"
+          echo "drift dry run rendered the expected issue."
