@@ -25,7 +25,8 @@
 //                every `covers` glob of a `current` doc must match >= 1 file
 //   index        the always-loaded index (CLAUDE.md, or AGENTS.md when CLAUDE.md
 //                is just `@AGENTS.md`) is <= 200 lines and has a
-//                `| Doc | Read when |` table
+//                `| Doc | Read when |` table, or a bullet list under a heading
+//                matching /read when relevant/i (the compact form)
 //   orphans      every living docs/**/*.md is reachable by links (or backticked
 //                paths) from CLAUDE.md / AGENTS.md / docs/README.md, transitively
 //                through docs
@@ -66,7 +67,8 @@
 // ----------------
 // `--self-test` runs every fixture under tests/fixtures/docs-hygiene/ (each a
 // tiny repo, materialised as a throwaway git repo) and asserts the EXACT set of
-// findings in its expected.json: `clean` must produce none, every bad fixture
+// findings in its expected.json: `clean` (and any fixture marked
+// `"negative": true`) must produce none, every bad fixture
 // exactly its own. A check that has lost the ability to go red fails there.
 // https://github.com/sidekick-labs/octo-brain/blob/main/.claude/conventions/check-positive-controls.md
 //
@@ -773,6 +775,28 @@ export function hasReadWhenTable(text) {
   });
 }
 
+// The compact form (docs-shape rule 1): a bullet list (`- path — when`) under a
+// heading matching /read when relevant/i. Only bullets in that heading's own
+// section count, up to the next heading of the same or a higher level.
+export function hasReadWhenList(text) {
+  const lines = proseLines(text);
+  for (let i = 0; i < lines.length; i++) {
+    const h = /^\s{0,3}(#{1,6})\s+(.*)$/.exec(lines[i]);
+    if (!h || !/read when relevant/i.test(h[2])) continue;
+    const level = h[1].length;
+    for (let j = i + 1; j < lines.length; j++) {
+      const next = /^\s{0,3}(#{1,6})\s/.exec(lines[j]);
+      if (next && next[1].length <= level) break;
+      if (/^\s*[-*+]\s+\S/.test(lines[j])) return true;
+    }
+  }
+  return false;
+}
+
+export function hasReadWhenIndex(text) {
+  return hasReadWhenTable(text) || hasReadWhenList(text);
+}
+
 export function checkIndex(repo) {
   const f = indexFile(repo);
   if (!f) return [finding('index', 'index-missing', 'CLAUDE.md', null, 'no CLAUDE.md or AGENTS.md at the repo root')];
@@ -782,8 +806,8 @@ export function checkIndex(repo) {
   if (n > MAX_INDEX_LINES) {
     out.push(finding('index', 'index-too-long', f, MAX_INDEX_LINES + 1, `${f} is ${n} lines (max ${MAX_INDEX_LINES}); move reference/history to docs/ (rule 1)`));
   }
-  if (!hasReadWhenTable(text)) {
-    out.push(finding('index', 'read-when-table-missing', f, null, `${f} has no "Read when relevant" table (a \`| Doc | Read when |\` header row)`));
+  if (!hasReadWhenIndex(text)) {
+    out.push(finding('index', 'read-when-table-missing', f, null, `${f} has no "Read when relevant" index (a \`| Doc | Read when |\` table, or a bullet list under a "Read when relevant" heading)`));
   }
   return out;
 }
@@ -1124,7 +1148,7 @@ export function selfTest(fixturesDir = DEFAULT_FIXTURES) {
       const want = (expected.findings || []).map(key).sort();
       for (const f of result.findings) codesSeen.add(f.code);
       const ok = got.length === want.length && got.every((g, i) => g === want[i]);
-      if (name !== 'clean' && want.length === 0 && !expected.unknown) failures.push(`${name}: a bad fixture must expect at least one finding`);
+      if (name !== 'clean' && !expected.negative && want.length === 0 && !expected.unknown) failures.push(`${name}: a bad fixture must expect at least one finding (or set "negative": true for an extra negative control)`);
       if (!ok) {
         failures.push(`${name}: expected [${want.join('; ')}] got [${got.join('; ')}]`);
         console.log(`  FAIL ${name}`);

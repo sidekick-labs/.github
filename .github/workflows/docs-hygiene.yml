@@ -17,7 +17,8 @@ name: Docs Hygiene
 #   * broken relative markdown links and backticked repo-relative paths
 #   * docs/**/*.md frontmatter (description/type/status/covers/verified)
 #   * the index (CLAUDE.md, or AGENTS.md behind an `@AGENTS.md` pointer) is
-#     <= 200 lines and carries a `| Doc | Read when |` table
+#     <= 200 lines and carries a `| Doc | Read when |` table, or a bullet
+#     list under a "Read when relevant" heading (the compact form)
 #   * orphan docs: living docs unreachable from CLAUDE.md / docs/README.md
 # The heuristics and their calibration are documented in the script header
 # (.github/actions/docs-hygiene/docs-hygiene.mjs).
