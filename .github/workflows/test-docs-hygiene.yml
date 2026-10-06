@@ -1,0 +1,84 @@
+name: Test docs-hygiene
+
+# Regression gate for the docs-hygiene check (docs-hygiene.yml /
+# docs-hygiene-drift.yml / the composite action they share).
+#
+# Two layers, both positive controls (check-positive-controls):
+#   1. `--self-test`: every fixture under tests/fixtures/docs-hygiene/ must
+#      produce EXACTLY its expected findings: `clean` none, each bad fixture its
+#      own, every finding code at least once, and a non-repo dir must be UNKNOWN.
+#   2. The composite action itself, driven against materialised fixtures: the
+#      clean tree must pass in block mode, the broken tree must FAIL in block
+#      mode and PASS in warn mode. This pins the exit-code contract through the
+#      action wiring (GITHUB_ACTION_PATH, the mode switch), not just the script.
+on:
+  pull_request:
+    paths:
+      - '.github/actions/docs-hygiene/**'
+      - 'tests/fixtures/docs-hygiene/**'
+      - '.github/workflows/docs-hygiene.yml'
+      - '.github/workflows/docs-hygiene-drift.yml'
+      - '.github/workflows/test-docs-hygiene.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/actions/docs-hygiene/**'
+      - 'tests/fixtures/docs-hygiene/**'
+      - '.github/workflows/docs-hygiene.yml'
+      - '.github/workflows/docs-hygiene-drift.yml'
+      - '.github/workflows/test-docs-hygiene.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  docs-hygiene-logic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+
+      - name: Self-test (fixtures)
+        run: node .github/actions/docs-hygiene/docs-hygiene.mjs --self-test
+
+      - name: Materialise clean and broken fixture repos
+        run: |
+          set -euo pipefail
+          node .github/actions/docs-hygiene/docs-hygiene.mjs --materialise clean --out "$RUNNER_TEMP/clean"
+          node .github/actions/docs-hygiene/docs-hygiene.mjs --materialise broken-path --out "$RUNNER_TEMP/broken"
+
+      - name: Action, block mode, clean tree (must pass)
+        uses: ./.github/actions/docs-hygiene
+        with:
+          mode: block
+          root: ${{ runner.temp }}/clean
+
+      - name: Action, warn mode, broken tree (must pass)
+        uses: ./.github/actions/docs-hygiene
+        with:
+          mode: warn
+          root: ${{ runner.temp }}/broken
+
+      - name: Action, block mode, broken tree (must fail)
+        id: block_broken
+        continue-on-error: true
+        uses: ./.github/actions/docs-hygiene
+        with:
+          mode: block
+          root: ${{ runner.temp }}/broken
+
+      - name: Assert block mode went red on the broken tree
+        env:
+          OUTCOME: ${{ steps.block_broken.outcome }}
+        run: |
+          if [ "$OUTCOME" != "failure" ]; then
+            echo "::error title=Positive control failed::block mode did not fail on a tree with a known broken path (outcome=$OUTCOME)"
+            exit 1
+          fi
+          echo "block mode failed on the broken tree, as it must."

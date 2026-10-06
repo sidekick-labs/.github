@@ -1,0 +1,1 @@
+{ "base": "clean", "findings": [ { "code": "broken-link", "file": "docs/guides/extra.md" } ] }

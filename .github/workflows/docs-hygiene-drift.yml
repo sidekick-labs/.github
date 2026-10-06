@@ -1,0 +1,56 @@
+name: Docs Drift Report
+
+# Reusable, REPORT-ONLY weekly companion to docs-hygiene.yml (docs-shape rule 5):
+# lists every living doc whose `covers:` paths gained commits after its
+# `verified:` date. It never fails on findings: a drifted doc is a prompt to
+# re-read the code, not a broken build. It DOES fail when it cannot tell
+# (shallow clone, not a git work tree) or when its self-test can no longer go
+# red, because a silent drift report is indistinguishable from "no drift".
+#
+# Counting rule: commits strictly AFTER the verified day (`git log --since
+# <verified>T23:59:59Z -- <covers globs>`); a same-day commit is assumed to be
+# what the verifier read. Archived/superseded docs and `type: report` docs are
+# skipped (point-in-time by definition).
+#
+# Output: annotations plus a table in the run's step summary.
+# TODO (follow-up): open or refresh one issue per repo in the owning brain, as
+# rule 5 describes. Not built yet; the step summary is the report for now.
+#
+# Consume from a scheduled workflow:
+#
+#   on:
+#     schedule:
+#       - cron: '23 1 * * 1'   # weekly, Monday 01:23 UTC
+#     workflow_dispatch:
+#   jobs:
+#     docs-drift:
+#       permissions:
+#         contents: read
+#       uses: sidekick-labs/.github/.github/workflows/docs-hygiene-drift.yml@main
+
+on:
+  workflow_call:
+
+permissions: {}
+
+jobs:
+  drift:
+    name: Docs drift report
+    # Homelab-routable via the CALLER's RUNNER_LABEL (repo scope only; see claude-code-review.yml).
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The drift question is about history; a shallow clone makes the
+          # script exit 3 (UNKNOWN) rather than report "no drift".
+          fetch-depth: 0
+
+      - name: Docs drift report
+        uses: sidekick-labs/.github/.github/actions/docs-hygiene@v3  # moving release tag — see #1/v3
+        with:
+          mode: drift

@@ -1,0 +1,1 @@
+{ "base": "clean", "remove": ["CLAUDE.md"], "findings": [ { "code": "index-missing", "file": "CLAUDE.md" } ] }

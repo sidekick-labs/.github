@@ -1,0 +1,3 @@
+# Reviewed exceptions: paths docs name on purpose that never exist in git.
+allow-missing:
+  - config/attestation_roots/ # created at deploy time
