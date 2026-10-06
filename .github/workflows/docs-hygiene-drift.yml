@@ -9,8 +9,9 @@ name: Docs Drift Report
 #
 # Counting rule: commits touching the covers globs whose date, in the
 # committer's own time zone (`%cs`), is strictly AFTER the verified day; a
-# same-local-day commit is assumed to be what the verifier read. Archived/superseded docs and `type: report` docs are
-# skipped (point-in-time by definition).
+# same-local-day commit is assumed to be what the verifier read.
+# Archived/superseded docs and `type: report` docs are skipped (point-in-time
+# by definition).
 #
 # Output: annotations plus a table in the run's step summary and, when the
 # caller passes `brain-repo`, ONE issue per repo in that brain (rule 5): titled
