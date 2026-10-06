@@ -970,11 +970,12 @@ export function runDrift(root) {
     // assumed to be what was checked. `verified:` is a date with no zone, so the
     // day is compared against each commit's date in its COMMITTER's zone (%cs),
     // not UTC: a 20:00 commit in UTC-8 is still that local day, and a 06:00
-    // commit in UTC+8 is already the next one. `--since` is only a cheap
-    // prefilter; any commit with a later local date is after
-    // <verified>T10:00Z (zones stop at +14:00), so midnight UTC is safe.
+    // commit in UTC+8 is already the next one. No `--since`: git stops that
+    // walk early on non-monotonic commit dates (rebases, cherry-picks, mixed
+    // zones), which would silently undercount drift. The pathspec keeps the
+    // full walk cheap.
     const specs = d.covers.map((g) => `:(glob)${g.replace(/^\.\//, '').replace(/\/$/, '/**')}`);
-    const r = git(root, ['log', '--format=%H %cs %s', `--since=${d.verified}T00:00:00Z`, 'HEAD', '--', ...specs]);
+    const r = git(root, ['log', '--format=%H %cs %s', 'HEAD', '--', ...specs]);
     const commits = r.stdout.split('\n').filter(Boolean).filter((l) => l.split(' ')[1] > d.verified);
     if (commits.length > 0) {
       findings.push({
