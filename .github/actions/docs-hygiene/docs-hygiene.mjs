@@ -411,6 +411,14 @@ function unquote(s) {
   return s;
 }
 
+// `verified:` may be at most this many days past the UTC date (time zones).
+export const VERIFIED_TOLERANCE_DAYS = 1;
+
+// YYYY-MM-DD of the UTC date `offsetDays` from now.
+export function utcDay(offsetDays = 0, now = Date.now()) {
+  return new Date(now + offsetDays * 86400000).toISOString().slice(0, 10);
+}
+
 export function isValidDate(s) {
   if (typeof s !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
   const d = new Date(`${s}T00:00:00Z`);
@@ -733,8 +741,10 @@ export function checkFrontmatter(repo, docs) {
     if ('verified' in d && d.verified !== null && d.verified !== '') {
       if (!isValidDate(d.verified)) {
         out.push(finding('frontmatter', 'frontmatter-bad-verified', file, 1, `verified \`${d.verified}\` is not a YYYY-MM-DD date`));
-      } else if (d.verified > new Date().toISOString().slice(0, 10)) {
-        out.push(finding('frontmatter', 'frontmatter-bad-verified', file, 1, `verified \`${d.verified}\` is in the future`));
+      } else if (d.verified > utcDay(VERIFIED_TOLERANCE_DAYS)) {
+        // One day of slack: a verifier east of UTC (Singapore, UTC+8) writes
+        // their local date while UTC is still on the day before.
+        out.push(finding('frontmatter', 'frontmatter-bad-verified', file, 1, `verified \`${d.verified}\` is in the future (later than UTC today + ${VERIFIED_TOLERANCE_DAYS} day)`));
       }
     }
     if ('covers' in d && d.covers !== null && d.covers !== '') {
@@ -957,10 +967,15 @@ export function runDrift(root) {
     if (d.type === 'report') continue; // point-in-time by definition: drift is expected
     considered++;
     // Strictly after the verified DAY: commits on the verified date itself are
-    // assumed to be what was checked.
+    // assumed to be what was checked. `verified:` is a date with no zone, so the
+    // day is compared against each commit's date in its COMMITTER's zone (%cs),
+    // not UTC: a 20:00 commit in UTC-8 is still that local day, and a 06:00
+    // commit in UTC+8 is already the next one. `--since` is only a cheap
+    // prefilter; any commit with a later local date is after
+    // <verified>T10:00Z (zones stop at +14:00), so midnight UTC is safe.
     const specs = d.covers.map((g) => `:(glob)${g.replace(/^\.\//, '').replace(/\/$/, '/**')}`);
-    const r = git(root, ['log', '--format=%H %cs %s', `--since=${d.verified}T23:59:59Z`, 'HEAD', '--', ...specs]);
-    const commits = r.stdout.split('\n').filter(Boolean);
+    const r = git(root, ['log', '--format=%H %cs %s', `--since=${d.verified}T00:00:00Z`, 'HEAD', '--', ...specs]);
+    const commits = r.stdout.split('\n').filter(Boolean).filter((l) => l.split(' ')[1] > d.verified);
     if (commits.length > 0) {
       findings.push({
         ...finding('drift', 'covers-drift', file, 1, `${commits.length} commit(s) touched its covers since verified ${d.verified}`),
@@ -1089,12 +1104,27 @@ function materialise(fixtureDir, expected = {}, dest = null) {
     const r = spawnSync('git', ['-C', tmp, ...args], { encoding: 'utf8', env: { ...env, ...extraEnv } });
     if (r.status !== 0) throw new Error(`fixture git ${args.join(' ')}: ${r.stderr}`);
   };
+  // `{{UTC_TODAY+N}}` in a fixture's markdown becomes the UTC date N days from
+  // now, for checks relative to today (the `verified:` future tolerance).
+  const walk = (dir) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory() && e.name !== '.git') walk(p);
+      else if (e.isFile() && p.endsWith('.md')) {
+        const t = fs.readFileSync(p, 'utf8');
+        if (t.includes('{{UTC_TODAY')) fs.writeFileSync(p, t.replace(/\{\{UTC_TODAY([+-]\d+)?\}\}/g, (_, n) => utcDay(Number(n || 0))));
+      }
+    }
+  };
+  walk(tmp);
   g(['init', '-q', '-b', 'main']);
   g(['add', '-A']);
   const historyPath = path.join(fixtureDir, 'history.json');
   if (fs.existsSync(historyPath)) {
     const base = JSON.parse(fs.readFileSync(historyPath, 'utf8'));
-    const at = (d) => ({ GIT_AUTHOR_DATE: `${d}T12:00:00Z`, GIT_COMMITTER_DATE: `${d}T12:00:00Z` });
+    // `at` (full ISO 8601 with a zone offset) overrides the noon-UTC default,
+    // for fixtures about which local day a commit falls on.
+    const at = (d, ts) => ({ GIT_AUTHOR_DATE: ts || `${d}T12:00:00Z`, GIT_COMMITTER_DATE: ts || `${d}T12:00:00Z` });
     g(['commit', '-q', '-m', 'fixture base'], at(base.baseDate));
     for (const c of base.commits) {
       for (const [p, content] of Object.entries(c.files)) {
@@ -1102,7 +1132,7 @@ function materialise(fixtureDir, expected = {}, dest = null) {
         fs.writeFileSync(path.join(tmp, p), content);
       }
       g(['add', '-A']);
-      g(['commit', '-q', '-m', c.message || 'fixture change'], at(c.date));
+      g(['commit', '-q', '-m', c.message || 'fixture change'], at(c.date, c.at));
     }
   }
   return tmp;

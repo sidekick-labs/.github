@@ -1,0 +1,6 @@
+{
+  "baseDate": "2026-09-01",
+  "commits": [
+    { "date": "2026-10-02", "at": "2026-10-02T06:00:00+08:00", "message": "morning after the verified day in UTC+8 (still 10-01 in UTC): drift", "files": { "src/core/engine.js": "export const engine = 2;\n" } }
+  ]
+}

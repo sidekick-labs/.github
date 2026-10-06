@@ -392,6 +392,12 @@ jobs:
 | orphans | `orphan-doc` |
 | drift (`docs-hygiene-drift.yml` only) | `covers-drift` |
 
+**Dates.** `verified:` may be up to one day past the UTC date (a verifier in
+UTC+8 writes their local date while UTC is still on the day before); later is
+`frontmatter-bad-verified`. Drift counts a commit only when its date in the
+committer's own zone is after the `verified:` day, so same-local-day commits
+never count.
+
 **Exit codes:** 0 clean (or any findings in warn/drift mode), 1 findings in block
 mode, 2 usage error, 3 UNKNOWN (not a git work tree, unreadable, shallow clone
 for drift). Every non-zero fails the job.
