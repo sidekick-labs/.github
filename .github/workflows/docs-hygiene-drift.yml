@@ -7,9 +7,9 @@ name: Docs Drift Report
 # (shallow clone, not a git work tree) or when its self-test can no longer go
 # red, because a silent drift report is indistinguishable from "no drift".
 #
-# Counting rule: commits strictly AFTER the verified day (`git log --since
-# <verified>T23:59:59Z -- <covers globs>`); a same-day commit is assumed to be
-# what the verifier read. Archived/superseded docs and `type: report` docs are
+# Counting rule: commits touching the covers globs whose date, in the
+# committer's own time zone (`%cs`), is strictly AFTER the verified day; a
+# same-local-day commit is assumed to be what the verifier read. Archived/superseded docs and `type: report` docs are
 # skipped (point-in-time by definition).
 #
 # Output: annotations plus a table in the run's step summary and, when the
