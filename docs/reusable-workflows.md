@@ -454,7 +454,42 @@ jobs:
     permissions:
       contents: read
     uses: sidekick-labs/.github/.github/workflows/docs-hygiene-drift.yml@main
+    with:
+      brain-repo: sidekick-labs/core-platform-brain   # the repo's owning brain
+    secrets: inherit   # SIDEKICK_RELEASE_BOT_PRIVATE_KEY, to mint the brain token
 ```
+
+**The drift issue.** With `brain-repo` set, each run also files the report as
+ONE issue per repo in that brain (rule 5), written by
+`.github/actions/docs-hygiene/drift-issue.mjs`:
+
+- title `[docs-drift] <repo>: N docs changed since verified`, label `docs-drift`,
+  and a table of doc, `covers:` globs, commits since verified, verified date and
+  last commit;
+- found again by label plus the title prefix `[docs-drift] <repo>:` among open
+  issues, and refreshed in place (title and body), so reruns never duplicate it;
+- closed with a comment when drift reaches zero; a later drift opens a new one.
+
+The brain write uses a release-bot App token scoped to `issues: write` on that
+brain only, minted from `SIDEKICK_RELEASE_BOT_PRIVATE_KEY` (the credential the
+sidekick-system-tests failure sink already uses). Filing stays report-only: a
+caller the key isn't shared with (public repos, per sre-brain#642), or any API
+error, gets a `::warning::` and the step summary, never a red run. A failed read
+of the brain's issues is "could not tell", so nothing is filed that run rather
+than risk a duplicate. Only the scan's exit 3 (UNKNOWN) fails a drift run.
+
+`dry-run: true` prints the would-be title and body instead of writing; locally:
+
+```bash
+node .github/actions/docs-hygiene/docs-hygiene.mjs --drift --root ../sidekick-web --json-out /tmp/drift.json
+GH_TOKEN=$(gh auth token) node .github/actions/docs-hygiene/drift-issue.mjs --dry-run \
+  --report /tmp/drift.json --repo sidekick-labs/sidekick-web --brain sidekick-labs/core-platform-brain
+```
+
+With a token the dry run also reads the brain and says whether it would create,
+refresh or close. `drift-issue.mjs --self-test` is its positive control (an
+in-memory GitHub), run by the action whenever `brain-repo` is set and by
+`test-docs-hygiene.yml`.
 
 **Refs.** Both workflows call the composite action at `@v3`, which
 `advance-major-tag.yml` moves to every new `main` commit. So the action lags the
