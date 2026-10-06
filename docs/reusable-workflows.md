@@ -25,6 +25,10 @@ Available reusable workflows:
   PR description nor a commit carries `Fixes <code>`, so the Sentry issue would
   not auto-resolve.
   See [Sentry fix-trailer guard](#sentry-fix-trailer-guard).
+- **`docs-hygiene.yml`** / **`docs-hygiene-drift.yml`** — the docs-shape
+  convention's enforcement: a PR gate (links, backticked paths, frontmatter,
+  index, orphans; warn → block ratchet) and a weekly report-only `covers:` drift
+  report. See [Docs hygiene](#docs-hygiene).
 
 > **Removed:** `reusable-sentry-autofix.yml` — the Sentry autofix moved to the
 > one-workflow-per-org model: `sidekick-labs/sre-brain`'s `sentry-sweep.yml` +
@@ -371,6 +375,97 @@ jobs:
     # once a v3 or later cuts.
     uses: sidekick-labs/.github/.github/workflows/skills-portability.yml@main
 ```
+
+## Docs hygiene
+
+`docs-hygiene.yml` enforces rule 5 of the
+[docs-shape convention](https://github.com/sidekick-labs/octo-brain/blob/main/.claude/conventions/docs-shape.md)
+(decision: sidekick-labs/octo-brain#573). It runs a zero-dependency Node script,
+`.github/actions/docs-hygiene/docs-hygiene.mjs`, over `CLAUDE.md`, `AGENTS.md`,
+`docs/**`, `.claude/**` and `.agents/**`:
+
+| Check | Finding codes |
+|---|---|
+| links | `broken-link`, `broken-path`, `broken-path-glob` |
+| frontmatter (`docs/**/*.md`, README indexes excepted) | `frontmatter-missing`, `frontmatter-unparseable`, `frontmatter-key-missing`, `frontmatter-bad-type`, `frontmatter-bad-status`, `frontmatter-bad-verified`, `frontmatter-bad-covers`, `covers-unmatched` |
+| index | `index-missing`, `index-too-long`, `read-when-table-missing` |
+| orphans | `orphan-doc` |
+| drift (`docs-hygiene-drift.yml` only) | `covers-drift` |
+
+**Exit codes:** 0 clean (or any findings in warn/drift mode), 1 findings in block
+mode, 2 usage error, 3 UNKNOWN (not a git work tree, unreadable, shallow clone
+for drift). Every non-zero fails the job.
+
+**Backticked paths are a heuristic,** tuned against 11 code repos. A span is
+treated as a path only when it contains `/`, has no whitespace or placeholder
+syntax, and starts with a top-level entry of the repo. It is skipped when its
+line (or the line before) names another repo or speaks in the past tense or the
+negative ("removed", "not under"), when it is gitignored, or when the doc is
+point-in-time (`type: adr`/`report`, `status: archived`/`superseded`, or an
+ADR/reports folder before frontmatter lands).
+
+**Intentionally missing paths** (a removed file a doc names on purpose, a
+directory created only at deploy time, a local secret location) are allowed in
+one of three scopes, narrowest first:
+
+- one line: `<!-- docs-hygiene-ignore -->` on that line;
+- one doc: `<!-- docs-hygiene: allow-missing config/attestation_roots/ app/services/claim_resolver.rb -->`
+  anywhere in the doc (entries are exact paths, `dir/` prefixes, or globs);
+- the repo: `.docs-hygiene.yml` with `allow-missing: [config/attestation_roots/]`.
+  A file the script can't read as that list makes the run UNKNOWN, not clean.
+
+**It carries its own controls.** Every run starts with `--self-test` against
+`tests/fixtures/docs-hygiene/`: `clean` must produce no findings, each bad
+fixture exactly its own, and every finding code must fire at least once.
+`test-docs-hygiene.yml` also drives the composite action against materialised
+fixtures and asserts block mode goes red on a broken tree.
+
+### Per-repo adoption
+
+```yaml
+# .github/workflows/docs-hygiene.yml in the consumer repo
+name: Docs Hygiene
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+permissions: {}
+concurrency:
+  group: docs-hygiene-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  docs-hygiene:
+    permissions:
+      contents: read
+    uses: sidekick-labs/.github/.github/workflows/docs-hygiene.yml@main
+    with:
+      mode: warn   # flip to `block` after one warn-only cycle (the ratchet)
+```
+
+```yaml
+# .github/workflows/docs-drift.yml in the consumer repo
+name: Docs Drift Report
+on:
+  schedule:
+    - cron: '23 1 * * 1'   # weekly, Monday 01:23 UTC
+  workflow_dispatch:
+permissions: {}
+jobs:
+  docs-drift:
+    permissions:
+      contents: read
+    uses: sidekick-labs/.github/.github/workflows/docs-hygiene-drift.yml@main
+```
+
+**Refs.** Both workflows call the composite action at `@v3`, which
+`advance-major-tag.yml` moves to every new `main` commit. So the action lags the
+workflow by at most one push to `main`, and a caller pinned to `@main` can briefly
+run a newer workflow against the previous action. Keep workflow/action changes
+backward compatible across one release (e.g. add a new `mode` to the action
+before a workflow passes it).
+
+Run it locally against a checkout:
+`node .github/actions/docs-hygiene/docs-hygiene.mjs --root ../sidekick-web --warn-only`
+(add `--json` for machine output, `--drift` for the drift report).
 
 ## Sentry fix-trailer guard
 

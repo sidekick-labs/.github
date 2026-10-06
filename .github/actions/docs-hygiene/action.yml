@@ -1,0 +1,57 @@
+# The docs-hygiene gate as a composite action. Consumers normally reach it via
+# the reusable workflows (docs-hygiene.yml for PRs, docs-hygiene-drift.yml for
+# the weekly report), which check out the caller first. It lives in an action,
+# not inline in the workflow, so the script ships with its fixtures: every run
+# starts with `--self-test` against tests/fixtures/docs-hygiene/ in THIS repo.
+#
+# Spec: rule 5 of the docs-shape convention
+# https://github.com/sidekick-labs/octo-brain/blob/main/.claude/conventions/docs-shape.md
+#
+# Exit contract (from the script): 0 clean / warn-only / drift report,
+# 1 findings in block mode, 2 usage error, 3 UNKNOWN (could not tell). Every
+# non-zero fails the step: an unreadable probe is never a clean bill of health.
+name: Docs hygiene
+description: >-
+  Check CLAUDE.md / AGENTS.md / docs / .claude markdown against the docs-shape
+  convention (links, backticked paths, frontmatter, index, orphans), or report
+  docs whose `covers:` code changed after `verified:` (mode drift).
+inputs:
+  mode:
+    description: '`warn` (findings annotate, never fail), `block` (findings fail), or `drift` (weekly report; needs fetch-depth 0).'
+    required: false
+    default: warn
+  root:
+    description: Repo root to check, relative to the workspace. Must be the top level of a git work tree.
+    required: false
+    default: '.'
+runs:
+  using: composite
+  steps:
+    - name: Set up Node.js
+      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      with:
+        node-version: '24'
+
+    # The positive control. Runs before the real scan so a gate that can no
+    # longer go red fails here instead of reporting a reassuring green.
+    - name: Self-test (positive control)
+      shell: bash
+      run: node "${GITHUB_ACTION_PATH}/docs-hygiene.mjs" --self-test
+
+    - name: Docs hygiene (${{ inputs.mode }})
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        ROOT: ${{ inputs.root }}
+        # Composite steps stop at the first failure, so reaching this step
+        # means the self-test above passed; the step summary says so.
+        DOCS_HYGIENE_SELF_TESTED: '1'
+      run: |
+        set -uo pipefail
+        case "$MODE" in
+          warn)  flags=(--warn-only) ;;
+          block) flags=() ;;
+          drift) flags=(--drift) ;;
+          *) echo "::error title=docs-hygiene::mode must be warn, block or drift (got '${MODE}')"; exit 2 ;;
+        esac
+        node "${GITHUB_ACTION_PATH}/docs-hygiene.mjs" --root "$ROOT" "${flags[@]}"

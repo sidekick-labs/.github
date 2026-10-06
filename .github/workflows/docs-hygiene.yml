@@ -1,0 +1,70 @@
+name: Docs Hygiene
+
+# Reusable PR gate for the docs-shape convention (rule 5, "Enforcement"):
+# https://github.com/sidekick-labs/octo-brain/blob/main/.claude/conventions/docs-shape.md
+#
+# Why this exists
+# ---------------
+# Agents follow docs, and docs rot silently. The 2026-10-06 audit
+# (sidekick-labs/octo-brain#573) found live guidance sending agents to a
+# superseded API contract, a nonexistent deploy workflow and code paths that had
+# moved months earlier; 28 orphan docs; and 0 of 122 docs with machine-readable
+# status. Docs-only PRs also skip Claude review, which mechanical-pr-review-skip
+# allows only when a deterministic gate gives the same guarantee. This is it.
+#
+# What it checks (in CLAUDE.md, AGENTS.md, docs/**, .claude/**, .agents/**)
+# ------------------------------------------------------------------------
+#   * broken relative markdown links and backticked repo-relative paths
+#   * docs/**/*.md frontmatter (description/type/status/covers/verified)
+#   * the index (CLAUDE.md, or AGENTS.md behind an `@AGENTS.md` pointer) is
+#     <= 200 lines and carries a `| Doc | Read when |` table
+#   * orphan docs: living docs unreachable from CLAUDE.md / docs/README.md
+# The heuristics and their calibration are documented in the script header
+# (.github/actions/docs-hygiene/docs-hygiene.mjs).
+#
+# Ratchet: `mode: warn` (the default) annotates findings and never fails, for one
+# cycle; then flip the caller to `mode: block`. In either mode the job FAILS on
+# exit 3 (UNKNOWN: not a git work tree, unreadable files) and if the built-in
+# self-test can no longer go red (check-positive-controls).
+#
+# Consume from a PR workflow (no `paths:` filter needed: it is fast, and a
+# filtered-out run cannot report the check):
+#
+#   jobs:
+#     docs-hygiene:
+#       permissions:
+#         contents: read
+#       uses: sidekick-labs/.github/.github/workflows/docs-hygiene.yml@main
+#       with:
+#         mode: warn   # flip to `block` after the warn-only cycle
+#
+# The weekly `covers:` drift report is the separate docs-hygiene-drift.yml.
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: '`warn` (annotate, never fail on findings) or `block` (findings fail the job).'
+        type: string
+        default: warn
+
+permissions: {}
+
+jobs:
+  docs-hygiene:
+    name: Docs hygiene
+    # Homelab-routable via the CALLER's RUNNER_LABEL (repo scope only; see claude-code-review.yml).
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Docs hygiene
+        uses: sidekick-labs/.github/.github/actions/docs-hygiene@v3  # moving release tag — see #1/v3
+        with:
+          mode: ${{ inputs.mode == 'block' && 'block' || 'warn' }}

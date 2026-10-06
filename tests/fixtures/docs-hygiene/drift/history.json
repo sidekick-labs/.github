@@ -1,0 +1,9 @@
+{
+  "baseDate": "2026-09-01",
+  "commits": [
+    { "date": "2026-09-30", "message": "engine change before reference was verified", "files": { "src/not-built-yet/a.js": "1\n" } },
+    { "date": "2026-10-01", "message": "same-day change: assumed seen by the verifier", "files": { "src/core/engine.js": "export const engine = 2;\n" } },
+    { "date": "2026-10-02", "message": "engine change after engine.md was verified", "files": { "src/core/engine.js": "export const engine = 3;\n" } },
+    { "date": "2026-10-03", "message": "untracked-by-any-doc change", "files": { "README.md": "x\n" } }
+  ]
+}
