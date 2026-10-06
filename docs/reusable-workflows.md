@@ -388,7 +388,7 @@ jobs:
 |---|---|
 | links | `broken-link`, `broken-path`, `broken-path-glob` |
 | frontmatter (`docs/**/*.md`, README indexes excepted) | `frontmatter-missing`, `frontmatter-unparseable`, `frontmatter-key-missing`, `frontmatter-bad-type`, `frontmatter-bad-status`, `frontmatter-bad-verified`, `frontmatter-bad-covers`, `covers-unmatched` |
-| index | `index-missing`, `index-too-long`, `read-when-table-missing` |
+| index (a `\| Doc \| Read when \|` table, or a bullet list under a "Read when relevant" heading) | `index-missing`, `index-too-long`, `read-when-table-missing` (the code keeps its name for either form) |
 | orphans | `orphan-doc` |
 | drift (`docs-hygiene-drift.yml` only) | `covers-drift` |
 
