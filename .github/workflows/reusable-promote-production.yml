@@ -158,7 +158,7 @@ jobs:
         # Note: v3 of this action uses `client-id` (the App Client ID from
         # General Settings), NOT the numeric App ID.
         id: app_token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ inputs.release_bot_client_id }}
           private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
@@ -377,7 +377,7 @@ jobs:
         id: ai_summary
         if: ${{ !inputs.dry_run && success() && steps.ff_push.outputs.already_at_target != 'true' && inputs.slack_channel != '' }}
         continue-on-error: true
-        uses: anthropics/claude-code-action@1d6de8cb0c237e7c15e9e1bdf973826ebae490cc # v1.0.236 (bundled CLI 2.1.284, the first to name claude-sonnet-5-5; claude-opus-5-5 needs CLI >=2.1.280; OAuth needs >=v1.0.168 since the 2026-07-07 auth change)
+        uses: anthropics/claude-code-action@f27be6b65a4652f08a2ba3cff79114829b588967 # v1.0.236 (bundled CLI 2.1.284, the first to name claude-sonnet-5-5; claude-opus-5-5 needs CLI >=2.1.280; OAuth needs >=v1.0.168 since the 2026-07-07 auth change)
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           claude_args: >-
