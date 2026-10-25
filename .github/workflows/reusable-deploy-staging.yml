@@ -194,6 +194,42 @@ jobs:
           cache-from: type=registry,ref=registry.digitalocean.com/${{ inputs.registry }}/${{ inputs.image_repo }}:cache
           cache-to: type=registry,ref=registry.digitalocean.com/${{ inputs.registry }}/${{ inputs.image_repo }}:cache,mode=max
 
+      - name: Wait for DOCR garbage collection before retrying
+        # The registry is read-only while garbage collection runs, and DOCR
+        # rejects pushes with `registry/auth ... 401 Unauthorized`, which looks
+        # like a credential failure. sidekick-web's nightly cleanup-docr.yml
+        # starts a GC at 16:00 UTC and exits without waiting for it. On
+        # 2026-10-25 merges at 15:58-16:06 UTC failed this way in web, harness
+        # and inference, and an immediate retry would have failed the same way.
+        # So when the first attempt failed, wait out any active GC (up to 30
+        # min) before retrying, then log in again. With no GC running,
+        # `get-active` errors and the loop exits at once.
+        if: steps.build_push.outcome == 'failure'
+        timeout-minutes: 32
+        env:
+          REGISTRY: ${{ inputs.registry }}
+        run: |
+          for i in $(seq 1 60); do
+            if ! STATUS=$(doctl registry garbage-collection get-active "$REGISTRY" --format Status --no-header 2>/tmp/gc-err); then
+              # No active GC is the normal case and comes back as an error; any
+              # other failure is logged so a skipped wait is diagnosable.
+              echo "No active DOCR garbage collection reported ($(head -c 300 /tmp/gc-err))"
+              break
+            fi
+            case "$STATUS" in
+              ""|*succeeded*|*failed*|*cancelled*)
+                echo "No active DOCR garbage collection${STATUS:+ (last status: $STATUS)}"
+                break ;;
+              *)
+                echo "DOCR garbage collection active (${STATUS}); waiting 30s ($i/60)"
+                sleep 30 ;;
+            esac
+          done
+          [ "$i" = 60 ] && echo "::warning::DOCR garbage collection still active after 30 min; retrying anyway"
+          # Fresh registry credentials: the first login's 1h token may be
+          # short-lived by now after a slow build plus the wait.
+          doctl registry login --expiry-seconds 3600
+
       - name: Build and push app image (retry once on transient push flake)
         id: build_push_retry
         # Runs only if the first attempt failed. NOT continue-on-error, so a
