@@ -96,6 +96,10 @@ jobs:
       - name: Create Sentry release (backend)
         if: env.SKIP_SENTRY != 'true' && !inputs.has_frontend
         uses: getsentry/action-release@6fb9aeade7061441cf3864e34fbe11a1457ad7dc # v3.7.1
+        # No `environment:`, so no deploy is recorded. This runs on push to
+        # main, which reaches staging at most; a production deploy is recorded
+        # only by the prod deploy workflow (reusable-deploy-production
+        # notify_sentry) at the promoted SHA. Marking production here put a
+        # false prod deploy on every merged SHA (sre-brain#831).
         with:
-          environment: production
           version: ${{ github.sha }}
