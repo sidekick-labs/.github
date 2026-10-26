@@ -1,15 +1,16 @@
 name: Gitleaks Secret Scan
 
-# Reusable PR gate that fails when the gitleaks secret scanner finds credentials,
-# tokens or other high-entropy strings committed to the PR diff.
+# Reusable gate that fails when the gitleaks secret scanner finds credentials,
+# tokens or other high-entropy strings in commits introduced by a pull request
+# or pushed to any branch.
 #
 # Uses the gitleaks binary directly (not gitleaks-action) to avoid the
 # GITLEAKS_LICENSE that the action requires for GitHub Organisations. The binary
 # is SHA-pinned and checksum-verified at install time.
 #
 # BYPASS PROTECTION:
-# 1. Config: `.gitleaks.toml` is loaded from the PR's BASE commit (not the
-#    checked-out PR tree). When the base has no config, a minimal stub that
+# 1. Config: `.gitleaks.toml` is loaded from the BASE commit (not the
+#    checked-out tree). When the base has no config, a minimal stub that
 #    extends the built-in default rules is used — so the first PR to add a
 #    `.gitleaks.toml` in a repo cannot ship a secret together with an allowlist
 #    rule for it. To suppress a confirmed false positive, land a `.gitleaks.toml`
@@ -42,10 +43,16 @@ name: Gitleaks Secret Scan
 #   - Add CODEOWNERS protection on `.gitleaks.toml` and `.gitleaksignore` in
 #     each caller if you want to prevent a repo admin from self-reviewing an
 #     allowlist change to the base branch.
+#   - For non-first `push` events, config is loaded from `github.event.before`
+#     (the previous tip of the branch). A determined author could land an
+#     allowlist rule in one push, then a matching secret in the next. For first
+#     pushes of a branch, config is loaded from the merge-base with the default
+#     branch, so a new branch cannot bring its own allowlist. The two-push bypass
+#     on non-first pushes is a known residual risk (tracked separately).
 #
-# USAGE: trigger on `pull_request` only. Using `pull_request_target` will put the
-# checkout on the base and make the `BASE..HEAD` range error. `merge_group` events
-# will also fail the empty-SHA checks.
+# USAGE: callers may trigger on `pull_request` and/or `push`. `pull_request_target`
+# and `merge_group` are rejected immediately (unsupported event). Force-pushes
+# may make `github.event.before` unreachable in the clone; the job fails hard.
 #
 # Consume from a PR workflow:
 #
@@ -121,22 +128,109 @@ jobs:
           tar -xzf "${RUNNER_TEMP}/gitleaks.tar.gz" -C "${RUNNER_TEMP}" gitleaks
           echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
 
-      - name: Resolve gitleaks config and ignore-path from base commit
-        # Loads .gitleaks.toml and .gitleaksignore from the PR's BASE commit
-        # so the PR branch cannot introduce bypass rules in the same diff.
-        # When absent on the base, a minimal stub (default rules, no allowlist)
-        # and an empty ignore-path file are used respectively.
+      - name: Resolve scan range
+        # Computes BASE and HEAD for the gitleaks log range.
+        # pull_request: the PR base/head SHAs.
+        # push:         github.event.before..github.sha. When `before` is all
+        #               zeros (first push of a branch) there is no prior tip to
+        #               trust, so BASE is the merge-base with the default branch
+        #               (every commit introduced by the push is scanned, and the
+        #               config still comes from a commit the push did not write).
+        #               If the merge-base equals HEAD and the pushed ref is NOT
+        #               the default branch, the branch has no new commits; BASE
+        #               is kept equal to HEAD so gitleaks sees an empty scan
+        #               range. If the pushed ref IS the default branch (first
+        #               push to the repo) or the merge-base cannot be found
+        #               (root commit, missing origin ref), BASE is left empty
+        #               and the later steps scan the full history with the stub.
+        # Any other event fails fast.
+        id: resolve-range
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_SHA: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          if [ -z "${BASE_SHA}" ]; then
-            echo "::error::BASE_SHA is empty — this reusable requires a pull_request event." >&2
+          case "$EVENT_NAME" in
+            pull_request)
+              base="$PR_BASE"
+              head="$PR_HEAD"
+              if [ -z "$base" ]; then
+                echo "::error::PR_BASE is empty — this reusable requires a non-empty pull_request base." >&2
+                exit 1
+              fi
+              if ! git rev-parse --verify --quiet "${base}^{commit}" >/dev/null; then
+                echo "::error::PR base SHA (${base:0:8}) is not present in this checkout." >&2
+                exit 1
+              fi
+              ;;
+            push)
+              head="$PUSH_SHA"
+              if echo "$PUSH_BEFORE" | grep -qE '^0+$'; then
+                base=""
+                # fetch-depth: 0 already populated refs/remotes/origin/*; no extra fetch needed.
+                if [ -n "$DEFAULT_BRANCH" ]; then
+                  base="$(git merge-base "origin/$DEFAULT_BRANCH" "$head" 2>/dev/null || true)"
+                fi
+                if [ -n "$base" ] && ! git rev-parse --verify --quiet "${base}^{commit}" >/dev/null; then
+                  base=""
+                fi
+                if [ "$base" = "$head" ]; then
+                  # merge-base equals HEAD: two distinct cases:
+                  #   (a) First push to the default branch itself — actions/checkout
+                  #       sets origin/<default> to the tip we just pushed, so
+                  #       merge-base returns HEAD. Clear base so the full history
+                  #       is scanned with the stub config (correct behaviour).
+                  #   (b) Feature branch pushed at the default-branch tip with no
+                  #       new commits. Scan range base..head is empty; config comes
+                  #       from base (==head) = the trusted default-branch tip.
+                  if [ "${REF_NAME:-}" = "${DEFAULT_BRANCH:-}" ]; then
+                    base=""
+                  else
+                    echo "::notice::No new commits: branch tip equals the merge-base with origin/${DEFAULT_BRANCH}. Scan range will be empty."
+                  fi
+                fi
+              else
+                base="$PUSH_BEFORE"
+                if ! git rev-parse --verify --quiet "${base}^{commit}" >/dev/null; then
+                  echo "::error::github.event.before (${base:0:8}) is not reachable in this checkout; cannot establish a trusted base." >&2
+                  exit 1
+                fi
+              fi
+              ;;
+            *)
+              echo "::error::Unsupported event '${EVENT_NAME}'. This reusable supports pull_request and push." >&2
+              exit 1
+              ;;
+          esac
+          if ! git rev-parse --verify --quiet "${head}^{commit}" >/dev/null; then
+            echo "::error::HEAD (${head:0:8}) is not present in this checkout." >&2
             exit 1
           fi
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+          if [ -n "$base" ]; then
+            echo "Resolved scan range: ${base:0:8}..${head:0:8} ($EVENT_NAME)"
+          else
+            echo "No trusted base for ${head:0:8} ($EVENT_NAME): scanning full history with the built-in rules"
+          fi
 
+      - name: Resolve gitleaks config and ignore-path from base commit
+        # Loads .gitleaks.toml and .gitleaksignore from BASE so the diff under
+        # review cannot introduce allowlist bypass rules in the same change.
+        # When absent on the base, a minimal stub (default rules, no allowlist)
+        # and an empty ignore-path file are used respectively. With no trusted
+        # base at all (BASE_SHA empty) only the stub is used: `git show :path`
+        # would otherwise read the checked-out tree, which the push wrote.
+        env:
+          BASE_SHA: ${{ steps.resolve-range.outputs.base }}
+        run: |
           # Config: load from base or write a stub that extends built-in rules.
           CONFIG_PATH="${RUNNER_TEMP}/.gitleaks.toml"
-          if git show "${BASE_SHA}:.gitleaks.toml" > "${CONFIG_PATH}" 2>/dev/null; then
+          if [ -n "${BASE_SHA}" ] && git show "${BASE_SHA}:.gitleaks.toml" > "${CONFIG_PATH}" 2>/dev/null; then
             echo "Using .gitleaks.toml from base commit ${BASE_SHA:0:8}"
             # Guard: a base config without `[extend] useDefault = true` scans with
             # zero rules and passes every PR silently. Fail fast so the problem is
@@ -152,7 +246,7 @@ jobs:
 
           # Ignore-path: load from base or use an empty file.
           IGNORE_PATH="${RUNNER_TEMP}/.gitleaksignore"
-          if git show "${BASE_SHA}:.gitleaksignore" > "${IGNORE_PATH}" 2>/dev/null; then
+          if [ -n "${BASE_SHA}" ] && git show "${BASE_SHA}:.gitleaksignore" > "${IGNORE_PATH}" 2>/dev/null; then
             echo "Using .gitleaksignore from base commit ${BASE_SHA:0:8}"
           else
             touch "${IGNORE_PATH}"
@@ -162,31 +256,33 @@ jobs:
           echo "GITLEAKS_CONFIG_PATH=${CONFIG_PATH}" >> "${GITHUB_ENV}"
           echo "GITLEAKS_IGNORE_PATH=${IGNORE_PATH}" >> "${GITHUB_ENV}"
 
-      - name: Scan PR diff for secrets
-        # Scans only the commits introduced by this PR (BASE..HEAD) so that
-        # pre-existing secrets in the repository's history do not block
-        # unrelated PRs. This workflow is designed as a pull_request gate;
-        # if HEAD_SHA is absent the step fails explicitly.
+      - name: Scan diff for secrets
+        # Scans only the commits in BASE..HEAD so that pre-existing secrets in
+        # history do not block unrelated PRs. BASE and HEAD are resolved by the
+        # "Resolve scan range" step above; an empty BASE means no trusted base
+        # exists (new default branch, root commit) and the full history is scanned.
         #
         # Note: `gitleaks git` takes the repository as a positional argument,
         # not via --source (which is a `detect` flag). Omitting it defaults to
         # the current directory.
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ steps.resolve-range.outputs.base }}
+          HEAD_SHA: ${{ steps.resolve-range.outputs.head }}
         run: |
-          if [ -z "${HEAD_SHA}" ]; then
-            echo "::error::HEAD_SHA is empty — this reusable requires a pull_request event." >&2
-            exit 1
+          if [ -n "${BASE_SHA}" ]; then
+            LOG_OPTS="${BASE_SHA}..${HEAD_SHA}"
+            echo "Scanning ${BASE_SHA:0:8}..${HEAD_SHA:0:8}"
+          else
+            LOG_OPTS="${HEAD_SHA}"
+            echo "Scanning the full history reachable from ${HEAD_SHA:0:8}"
           fi
-          echo "Scanning ${BASE_SHA:0:8}..${HEAD_SHA:0:8} (PR diff only)"
           # Remove .gitleaksignore from the working tree before scanning.
           # gitleaks auto-loads <source>/.gitleaksignore regardless of
           # --gitleaks-ignore-path. `rm -f` removes a symlink without
           # following it so a PR-committed symlink cannot redirect the removal.
           rm -f .gitleaksignore
           gitleaks git \
-            --log-opts "${BASE_SHA}..${HEAD_SHA}" \
+            --log-opts "${LOG_OPTS}" \
             --config "${GITLEAKS_CONFIG_PATH}" \
             --gitleaks-ignore-path "${GITLEAKS_IGNORE_PATH}" \
             --ignore-gitleaks-allow \
