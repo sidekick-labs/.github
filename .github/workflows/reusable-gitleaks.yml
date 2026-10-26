@@ -43,14 +43,15 @@ name: Gitleaks Secret Scan
 #   - Add CODEOWNERS protection on `.gitleaks.toml` and `.gitleaksignore` in
 #     each caller if you want to prevent a repo admin from self-reviewing an
 #     allowlist change to the base branch.
-#   - For `push` events, config is loaded from `github.event.before` (the previous
-#     tip of the pushed branch). A determined author could push an allowlist rule
-#     in one commit and a matching secret in a later push. Mitigation: load config
-#     from the merge-base with the default branch for push events (deferred).
+#   - For non-first `push` events, config is loaded from `github.event.before`
+#     (the previous tip of the branch). A determined author could land an
+#     allowlist rule in one push, then a matching secret in the next. For first
+#     pushes of a branch, config is loaded from the merge-base with the default
+#     branch, so a new branch cannot bring its own allowlist. The two-push bypass
+#     on non-first pushes is a known residual risk (tracked separately).
 #
-# USAGE: callers may trigger on `pull_request` and/or `push`. Using
-# `pull_request_target` will put the checkout on the base and make the
-# `BASE..HEAD` range error. `merge_group` events are rejected. Force-pushes
+# USAGE: callers may trigger on `pull_request` and/or `push`. `pull_request_target`
+# and `merge_group` are rejected immediately (unsupported event). Force-pushes
 # may make `github.event.before` unreachable in the clone; the job fails hard.
 #
 # Consume from a PR workflow:
@@ -210,7 +211,6 @@ jobs:
         env:
           BASE_SHA: ${{ steps.resolve-range.outputs.base }}
         run: |
-
           # Config: load from base or write a stub that extends built-in rules.
           CONFIG_PATH="${RUNNER_TEMP}/.gitleaks.toml"
           if [ -n "${BASE_SHA}" ] && git show "${BASE_SHA}:.gitleaks.toml" > "${CONFIG_PATH}" 2>/dev/null; then
