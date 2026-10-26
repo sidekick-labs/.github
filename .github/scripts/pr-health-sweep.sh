@@ -3,8 +3,7 @@
 # PR-health sweep — the two failure modes that make a PR look stuck when it is not.
 #
 # COMPLEMENTS dependabot-sweep.sh, which solves exactly these problems for
-# dependabot PRs only: it gates on `--author app/dependabot` and rebases via a
-# `@dependabot rebase` comment, a mechanism no other author has. Human- and
+# dependabot PRs only: it gates on `--author app/dependabot`. Human- and
 # agent-authored PRs hit the same two walls with nothing mopping up after them.
 #
 # PHASE 1 — ARMED BUT BEHIND.

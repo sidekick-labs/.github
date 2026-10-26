@@ -9,11 +9,24 @@
 #   Phase 1 (free): MERGE every dependabot PR the per-PR gate already APPROVED
 #                   (= confirmed minor/patch) that is CLEAN + MERGEABLE.
 #   Phase 2 (adaptive, minute-frugal): for the still-BEHIND approved ones,
-#                   rebase exactly ONE per repo per pass. (BEHIND only ever
+#                   update exactly ONE branch per repo per pass. (BEHIND only ever
 #                   appears on repos that REQUIRE up-to-date branches; non-strict
 #                   repos show CLEAN even when behind, so they land in Phase 1
-#                   with zero rebases.) One-per-repo keeps CI cost O(N), not the
-#                   O(N^2) thundering-herd you get from rebasing the whole stack.
+#                   with zero updates.) One-per-repo keeps CI cost O(N), not the
+#                   O(N^2) thundering-herd you get from updating the whole stack.
+#
+# Phase 2 uses the REST update-branch call (a GitHub-signed merge of the base
+# into the PR branch), NOT an `@dependabot rebase` comment. Dependabot only obeys
+# commands from users with push access, so the App's comments were answered with
+# "Sorry, only users with push access can use that command." and nothing moved:
+# sidekick-inference#409 collected four of those replies 10-24..10-26, and
+# rdp-client#226/#227 sat BEHIND for 7 days. The cost: once the branch carries a
+# non-Dependabot commit, Dependabot stops rebasing that PR itself. That is fine
+# here, because only already-armed PRs are updated and they land on green.
+#
+# GitHub computes mergeability lazily, so the first read of a PR nobody has
+# looked at lately returns UNKNOWN. A PR is re-read once after a short pause
+# before it is skipped; otherwise a quiet repo's PRs are skipped on every pass.
 #
 # Majors are never touched: they are not approved by the per-PR gate, so the
 # APPROVED filter skips them. DRY_RUN=true logs decisions, changes nothing.
@@ -30,9 +43,13 @@ echo "::endgroup::"
 declare -a READY=() BEHIND=()
 for row in "${ROWS[@]}"; do
   repo="${row%%$'\t'*}"; n="${row##*$'\t'}"
-  IFS=$'\t' read -r armed state mergeable < <(gh pr view "$n" -R "$repo" \
-    --json autoMergeRequest,mergeStateStatus,mergeable \
-    --jq '[(if .autoMergeRequest then "armed" else "no" end), .mergeStateStatus, .mergeable]|@tsv')
+  for attempt in 1 2; do
+    IFS=$'\t' read -r armed state mergeable head < <(gh pr view "$n" -R "$repo" \
+      --json autoMergeRequest,mergeStateStatus,mergeable,headRefOid \
+      --jq '[(if .autoMergeRequest then "armed" else "no" end), .mergeStateStatus, .mergeable, .headRefOid]|@tsv')
+    [ "$mergeable" = "UNKNOWN" ] && [ "$attempt" = 1 ] && [ "$armed" = "armed" ] || break
+    sleep 5   # mergeability is computed lazily; the first read kicked it off
+  done
   # Gate: act only on PRs the per-PR auto-merge already ARMED (= it confirmed
   # minor/patch + approved). reviewDecision is unreliable here (0 required
   # reviewers leaves it null even after the bot approves), so arming is the
@@ -41,7 +58,7 @@ for row in "${ROWS[@]}"; do
   if [ "$mergeable" != "MERGEABLE" ]; then echo "skip $repo#$n — $mergeable/$state"; continue; fi
   case "$state" in
     CLEAN)  READY+=("$repo#$n") ;;
-    BEHIND) BEHIND+=("$repo#$n") ;;
+    BEHIND) BEHIND+=("$repo#$n@$head") ;;
     *)      echo "wait $repo#$n — $state" ;;
   esac
 done
@@ -54,14 +71,18 @@ for pr in "${READY[@]}"; do
 done
 echo "::endgroup::"
 
-echo "::group::Phase 2 — rebase ONE behind per repo (${#BEHIND[@]} candidates)"
+echo "::group::Phase 2 — update ONE behind branch per repo (${#BEHIND[@]} candidates)"
 declare -A DONE=()
 for pr in "${BEHIND[@]}"; do
+  head="${pr##*@}"; pr="${pr%@*}"
   repo="${pr%#*}"; n="${pr#*#}"
-  if [ -n "${DONE[$repo]:-}" ]; then echo "defer $repo#$n — already rebased one in $repo this pass"; continue; fi
-  echo "rebase $repo#$n (strict+behind)"
-  [ "$DRY_RUN" = "true" ] || gh pr comment "$n" -R "$repo" --body "@dependabot rebase" >/dev/null
+  if [ -n "${DONE[$repo]:-}" ]; then echo "defer $repo#$n — already updated one in $repo this pass"; continue; fi
+  echo "update-branch $repo#$n (strict+behind)"
+  # expected_head_sha: if the branch moved since we read it, GitHub refuses (422)
+  # rather than merging into a head we never looked at.
+  [ "$DRY_RUN" = "true" ] || gh api -X PUT "repos/$repo/pulls/$n/update-branch" \
+    -f expected_head_sha="$head" >/dev/null || echo "  update-branch failed for $repo#$n"
   DONE[$repo]=1
 done
 echo "::endgroup::"
-echo "sweep complete (dry_run=$DRY_RUN): ready=${#READY[@]} behind-candidates=${#BEHIND[@]} repos-rebased=${#DONE[@]}"
+echo "sweep complete (dry_run=$DRY_RUN): ready=${#READY[@]} behind-candidates=${#BEHIND[@]} repos-updated=${#DONE[@]}"
