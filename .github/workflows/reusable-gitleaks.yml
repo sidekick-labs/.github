@@ -136,9 +136,13 @@ jobs:
         #               trust, so BASE is the merge-base with the default branch
         #               (every commit introduced by the push is scanned, and the
         #               config still comes from a commit the push did not write).
-        #               If that yields nothing usable (the default branch itself,
-        #               a root commit) BASE is left empty and the later steps scan
-        #               the full history with the stub config.
+        #               If the merge-base equals HEAD the branch was pushed at
+        #               the default branch's tip with no new commits; BASE is kept
+        #               equal to HEAD so gitleaks sees an empty scan range and
+        #               exits cleanly. If the merge-base cannot be found (root
+        #               commit, default branch itself, missing origin ref) BASE
+        #               is left empty and the later steps scan the full history
+        #               with the stub config.
         # Any other event fails fast.
         id: resolve-range
         env:
@@ -174,7 +178,11 @@ jobs:
                   base=""
                 fi
                 if [ "$base" = "$head" ]; then
-                  base=""
+                  # Branch was pushed at the default branch's tip: no new commits
+                  # to scan. Keep base equal to head so the scan range is empty.
+                  # Config is loaded from base (==head), which is the default-branch
+                  # tip — not the push-controlled tree.
+                  echo "::notice::No new commits: branch tip equals the merge-base with origin/${DEFAULT_BRANCH}. Scan range will be empty."
                 fi
               else
                 base="$PUSH_BEFORE"
