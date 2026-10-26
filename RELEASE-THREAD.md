@@ -54,12 +54,13 @@ before that staging callers were SHA-pinned and needed a 3-repo re-pin cascade).
 reusable/composite change — production *or* staging — is:
 
 1. Edit the reusable/composite on a branch, open a PR, merge to `.github` `main`.
-2. Advance the tag: `git tag -f v3 <merge-sha> && git push -f origin v3`.
-3. Done — every caller picks it up. **No caller re-pin PRs.**
+2. Done. `advance-major-tag.yml` moves `v3` to the merge commit, and every caller picks it up.
+   **No caller re-pin PRs.**
 
-`v3` is a *deliberately-advanced release pointer*, not auto-tracking `main`: move it only
-after the change is merged and you're ready for it to go live across all three repos.
-Third-party actions (checkout, create-github-app-token, upload-artifact) stay SHA-pinned.
+`v3` tracks `main`, so merging a reusable change *is* shipping it to all three repos: treat the
+`.github` PR review as the release gate. Bare `vN` tags are exempt from the org's immutable-tag
+ruleset so the workflow can move them. Third-party actions (checkout, create-github-app-token,
+upload-artifact) stay SHA-pinned.
 
 > Pin drift is moot under this model — all three callers pin `@v3` for both production and
 > staging. To verify:

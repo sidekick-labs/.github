@@ -72,10 +72,10 @@ checks must be green for branch protection to allow merge.
 
 ## Deploying
 
-Production deploys run through the shared
-[`deploy-production.yml`](https://github.com/sidekick-labs/.github/blob/main/.github/workflows/deploy-production.yml)
-workflow. Each app has its own caller config that wires DigitalOcean App
-Platform. See the per-repo deployment runbook in `docs/` if present.
+Production deploys run through the shared `reusable-promote-production.yml` and
+`reusable-deploy-production.yml` workflows, called at `@v3` from each app's
+`promote-production.yml` and `deploy-production.yml`. See [README.md](README.md)
+and [RELEASE-THREAD.md](RELEASE-THREAD.md).
 
 ## Security
 
