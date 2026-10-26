@@ -1,0 +1,116 @@
+name: Gitleaks Secret Scan
+
+# Reusable PR gate that fails when the gitleaks secret scanner finds credentials,
+# tokens or other high-entropy strings committed to the PR diff.
+#
+# Uses the gitleaks binary directly (not gitleaks-action) to avoid the
+# GITLEAKS_LICENSE that the action requires for GitHub Organisations. The binary
+# is SHA-pinned and checksum-verified at install time.
+#
+# False positives are suppressed by adding an allowlist rule to a
+# `.gitleaks.toml` file in the calling repo's root. Example:
+#
+#   [[allowlist.rules]]
+#   id          = "my-rule-id"
+#   description = "Test fixture — not a real credential"
+#   regexes     = ['MY_FAKE_SECRET_[0-9a-f]{32}']
+#
+# See https://github.com/gitleaks/gitleaks?tab=readme-ov-file#configuration
+#
+# Consume from a PR workflow:
+#
+#   jobs:
+#     gitleaks:
+#       name: Secret scan
+#       permissions:
+#         contents: read
+#       uses: sidekick-labs/.github/.github/workflows/reusable-gitleaks.yml@v3
+#       with:
+#         runner-label: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
+#
+# NOTE: sidekick-labs/.github uses moving release tags. App repos reference
+# reusables at @v3. After merging to main, advance the v3 tag:
+#   git tag -f v3 <merge-sha>
+#   git push origin v3 --force
+# (Report; do NOT advance the tag from this worktree.)
+#
+# Job permissions MUST NOT exceed `contents: read`. Callers that grant more
+# hit startup_failure on the reusable.
+
+on:
+  workflow_call:
+    inputs:
+      runner-label:
+        description: >-
+          Label of the runner to execute on. Defaults to ubuntu-latest, which is
+          safe for public callers: the homelab self-hosted runner groups carry
+          `allows_public_repositories: false`. Private callers on the fleet pass
+          their homelab label, e.g. `jdb`.
+        required: false
+        type: string
+        default: 'ubuntu-latest'
+
+permissions: {}
+
+jobs:
+  gitleaks:
+    name: Secret scan
+    runs-on: ${{ inputs.runner-label }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install gitleaks v8.30.1
+        # Binary is downloaded from GitHub Releases and verified against a
+        # pinned SHA-256 before extraction. No sudo or apt required.
+        # Both x86_64 and aarch64 Linux runners are covered.
+        env:
+          GITLEAKS_VERSION: "8.30.1"
+          GITLEAKS_X64_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+          GITLEAKS_ARM64_SHA256: "e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080"
+        run: |
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "aarch64" ]; then
+            ARCHIVE="gitleaks_${GITLEAKS_VERSION}_linux_arm64.tar.gz"
+            SHA256="${GITLEAKS_ARM64_SHA256}"
+          else
+            ARCHIVE="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+            SHA256="${GITLEAKS_X64_SHA256}"
+          fi
+          curl -sSfL \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${ARCHIVE}" \
+            -o "${RUNNER_TEMP}/gitleaks.tar.gz"
+          echo "${SHA256}  ${RUNNER_TEMP}/gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf "${RUNNER_TEMP}/gitleaks.tar.gz" -C "${RUNNER_TEMP}" gitleaks
+          echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
+
+      - name: Scan PR diff for secrets
+        # Scans only the commits introduced by this PR (BASE..HEAD) so that
+        # pre-existing secrets in the repository's history do not block
+        # unrelated PRs. Callers should add a `.gitleaks.toml` allowlist in
+        # their repo root to suppress confirmed false positives.
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ -n "${BASE_SHA}" ] && [ -n "${HEAD_SHA}" ]; then
+            echo "Scanning ${BASE_SHA:0:8}..${HEAD_SHA:0:8} (PR diff only)"
+            gitleaks detect \
+              --source . \
+              --log-opts "${BASE_SHA}..${HEAD_SHA}" \
+              --redact \
+              --verbose
+          else
+            echo "Not a pull_request event — scanning HEAD only."
+            gitleaks detect \
+              --source . \
+              --log-opts "HEAD~1..HEAD" \
+              --redact \
+              --verbose
+          fi
