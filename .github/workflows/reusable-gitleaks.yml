@@ -7,15 +7,13 @@ name: Gitleaks Secret Scan
 # GITLEAKS_LICENSE that the action requires for GitHub Organisations. The binary
 # is SHA-pinned and checksum-verified at install time.
 #
-# False positives are suppressed by adding an allowlist rule to a
-# `.gitleaks.toml` file in the calling repo's root. Example:
-#
-#   [[allowlist.rules]]
-#   id          = "my-rule-id"
-#   description = "Test fixture — not a real credential"
-#   regexes     = ['MY_FAKE_SECRET_[0-9a-f]{32}']
-#
-# See https://github.com/gitleaks/gitleaks?tab=readme-ov-file#configuration
+# ALLOWLIST NOTE: this workflow loads `.gitleaks.toml` from the PR *base* commit
+# (not the checked-out PR tree) so a PR cannot add both a secret and an allowlist
+# entry that hides it in the same diff. If no base config exists, the default
+# gitleaks rules apply. To suppress a confirmed false positive, add the allowlist
+# rule in a *separate* PR to the base branch before landing the PR with the
+# pattern. The PR body for that allowlist PR should cite the rule id and the
+# reason the pattern is safe.
 #
 # Consume from a PR workflow:
 #
@@ -28,14 +26,8 @@ name: Gitleaks Secret Scan
 #       with:
 #         runner-label: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
 #
-# NOTE: sidekick-labs/.github uses moving release tags. App repos reference
-# reusables at @v3. After merging to main, advance the v3 tag:
-#   git tag -f v3 <merge-sha>
-#   git push origin v3 --force
-# (Report; do NOT advance the tag from this worktree.)
-#
 # Job permissions MUST NOT exceed `contents: read`. Callers that grant more
-# hit startup_failure on the reusable.
+# hit startup_failure on the reusable (fundbright .github#78 post-mortem).
 
 on:
   workflow_call:
@@ -68,8 +60,10 @@ jobs:
 
       - name: Install gitleaks v8.30.1
         # Binary is downloaded from GitHub Releases and verified against a
-        # pinned SHA-256 before extraction. No sudo or apt required.
-        # Both x86_64 and aarch64 Linux runners are covered.
+        # pinned SHA-256 before extraction. No sudo or apt required —
+        # extraction goes to $RUNNER_TEMP, which is always writable.
+        # Both x86_64 and aarch64 Linux runners are covered; any other
+        # architecture fails explicitly.
         env:
           GITLEAKS_VERSION: "8.30.1"
           GITLEAKS_X64_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
@@ -79,38 +73,57 @@ jobs:
           if [ "$ARCH" = "aarch64" ]; then
             ARCHIVE="gitleaks_${GITLEAKS_VERSION}_linux_arm64.tar.gz"
             SHA256="${GITLEAKS_ARM64_SHA256}"
-          else
+          elif [ "$ARCH" = "x86_64" ]; then
             ARCHIVE="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
             SHA256="${GITLEAKS_X64_SHA256}"
+          else
+            echo "Unsupported architecture: $ARCH (expected x86_64 or aarch64)" >&2
+            exit 1
           fi
-          curl -sSfL \
+          curl -sSfL --retry 3 --retry-all-errors \
             "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${ARCHIVE}" \
             -o "${RUNNER_TEMP}/gitleaks.tar.gz"
           echo "${SHA256}  ${RUNNER_TEMP}/gitleaks.tar.gz" | sha256sum -c -
           tar -xzf "${RUNNER_TEMP}/gitleaks.tar.gz" -C "${RUNNER_TEMP}" gitleaks
           echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
 
+      - name: Resolve gitleaks config from base commit
+        # Load .gitleaks.toml from the PR's BASE commit so the PR branch
+        # cannot introduce an allowlist rule that hides a secret in the same diff.
+        # Falls back to no config (default gitleaks rules) if the file is absent.
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          CONFIG_FLAG=""
+          if [ -n "${BASE_SHA}" ]; then
+            if git show "${BASE_SHA}:.gitleaks.toml" > "${RUNNER_TEMP}/.gitleaks.toml" 2>/dev/null; then
+              echo "Using .gitleaks.toml from base commit ${BASE_SHA:0:8}"
+              CONFIG_FLAG="--config ${RUNNER_TEMP}/.gitleaks.toml"
+            else
+              echo "No .gitleaks.toml at base commit ${BASE_SHA:0:8} — using default rules"
+            fi
+          fi
+          echo "GITLEAKS_CONFIG_FLAG=${CONFIG_FLAG}" >> "${GITHUB_ENV}"
+
       - name: Scan PR diff for secrets
         # Scans only the commits introduced by this PR (BASE..HEAD) so that
         # pre-existing secrets in the repository's history do not block
-        # unrelated PRs. Callers should add a `.gitleaks.toml` allowlist in
-        # their repo root to suppress confirmed false positives.
+        # unrelated PRs. This workflow is designed as a pull_request gate;
+        # if BASE_SHA or HEAD_SHA are absent the step fails explicitly rather
+        # than silently passing an empty scan.
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          if [ -n "${BASE_SHA}" ] && [ -n "${HEAD_SHA}" ]; then
-            echo "Scanning ${BASE_SHA:0:8}..${HEAD_SHA:0:8} (PR diff only)"
-            gitleaks detect \
-              --source . \
-              --log-opts "${BASE_SHA}..${HEAD_SHA}" \
-              --redact \
-              --verbose
-          else
-            echo "Not a pull_request event — scanning HEAD only."
-            gitleaks detect \
-              --source . \
-              --log-opts "HEAD~1..HEAD" \
-              --redact \
-              --verbose
+          if [ -z "${BASE_SHA}" ] || [ -z "${HEAD_SHA}" ]; then
+            echo "::error::BASE_SHA or HEAD_SHA is empty — this reusable requires a pull_request event." >&2
+            exit 1
           fi
+          echo "Scanning ${BASE_SHA:0:8}..${HEAD_SHA:0:8} (PR diff only)"
+          # shellcheck disable=SC2086
+          gitleaks git \
+            --source . \
+            --log-opts "${BASE_SHA}..${HEAD_SHA}" \
+            --redact \
+            --verbose \
+            ${GITLEAKS_CONFIG_FLAG}
