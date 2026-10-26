@@ -14,13 +14,38 @@ name: Gitleaks Secret Scan
 #    `.gitleaks.toml` in a repo cannot ship a secret together with an allowlist
 #    rule for it. To suppress a confirmed false positive, land a `.gitleaks.toml`
 #    allowlist rule to the base branch BEFORE landing the PR with the pattern.
+#    Every caller `.gitleaks.toml` MUST include `[extend]\nuseDefault = true`;
+#    without it gitleaks runs with zero rules and passes every PR silently. The
+#    step fails explicitly if this is missing, so the error is visible.
+#    Note: allowlist syntax is `[[allowlists]]` (or per-rule `[[rules.allowlists]]`).
+#    Relative `[extend] path` entries resolve against `$RUNNER_TEMP`, where the
+#    config file is written — they will not resolve correctly.
 # 2. Inline allow-comments: `--ignore-gitleaks-allow` is passed so `# gitleaks:allow`
 #    inline comments in the PR's code cannot suppress a finding.
 # 3. `.gitleaksignore`: the ignore path is set from the base commit. If the base
 #    has no `.gitleaksignore`, an empty file is used so the PR cannot add one.
+#    gitleaks 8.30.1 auto-loads `<source>/.gitleaksignore` regardless of
+#    `--gitleaks-ignore-path` (verified by local test: a fingerprint placed in
+#    `<source>/.gitleaksignore` suppresses findings even when the explicit flag
+#    points at an empty file). To prevent a PR from adding its own fingerprints,
+#    the scan step removes `.gitleaksignore` from the working tree with `rm -f`
+#    before invoking gitleaks. `rm -f` removes a symlink itself without following
+#    it, which also closes the symlink-at-destination attack surface that a
+#    `cp`-based approach would expose.
 #
-# These controls require CODEOWNERS protection on `.gitleaks.toml` in callers if
-# you want to prevent a repo admin from self-reviewing an allowlist change.
+# RESIDUAL RISKS: these controls cover the workflow behaviour, but the gate is
+# only as strong as how callers wire it in:
+#   - Make "Secret scan" a REQUIRED STATUS CHECK in each caller repo (branch
+#     protection or ruleset). Without it a PR can skip the job entirely.
+#   - Protect `.github/workflows/` with CODEOWNERS in each caller (or a ruleset).
+#     Without it a PR can delete or modify the caller workflow to drop the job.
+#   - Add CODEOWNERS protection on `.gitleaks.toml` and `.gitleaksignore` in
+#     each caller if you want to prevent a repo admin from self-reviewing an
+#     allowlist change to the base branch.
+#
+# USAGE: trigger on `pull_request` only. Using `pull_request_target` will put the
+# checkout on the base and make the `BASE..HEAD` range error. `merge_group` events
+# will also fail the empty-SHA checks.
 #
 # Consume from a PR workflow:
 #
@@ -113,6 +138,13 @@ jobs:
           CONFIG_PATH="${RUNNER_TEMP}/.gitleaks.toml"
           if git show "${BASE_SHA}:.gitleaks.toml" > "${CONFIG_PATH}" 2>/dev/null; then
             echo "Using .gitleaks.toml from base commit ${BASE_SHA:0:8}"
+            # Guard: a base config without `[extend] useDefault = true` scans with
+            # zero rules and passes every PR silently. Fail fast so the problem is
+            # visible rather than a quiet false-negative.
+            if ! grep -Eq '^\s*useDefault\s*=\s*true' "${CONFIG_PATH}"; then
+              echo "::error::base .gitleaks.toml does not set '[extend] useDefault = true'. Without it gitleaks scans with zero built-in rules and will pass every PR. Add '[extend]\\nuseDefault = true' to the base config." >&2
+              exit 1
+            fi
           else
             printf '[extend]\nuseDefault = true\n' > "${CONFIG_PATH}"
             echo "No .gitleaks.toml at base commit ${BASE_SHA:0:8} — using built-in default rules"
@@ -129,12 +161,6 @@ jobs:
 
           echo "GITLEAKS_CONFIG_PATH=${CONFIG_PATH}" >> "${GITHUB_ENV}"
           echo "GITLEAKS_IGNORE_PATH=${IGNORE_PATH}" >> "${GITHUB_ENV}"
-
-          # Also overwrite the working tree's .gitleaksignore with the base
-          # version so that gitleaks's auto-load of <source>/.gitleaksignore
-          # (which happens even when --gitleaks-ignore-path is set) picks up the
-          # trusted base content, not whatever the PR introduced.
-          cp "${IGNORE_PATH}" .gitleaksignore
 
       - name: Scan PR diff for secrets
         # Scans only the commits introduced by this PR (BASE..HEAD) so that
@@ -154,6 +180,11 @@ jobs:
             exit 1
           fi
           echo "Scanning ${BASE_SHA:0:8}..${HEAD_SHA:0:8} (PR diff only)"
+          # Remove .gitleaksignore from the working tree before scanning.
+          # gitleaks auto-loads <source>/.gitleaksignore regardless of
+          # --gitleaks-ignore-path. `rm -f` removes a symlink without
+          # following it so a PR-committed symlink cannot redirect the removal.
+          rm -f .gitleaksignore
           gitleaks git \
             --log-opts "${BASE_SHA}..${HEAD_SHA}" \
             --config "${GITLEAKS_CONFIG_PATH}" \
