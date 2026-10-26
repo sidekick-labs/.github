@@ -130,11 +130,21 @@ jobs:
           echo "GITLEAKS_CONFIG_PATH=${CONFIG_PATH}" >> "${GITHUB_ENV}"
           echo "GITLEAKS_IGNORE_PATH=${IGNORE_PATH}" >> "${GITHUB_ENV}"
 
+          # Also overwrite the working tree's .gitleaksignore with the base
+          # version so that gitleaks's auto-load of <source>/.gitleaksignore
+          # (which happens even when --gitleaks-ignore-path is set) picks up the
+          # trusted base content, not whatever the PR introduced.
+          cp "${IGNORE_PATH}" .gitleaksignore
+
       - name: Scan PR diff for secrets
         # Scans only the commits introduced by this PR (BASE..HEAD) so that
         # pre-existing secrets in the repository's history do not block
         # unrelated PRs. This workflow is designed as a pull_request gate;
         # if HEAD_SHA is absent the step fails explicitly.
+        #
+        # Note: `gitleaks git` takes the repository as a positional argument,
+        # not via --source (which is a `detect` flag). Omitting it defaults to
+        # the current directory.
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -145,7 +155,6 @@ jobs:
           fi
           echo "Scanning ${BASE_SHA:0:8}..${HEAD_SHA:0:8} (PR diff only)"
           gitleaks git \
-            --source . \
             --log-opts "${BASE_SHA}..${HEAD_SHA}" \
             --config "${GITLEAKS_CONFIG_PATH}" \
             --gitleaks-ignore-path "${GITLEAKS_IGNORE_PATH}" \
