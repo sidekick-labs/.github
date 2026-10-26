@@ -88,9 +88,17 @@ jobs:
           echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
 
       - name: Resolve scan range
-        # Computes BASE_SHA and HEAD_SHA for the gitleaks log range.
-        # pull_request: use the PR base/head SHAs.
-        # push:         use github.event.before (or HEAD~1 on a first-push).
+        # Computes BASE and HEAD for the gitleaks log range.
+        # pull_request: the PR base/head SHAs.
+        # push:         github.event.before..github.sha. When `before` is all
+        #               zeros (first push of a branch) there is no prior tip to
+        #               trust, so BASE is the merge-base with the default branch
+        #               (every commit introduced by the push is scanned, and the
+        #               config still comes from a commit the push did not write).
+        #               If that yields nothing usable (the default branch itself,
+        #               a root commit) BASE is left empty and the later steps scan
+        #               the full history with the stub config.
+        # Any other event fails fast.
         id: resolve-range
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -98,6 +106,7 @@ jobs:
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
           PUSH_BEFORE: ${{ github.event.before }}
           PUSH_SHA: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           case "$EVENT_NAME" in
             pull_request)
@@ -107,9 +116,22 @@ jobs:
             push)
               head="$PUSH_SHA"
               if echo "$PUSH_BEFORE" | grep -qE '^0+$'; then
-                base="$(git rev-parse HEAD~1 2>/dev/null || echo "$head")"
+                base=""
+                if [ -n "$DEFAULT_BRANCH" ] && git fetch --quiet origin "$DEFAULT_BRANCH" 2>/dev/null; then
+                  base="$(git merge-base --quiet "origin/$DEFAULT_BRANCH" "$head" 2>/dev/null || true)"
+                fi
+                if [ -n "$base" ] && ! git rev-parse --verify --quiet "${base}^{commit}" >/dev/null; then
+                  base=""
+                fi
+                if [ "$base" = "$head" ]; then
+                  base=""
+                fi
               else
                 base="$PUSH_BEFORE"
+                if ! git rev-parse --verify --quiet "${base}^{commit}" >/dev/null; then
+                  echo "::error::github.event.before (${base:0:8}) is not reachable in this checkout; cannot establish a trusted base." >&2
+                  exit 1
+                fi
               fi
               ;;
             *)
@@ -117,9 +139,17 @@ jobs:
               exit 1
               ;;
           esac
+          if ! git rev-parse --verify --quiet "${head}^{commit}" >/dev/null; then
+            echo "::error::HEAD (${head:0:8}) is not present in this checkout." >&2
+            exit 1
+          fi
           echo "base=$base" >> "$GITHUB_OUTPUT"
           echo "head=$head" >> "$GITHUB_OUTPUT"
-          echo "Resolved: ${base:0:8}..${head:0:8} ($EVENT_NAME)"
+          if [ -n "$base" ]; then
+            echo "Resolved: ${base:0:8}..${head:0:8} ($EVENT_NAME)"
+          else
+            echo "No trusted base for ${head:0:8} ($EVENT_NAME): scanning full history with the built-in rules"
+          fi
 
       - name: Resolve gitleaks config from base commit
         # Load .gitleaks.toml from BASE so the diff under review cannot introduce
@@ -141,15 +171,22 @@ jobs:
 
       - name: Scan diff for secrets
         # Scans BASE..HEAD. BASE and HEAD are resolved by "Resolve scan range".
+        # An empty BASE means no trusted base exists; the full history is scanned.
         env:
           BASE_SHA: ${{ steps.resolve-range.outputs.base }}
           HEAD_SHA: ${{ steps.resolve-range.outputs.head }}
         run: |
-          echo "Scanning ${BASE_SHA:0:8}..${HEAD_SHA:0:8}"
+          if [ -n "${BASE_SHA}" ]; then
+            LOG_OPTS="${BASE_SHA}..${HEAD_SHA}"
+            echo "Scanning ${BASE_SHA:0:8}..${HEAD_SHA:0:8}"
+          else
+            LOG_OPTS="${HEAD_SHA}"
+            echo "Scanning the full history reachable from ${HEAD_SHA:0:8}"
+          fi
           # shellcheck disable=SC2086
           gitleaks git \
             --source . \
-            --log-opts "${BASE_SHA}..${HEAD_SHA}" \
+            --log-opts "${LOG_OPTS}" \
             --redact \
             --verbose \
             ${GITLEAKS_CONFIG_FLAG}
