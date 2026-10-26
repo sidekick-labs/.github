@@ -87,12 +87,46 @@ jobs:
           tar -xzf "${RUNNER_TEMP}/gitleaks.tar.gz" -C "${RUNNER_TEMP}" gitleaks
           echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
 
+      - name: Resolve scan range
+        # Computes BASE_SHA and HEAD_SHA for the gitleaks log range.
+        # pull_request: use the PR base/head SHAs.
+        # push:         use github.event.before (or HEAD~1 on a first-push).
+        id: resolve-range
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_SHA: ${{ github.sha }}
+        run: |
+          case "$EVENT_NAME" in
+            pull_request)
+              base="$PR_BASE"
+              head="$PR_HEAD"
+              ;;
+            push)
+              head="$PUSH_SHA"
+              if echo "$PUSH_BEFORE" | grep -qE '^0+$'; then
+                base="$(git rev-parse HEAD~1 2>/dev/null || echo "$head")"
+              else
+                base="$PUSH_BEFORE"
+              fi
+              ;;
+            *)
+              echo "::error::Unsupported event '${EVENT_NAME}'. This reusable supports pull_request and push." >&2
+              exit 1
+              ;;
+          esac
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+          echo "Resolved: ${base:0:8}..${head:0:8} ($EVENT_NAME)"
+
       - name: Resolve gitleaks config from base commit
-        # Load .gitleaks.toml from the PR's BASE commit so the PR branch
-        # cannot introduce an allowlist rule that hides a secret in the same diff.
+        # Load .gitleaks.toml from BASE so the diff under review cannot introduce
+        # an allowlist rule that hides a secret in the same change.
         # Falls back to no config (default gitleaks rules) if the file is absent.
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_SHA: ${{ steps.resolve-range.outputs.base }}
         run: |
           CONFIG_FLAG=""
           if [ -n "${BASE_SHA}" ]; then
@@ -105,21 +139,13 @@ jobs:
           fi
           echo "GITLEAKS_CONFIG_FLAG=${CONFIG_FLAG}" >> "${GITHUB_ENV}"
 
-      - name: Scan PR diff for secrets
-        # Scans only the commits introduced by this PR (BASE..HEAD) so that
-        # pre-existing secrets in the repository's history do not block
-        # unrelated PRs. This workflow is designed as a pull_request gate;
-        # if BASE_SHA or HEAD_SHA are absent the step fails explicitly rather
-        # than silently passing an empty scan.
+      - name: Scan diff for secrets
+        # Scans BASE..HEAD. BASE and HEAD are resolved by "Resolve scan range".
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ steps.resolve-range.outputs.base }}
+          HEAD_SHA: ${{ steps.resolve-range.outputs.head }}
         run: |
-          if [ -z "${BASE_SHA}" ] || [ -z "${HEAD_SHA}" ]; then
-            echo "::error::BASE_SHA or HEAD_SHA is empty — this reusable requires a pull_request event." >&2
-            exit 1
-          fi
-          echo "Scanning ${BASE_SHA:0:8}..${HEAD_SHA:0:8} (PR diff only)"
+          echo "Scanning ${BASE_SHA:0:8}..${HEAD_SHA:0:8}"
           # shellcheck disable=SC2086
           gitleaks git \
             --source . \
