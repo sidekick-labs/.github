@@ -73,9 +73,14 @@ jobs:
 > BuildKit mounts the secret at `/run/secrets/<id>` only for the duration
 > of the `RUN` step — it's never written to image layers.
 
-### `deploy-production.yml`
+### `reusable-promote-production.yml` + `reusable-deploy-production.yml`
 
-Promotes the main branch to production with release tagging and Sentry deploy notification.
+The production pipeline for sidekick-web, sidekick-harness and sidekick-inference. Promote verifies
+the target SHA is on `main` with green CI and an image in DOCR, then fast-forwards `production` and
+dispatches the app's own `deploy-production.yml`. That calls the deploy reusable, which deploys the
+image and, when the caller sets `create_release` and `notify_sentry`, cuts the `vYYYY.MM.DD.N` tag
+and GitHub Release and records the Sentry production deploy. See [RELEASE-THREAD.md](RELEASE-THREAD.md)
+for the Slack thread and the `@v3` pin model.
 
 ### `sentry-release.yml`
 
