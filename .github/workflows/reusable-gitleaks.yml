@@ -1,15 +1,16 @@
 name: Gitleaks Secret Scan
 
-# Reusable PR gate that fails when the gitleaks secret scanner finds credentials,
-# tokens or other high-entropy strings committed to the PR diff.
+# Reusable gate that fails when the gitleaks secret scanner finds credentials,
+# tokens or other high-entropy strings in commits introduced by a pull request
+# or pushed to any branch.
 #
 # Uses the gitleaks binary directly (not gitleaks-action) to avoid the
 # GITLEAKS_LICENSE that the action requires for GitHub Organisations. The binary
 # is SHA-pinned and checksum-verified at install time.
 #
 # BYPASS PROTECTION:
-# 1. Config: `.gitleaks.toml` is loaded from the PR's BASE commit (not the
-#    checked-out PR tree). When the base has no config, a minimal stub that
+# 1. Config: `.gitleaks.toml` is loaded from the BASE commit (not the
+#    checked-out tree). When the base has no config, a minimal stub that
 #    extends the built-in default rules is used — so the first PR to add a
 #    `.gitleaks.toml` in a repo cannot ship a secret together with an allowlist
 #    rule for it. To suppress a confirmed false positive, land a `.gitleaks.toml`
@@ -42,10 +43,15 @@ name: Gitleaks Secret Scan
 #   - Add CODEOWNERS protection on `.gitleaks.toml` and `.gitleaksignore` in
 #     each caller if you want to prevent a repo admin from self-reviewing an
 #     allowlist change to the base branch.
+#   - For `push` events, config is loaded from `github.event.before` (the previous
+#     tip of the pushed branch). A determined author could push an allowlist rule
+#     in one commit and a matching secret in a later push. Mitigation: load config
+#     from the merge-base with the default branch for push events (deferred).
 #
-# USAGE: trigger on `pull_request` only. Using `pull_request_target` will put the
-# checkout on the base and make the `BASE..HEAD` range error. `merge_group` events
-# will also fail the empty-SHA checks.
+# USAGE: callers may trigger on `pull_request` and/or `push`. Using
+# `pull_request_target` will put the checkout on the base and make the
+# `BASE..HEAD` range error. `merge_group` events are rejected. Force-pushes
+# may make `github.event.before` unreachable in the clone; the job fails hard.
 #
 # Consume from a PR workflow:
 #
@@ -146,13 +152,22 @@ jobs:
             pull_request)
               base="$PR_BASE"
               head="$PR_HEAD"
+              if [ -z "$base" ]; then
+                echo "::error::PR_BASE is empty — this reusable requires a non-empty pull_request base." >&2
+                exit 1
+              fi
+              if ! git rev-parse --verify --quiet "${base}^{commit}" >/dev/null; then
+                echo "::error::PR base SHA (${base:0:8}) is not present in this checkout." >&2
+                exit 1
+              fi
               ;;
             push)
               head="$PUSH_SHA"
               if echo "$PUSH_BEFORE" | grep -qE '^0+$'; then
                 base=""
-                if [ -n "$DEFAULT_BRANCH" ] && git fetch --quiet origin "$DEFAULT_BRANCH" 2>/dev/null; then
-                  base="$(git merge-base --quiet "origin/$DEFAULT_BRANCH" "$head" 2>/dev/null || true)"
+                # fetch-depth: 0 already populated refs/remotes/origin/*; no extra fetch needed.
+                if [ -n "$DEFAULT_BRANCH" ]; then
+                  base="$(git merge-base "origin/$DEFAULT_BRANCH" "$head" 2>/dev/null || true)"
                 fi
                 if [ -n "$base" ] && ! git rev-parse --verify --quiet "${base}^{commit}" >/dev/null; then
                   base=""
