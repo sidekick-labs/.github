@@ -34,9 +34,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          # Advance to main's CURRENT head, not this event's github.sha: runs can
+          # finish out of push order, and a re-run keeps its original sha, so
+          # using the event sha could move the tag backwards. main only moves
+          # forward (protected, no force pushes), so its head is always newest.
+          SHA="$(gh api "repos/$REPO/commits/main" --jq .sha)"
           # Highest existing bare major tag (v1, v2, v3, …). Ignores vN.M.P releases.
           MAJOR="$(gh api "repos/$REPO/tags" --paginate --jq '.[].name' \
             | grep -E '^v[0-9]+$' | sort -V | tail -1 || true)"
