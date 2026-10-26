@@ -15,7 +15,6 @@ updates:
       timezone: "Asia/Singapore"
     cooldown:
       default-days: 3
-      semver-major-days: 7
     groups:
       github-actions:
         patterns:
