@@ -574,7 +574,7 @@ outbound HTTPS to those registries.
 
 | Status | Licences | Effect |
 |---|---|---|
-| allow | MIT, ISC, BSD-2/3-Clause, 0BSD, Apache-2.0, BlueOak-1.0.0, Unlicense, CC0-1.0, Python-2.0/PSF-2.0, Ruby, Zlib, MPL-2.0, OFL-1.1, CC-BY-4.0 (data) | counted |
+| allow | MIT, MIT-0 (MIT without the attribution clause), ISC, BSD-2/3-Clause, 0BSD, Apache-2.0, BlueOak-1.0.0, Unlicense, CC0-1.0, Python-2.0/PSF-2.0, Ruby, Zlib, MPL-2.0, OFL-1.1, CC-BY-4.0 (data) | counted |
 | review | GPL/LGPL/EPL of any version; anything with no recognisable licence | listed in the summary |
 | block | AGPL, SSPL, BUSL, Commons Clause, Elastic, PolyForm, FSL, CC-BY-NC and other source-available or noncommercial licences | listed, plus a `::warning` annotation (`::error` and a failed job only with `fail-on-block: true`) |
 

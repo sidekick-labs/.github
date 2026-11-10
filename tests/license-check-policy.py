@@ -64,6 +64,9 @@ def load_module():
 POLICY = {
     # allowed
     "MIT": "allow",
+    "MIT-0": "allow",  # MIT without the attribution clause: org policy allow list
+    "(MIT-0 OR Apache-2.0)": "allow",
+    "MIT-0 AND GPL-3.0-only": "review",
     "Apache-2.0 WITH LLVM-exception": "allow",
     "(MIT OR CC0-1.0)": "allow",
     "MIT AND ISC": "allow",
