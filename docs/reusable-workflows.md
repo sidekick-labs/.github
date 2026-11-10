@@ -607,6 +607,8 @@ jobs:
         npm:sentry  # Sentry CLI (FSL-1.1-Apache-2.0): build-time sourcemap upload, internal use
 ```
 
+**Outputs** (counts, as strings): `allowed`, `review`, `blocked`, `excepted`. Read them from a calling job with `needs.<job>.outputs.blocked`. They never change the job's result: a report-only run with `blocked > 0` still succeeds.
+
 Each exception is one `<ecosystem>:<package>  # <reason>` line. It applies to
 every version, and the reason is shown in the summary. Keep exceptions to
 packages a licence review has cleared. The check landed report-only (licence
