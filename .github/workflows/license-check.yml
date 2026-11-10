@@ -19,7 +19,8 @@ name: License Check
 # a `review` row means "read that package's LICENSE", not "violation".
 #
 # The counts are also the workflow's outputs (`allowed`, `review`, `blocked`,
-# `excepted`), so a caller such as sre-brain's compliance watch can read them.
+# `excepted`), and `blocked`/`review` are uploaded as the run artifact
+# `licence-check-counts` (counts.json), which sre-brain's compliance watch reads.
 # The result goes to the job summary. The job does not fail unless the caller
 # sets `fail-on-block: true` -- it lands report-only (licence audit 2026-11-10)
 # and is not a required check. No paid GitHub feature (dependency review /
@@ -92,6 +93,7 @@ jobs:
         env:
           LICENSE_EXCEPTIONS: ${{ inputs.exceptions }}
           FAIL_ON_BLOCK: ${{ inputs.fail-on-block }}
+          LICENCE_COUNTS_FILE: ${{ runner.temp }}/licence-check-counts/counts.json
         run: |
           cat > "${RUNNER_TEMP}/license_check.py" <<'LICENSE_CHECK_EOF'
           #!/usr/bin/env python3
@@ -593,6 +595,15 @@ jobs:
                   with open(out_path, "a") as fh:
                       fh.write(f"allowed={counts['allow']}\nreview={counts['review']}\n"
                                f"blocked={counts['block']}\nexcepted={counts['excepted']}\n")
+              # The same counts as a JSON file, uploaded by the workflow as the run artifact
+              # `licence-check-counts`: sre-brain's compliance watch (check h) reads it over the
+              # Actions API, where job outputs are not visible. Contract: {"blocked": int, "review": int}.
+              counts_file = os.environ.get("LICENCE_COUNTS_FILE")
+              if counts_file:
+                  Path(counts_file).write_text(json.dumps({
+                      "blocked": sum(1 for p in pkgs if p.status == "block"),
+                      "review": sum(1 for p in pkgs if p.status == "review"),
+                  }) + "\n")
               summary = os.environ.get("GITHUB_STEP_SUMMARY")
               if summary:
                   with open(summary, "a") as fh:
@@ -611,4 +622,20 @@ jobs:
           if __name__ == "__main__":
               sys.exit(main())
           LICENSE_CHECK_EOF
+          mkdir -p "${RUNNER_TEMP}/licence-check-counts"
           python3 "${RUNNER_TEMP}/license_check.py" .
+
+      # The counts as a run artifact: sre-brain's compliance watch (check h) reads it
+      # over the Actions API, which cannot see job outputs. Contract (agreed with that
+      # check): artifact `licence-check-counts`, one JSON file {"blocked": n, "review": n}.
+      # Uploaded even when a blocking caller fails the check above, never when cancelled.
+      - name: Upload licence counts
+        # steps.check.outputs.blocked is set exactly when the script finished and wrote counts.json
+        # (hashFiles() cannot see runner.temp, which is outside the workspace).
+        if: ${{ !cancelled() && steps.check.outputs.blocked != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: licence-check-counts
+          path: ${{ runner.temp }}/licence-check-counts/counts.json
+          retention-days: 30
+          if-no-files-found: warn
