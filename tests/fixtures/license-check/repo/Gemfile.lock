@@ -1,0 +1,18 @@
+GEM
+  remote: https://rubygems.org/
+  specs:
+    actionpack (8.1.4)
+      rack
+    brakeman (8.1.0)
+      racc
+    racc (1.8.1)
+    rack (3.2.1)
+    rails (8.1.4)
+      actionpack
+
+PLATFORMS
+  ruby
+
+DEPENDENCIES
+  brakeman
+  rails
