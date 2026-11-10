@@ -202,6 +202,18 @@ def test_outputs(m) -> None:
     check("blocked count is non-zero for the fixture (AGPL rows)", int(got.get("blocked", 0)) > 0)
     check("writing outputs does not change the exit status", code == 0, f"exit {code}")
 
+    counts = pathlib.Path(tempfile.mkdtemp()) / "counts.json"
+    os.environ["LICENCE_COUNTS_FILE"] = str(counts)
+    try:
+        run_fixture(m)
+    finally:
+        os.environ.pop("LICENCE_COUNTS_FILE", None)
+    import json as _json
+    data = _json.loads(counts.read_text())
+    check("counts.json matches the compliance-watch contract exactly",
+          set(data) == {"blocked", "review"} and all(isinstance(v, int) for v in data.values())
+          and str(data["blocked"]) == got["blocked"] and str(data["review"]) == got["review"], str(data))
+
 
 def test_resilience(m) -> None:
     print("\nregistry failures and hostile metadata\n")
