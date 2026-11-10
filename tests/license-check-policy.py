@@ -186,6 +186,23 @@ def test_fixture(m) -> None:
     check("--fail-on-block exits 0 once every block is excepted", code == 0, f"exit {code}")
 
 
+def test_outputs(m) -> None:
+    print("\nGITHUB_OUTPUT counts (the reusable's outputs)\n")
+    out = pathlib.Path(tempfile.mkdtemp()) / "out"
+    out.write_text("")
+    os.environ["GITHUB_OUTPUT"] = str(out)
+    try:
+        code, _, rows = run_fixture(m)
+    finally:
+        os.environ.pop("GITHUB_OUTPUT", None)
+    got = dict(line.split("=", 1) for line in out.read_text().split())
+    want = {k: str(sum(1 for r in rows if r["status"] == s))
+            for k, s in (("allowed", "allow"), ("review", "review"), ("blocked", "block"), ("excepted", "excepted"))}
+    check("writes allowed/review/blocked/excepted to GITHUB_OUTPUT", got == want, f"{got} vs {want}")
+    check("blocked count is non-zero for the fixture (AGPL rows)", int(got.get("blocked", 0)) > 0)
+    check("writing outputs does not change the exit status", code == 0, f"exit {code}")
+
+
 def test_resilience(m) -> None:
     print("\nregistry failures and hostile metadata\n")
 
@@ -223,6 +240,7 @@ def main() -> int:
     test_policy(m)
     test_fixture(m)
     test_resilience(m)
+    test_outputs(m)
     print()
     if failures:
         print(f"{len(failures)} check(s) failed:")

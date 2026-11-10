@@ -18,6 +18,8 @@ name: License Check
 # classifiers counts as alternatives. Registry metadata is a lead, not proof:
 # a `review` row means "read that package's LICENSE", not "violation".
 #
+# The counts are also the workflow's outputs (`allowed`, `review`, `blocked`,
+# `excepted`), so a caller such as sre-brain's compliance watch can read them.
 # The result goes to the job summary. The job does not fail unless the caller
 # sets `fail-on-block: true` -- it lands report-only (licence audit 2026-11-10)
 # and is not a required check. No paid GitHub feature (dependency review /
@@ -50,6 +52,19 @@ on:
         description: 'Fail the job when an unexcepted package has a blocked licence. Off while the check is report-only.'
         type: boolean
         default: false
+    outputs:
+      allowed:
+        description: 'Number of locked packages whose licence the policy allows.'
+        value: ${{ jobs.license-check.outputs.allowed }}
+      review:
+        description: 'Number of packages to review (GPL/LGPL/EPL, or no recognisable licence).'
+        value: ${{ jobs.license-check.outputs.review }}
+      blocked:
+        description: 'Number of unexcepted packages whose licence the policy blocks. Non-zero is reported, not failed, unless fail-on-block is true.'
+        value: ${{ jobs.license-check.outputs.blocked }}
+      excepted:
+        description: 'Number of packages covered by a recorded exception.'
+        value: ${{ jobs.license-check.outputs.excepted }}
 
 permissions: {}
 
@@ -61,6 +76,11 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
+    outputs:
+      allowed: ${{ steps.check.outputs.allowed }}
+      review: ${{ steps.check.outputs.review }}
+      blocked: ${{ steps.check.outputs.blocked }}
+      excepted: ${{ steps.check.outputs.excepted }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -68,6 +88,7 @@ jobs:
           persist-credentials: false
 
       - name: Check licences against the org policy
+        id: check
         env:
           LICENSE_EXCEPTIONS: ${{ inputs.exceptions }}
           FAIL_ON_BLOCK: ${{ inputs.fail-on-block }}
@@ -564,6 +585,14 @@ jobs:
               evaluate(pkgs, parse_exceptions(args.exceptions))
 
               report = render(pkgs, [rel for _, rel, _ in found], args.fail_on_block)
+              # Counts for callers (e.g. sre-brain's compliance watch, check h), exposed as the
+              # reusable workflow's outputs. Behaviour-neutral: they change no exit status.
+              out_path = os.environ.get("GITHUB_OUTPUT")
+              if out_path:
+                  counts = {s: sum(1 for p in pkgs if p.status == s) for s in ("allow", "review", "block", "excepted")}
+                  with open(out_path, "a") as fh:
+                      fh.write(f"allowed={counts['allow']}\nreview={counts['review']}\n"
+                               f"blocked={counts['block']}\nexcepted={counts['excepted']}\n")
               summary = os.environ.get("GITHUB_STEP_SUMMARY")
               if summary:
                   with open(summary, "a") as fh:
