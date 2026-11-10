@@ -1,0 +1,40 @@
+name: Test license-check logic
+
+# Regression gate for license-check.yml's policy table, lockfile parsing and
+# exit-code contract (report-only by default, blocking only with
+# `fail-on-block`). The test extracts the inline script from the workflow and
+# runs it against tests/fixtures/license-check/ with registry lookups stubbed,
+# so it is network-free. Mirrors the path-filtered pattern of
+# test-audit-logic.yml.
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/license-check.yml'
+      - 'tests/license-check-policy.py'
+      - 'tests/fixtures/license-check/**'
+      - '.github/workflows/test-license-check.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/license-check.yml'
+      - 'tests/license-check-policy.py'
+      - 'tests/fixtures/license-check/**'
+      - '.github/workflows/test-license-check.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  license-check-logic:
+    name: License-check logic
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Run licence-check tests
+        run: python3 tests/license-check-policy.py

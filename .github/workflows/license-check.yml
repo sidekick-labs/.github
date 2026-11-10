@@ -1,0 +1,560 @@
+name: License Check
+
+# Reusable, REPORT-ONLY licence check over the calling repo's lockfiles.
+#
+# Reads every package-lock.json, Gemfile.lock, uv.lock and pip-compile
+# `requirements*.lock` in the caller (vendored trees skipped), resolves each
+# package's declared licence (the lockfile's own field where it has one, else
+# the npm / RubyGems / PyPI registry) and classifies it against the org policy:
+#
+#   allow   MIT, ISC, BSD-2/3-Clause, 0BSD, Apache-2.0, BlueOak-1.0.0, Unlicense,
+#           CC0-1.0, Python-2.0/PSF-2.0, Ruby, Zlib, MPL-2.0, OFL-1.1, CC-BY-4.0
+#   review  GPL / LGPL / EPL of any version, or no recognisable licence (warn)
+#   block   AGPL, SSPL, BUSL, Commons Clause, Elastic, PolyForm, FSL, CC-BY-NC
+#           and other source-available or noncommercial licences
+#
+# `A OR B` is judged by its more permissive side (the licensee chooses), `A AND
+# B` by its stricter one; a RubyGems licence list or a set of PyPI licence
+# classifiers counts as alternatives. Registry metadata is a lead, not proof:
+# a `review` row means "read that package's LICENSE", not "violation".
+#
+# The result goes to the job summary. The job does not fail unless the caller
+# sets `fail-on-block: true` -- it lands report-only (licence audit 2026-11-10)
+# and is not a required check. No paid GitHub feature (dependency review /
+# GHAS) is used; it needs only outbound HTTPS to the three registries.
+#
+# Consume from a PR workflow:
+#
+#   jobs:
+#     license-check:
+#       uses: sidekick-labs/.github/.github/workflows/license-check.yml@main
+#       with:
+#         exceptions: |
+#           npm:sentry  # Sentry CLI (FSL): build-time sourcemap upload, internal use
+#
+# `exceptions` is one `<ecosystem>:<package>  # <reason>` per line (ecosystem is
+# npm, rubygems or pypi; any version). Excepted packages are listed, with the
+# reason, under "Recorded exceptions" rather than counted.
+#
+# The script is inline (as in pin-check.yml) because a workflow_call job checks
+# out the CALLING repo; tests/license-check-policy.py extracts and tests it.
+
+on:
+  workflow_call:
+    inputs:
+      exceptions:
+        description: 'Recorded exceptions, one `<ecosystem>:<package>  # <reason>` per line.'
+        type: string
+        default: ''
+      fail-on-block:
+        description: 'Fail the job when an unexcepted package has a blocked licence. Off while the check is report-only.'
+        type: boolean
+        default: false
+
+permissions: {}
+
+jobs:
+  license-check:
+    name: Licence check
+    # Homelab-routable via the CALLER's RUNNER_LABEL (repo scope only; see claude-code-review.yml).
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check licences against the org policy
+        env:
+          LICENSE_EXCEPTIONS: ${{ inputs.exceptions }}
+          FAIL_ON_BLOCK: ${{ inputs.fail-on-block }}
+        run: |
+          cat > "${RUNNER_TEMP}/license_check.py" <<'LICENSE_CHECK_EOF'
+          #!/usr/bin/env python3
+          """Report-only licence check over a repository's lockfiles.
+
+          Reads every package-lock.json, Gemfile.lock, uv.lock and pip-compile
+          `requirements*.lock` under ROOT (skipping vendored trees), resolves each
+          package's declared licence (from the lockfile where it carries one, otherwise
+          from the npm, RubyGems or PyPI registry), and classifies it against the org
+          policy:
+
+              allow   permissive and weak-copyleft licences the org accepts
+              review  GPL/LGPL/EPL of any version, or no recognisable licence (warn)
+              block   network-copyleft, source-available and noncommercial licences
+
+          A licence expression is judged as written: `A OR B` takes the more permissive
+          side (the licensee may choose), `A AND B` the stricter. A RubyGems `licenses`
+          list and a PyPI classifier list are treated as alternatives (the convention
+          both registries use for dual licensing).
+
+          Exceptions name a package (any version) with a reason; they are reported but
+          not counted. The result is written as Markdown to $GITHUB_STEP_SUMMARY (or
+          stdout). Exit status is 0 unless --fail-on-block is given and a blocked,
+          unexcepted package exists: the check starts out report-only.
+
+          Registry metadata is a lead, not proof. A `review` row means "look at the
+          package's own LICENSE", not "this is a violation".
+          """
+
+          from __future__ import annotations
+
+          import argparse
+          import concurrent.futures
+          import json
+          import os
+          import re
+          import sys
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from dataclasses import dataclass, field
+          from pathlib import Path
+
+          try:
+              import tomllib
+          except ModuleNotFoundError:  # Python < 3.11
+              tomllib = None
+
+          SKIP_DIRS = {"node_modules", ".git", "vendor", ".worktrees", "dist", "build", "tmp", ".venv", "venv"}
+
+          ALLOW = {
+              "MIT", "MIT-0", "ISC", "BSD-2-CLAUSE", "BSD-3-CLAUSE", "0BSD", "APACHE-2.0",
+              "BLUEOAK-1.0.0", "UNLICENSE", "CC0-1.0", "PYTHON-2.0", "PSF-2.0", "RUBY",
+              "ZLIB", "MPL-2.0", "OFL-1.1", "CC-BY-4.0",
+          }
+          # Prefix families, matched after normalisation.
+          BLOCK_PREFIXES = ("AGPL", "SSPL", "BUSL", "COMMONS-CLAUSE", "ELASTIC", "POLYFORM", "FSL", "CC-BY-NC", "PROSPERITY", "NONCOMMERCIAL")
+          REVIEW_PREFIXES = ("GPL", "LGPL", "EPL")
+
+          # Common non-SPDX spellings seen in registry metadata.
+          ALIASES = {
+              "APACHE 2.0": "APACHE-2.0", "APACHE-2": "APACHE-2.0", "APACHE 2": "APACHE-2.0",
+              "APACHE LICENSE 2.0": "APACHE-2.0", "APACHE LICENSE, VERSION 2.0": "APACHE-2.0",
+              "APACHE LICENSE VERSION 2.0": "APACHE-2.0", "APACHE SOFTWARE LICENSE": "APACHE-2.0",
+              "APACHE 2.0 LICENSE": "APACHE-2.0", "THE APACHE SOFTWARE LICENSE, VERSION 2.0": "APACHE-2.0",
+              "MIT LICENSE": "MIT", "THE MIT LICENSE": "MIT", "EXPAT": "MIT",
+              "BSD LICENSE": "BSD-3-CLAUSE", "BSD": "BSD-3-CLAUSE", "NEW BSD": "BSD-3-CLAUSE",
+              "3-CLAUSE BSD LICENSE": "BSD-3-CLAUSE", "BSD-3": "BSD-3-CLAUSE", "BSD 3-CLAUSE": "BSD-3-CLAUSE",
+              "BSD-2": "BSD-2-CLAUSE", "SIMPLIFIED BSD": "BSD-2-CLAUSE", "BSD 2-CLAUSE": "BSD-2-CLAUSE",
+              "ISC LICENSE (ISCL)": "ISC", "ISC LICENSE": "ISC",
+              "PYTHON SOFTWARE FOUNDATION LICENSE": "PSF-2.0", "PSF": "PSF-2.0",
+              "MOZILLA PUBLIC LICENSE 2.0 (MPL 2.0)": "MPL-2.0",
+              "THE UNLICENSE (UNLICENSE)": "UNLICENSE", "PUBLIC DOMAIN": "UNLICENSE",
+              "CC0 1.0 UNIVERSAL (CC0 1.0) PUBLIC DOMAIN DEDICATION": "CC0-1.0",
+              "SIL OPEN FONT LICENSE 1.1 (OFL-1.1)": "OFL-1.1",
+              "GNU AFFERO GENERAL PUBLIC LICENSE V3 OR LATER (AGPLV3+)": "AGPL-3.0-OR-LATER",
+              "GNU AFFERO GENERAL PUBLIC LICENSE V3 (AGPLV3)": "AGPL-3.0-ONLY",
+              "GNU GENERAL PUBLIC LICENSE V3 (GPLV3)": "GPL-3.0-ONLY",
+              "GNU GENERAL PUBLIC LICENSE V2 (GPLV2)": "GPL-2.0-ONLY",
+              "GNU LESSER GENERAL PUBLIC LICENSE V3 (LGPLV3)": "LGPL-3.0-ONLY",
+              "GNU LIBRARY OR LESSER GENERAL PUBLIC LICENSE (LGPL)": "LGPL",
+              "COMMONS CLAUSE": "COMMONS-CLAUSE", "ELASTIC LICENSE 2.0": "ELASTIC-2.0",
+          }
+
+          RANK = {"allow": 0, "review": 1, "block": 2}
+
+
+          # Long-form licence names, as PyPI classifiers and old metadata spell them. Checked
+          # before expression parsing, because names such as "GNU General Public License v3
+          # or later" contain an `or` that is not an SPDX disjunction.
+          NAMED = (
+              (re.compile(r"AFFERO|\bAGPL", re.I), "block"),
+              (re.compile(r"SERVER SIDE PUBLIC|\bSSPL|BUSINESS SOURCE|\bBUSL|COMMONS CLAUSE|ELASTIC LICEN|POLYFORM|FUNCTIONAL SOURCE|NON-?COMMERCIAL", re.I), "block"),
+              (re.compile(r"LESSER GENERAL PUBLIC|LIBRARY GENERAL PUBLIC|GENERAL PUBLIC LICEN|\bL?GPL|ECLIPSE PUBLIC", re.I), "review"),
+              (re.compile(r"^MOZILLA PUBLIC LICENSE 2\.0", re.I), "allow"),
+          )
+
+
+          def classify_named(text: str) -> str | None:
+              if not re.search(r"\s(OR|AND)\s", text, re.I) or re.search(r"\bor later\b", text, re.I):
+                  for pattern, status in NAMED:
+                      if pattern.search(text) and not re.fullmatch(r"[\w.+-]+(\s+WITH\s+[\w.+-]+)?", text.strip()):
+                          return status
+              return None
+
+
+          def classify_token(token: str) -> str:
+              t = token.strip().strip("()").strip()
+              if not t:
+                  return "review"
+              named = classify_named(t)
+              if named:
+                  return named
+              u = re.sub(r"\s+", " ", t.upper())
+              u = re.sub(r"\s+WITH\s+.*$", "", u)  # `Apache-2.0 WITH LLVM-exception` -> base licence
+              u = ALIASES.get(u, u)
+              u = u.replace(" ", "-") if u not in ALLOW else u
+              if u.endswith("+"):
+                  u = u[:-1]
+              if u in ALLOW:
+                  return "allow"
+              if u.startswith(BLOCK_PREFIXES) or "NONCOMMERCIAL" in u or "NON-COMMERCIAL" in u:
+                  return "block"
+              if u.startswith(REVIEW_PREFIXES):
+                  return "review"
+              if u.startswith(("BSD-", "MIT-", "APACHE-2")) or u in {"BSD-STYLE", "MIT/X11"}:
+                  return "allow"
+              return "review"
+
+
+          def _split_top(expr: str, op: str) -> list[str]:
+              parts, depth, cur, i = [], 0, "", 0
+              pat = f" {op} "
+              while i < len(expr):
+                  c = expr[i]
+                  if c == "(":
+                      depth += 1
+                  elif c == ")":
+                      depth -= 1
+                  if depth == 0 and expr[i:i + len(pat)].upper() == pat:
+                      parts.append(cur)
+                      cur, i = "", i + len(pat)
+                      continue
+                  cur += c
+                  i += 1
+              parts.append(cur)
+              return [p.strip() for p in parts if p.strip()]
+
+
+          def classify_expression(expr: str) -> str:
+              """Classify an SPDX-ish expression: OR takes the best branch, AND the worst."""
+              e = expr.strip()
+              if re.search(r"\bor later\b", e, re.I) or e.upper() in ALIASES:
+                  return classify_token(e)
+              while e.startswith("(") and e.endswith(")") and _balanced(e[1:-1]):
+                  e = e[1:-1].strip()
+              ors = _split_top(e, "OR")
+              if len(ors) > 1:
+                  return min((classify_expression(p) for p in ors), key=RANK.__getitem__)
+              ands = _split_top(e, "AND")
+              if len(ands) > 1:
+                  return max((classify_expression(p) for p in ands), key=RANK.__getitem__)
+              return classify_token(e)
+
+
+          def _balanced(s: str) -> bool:
+              depth = 0
+              for c in s:
+                  depth += c == "("
+                  depth -= c == ")"
+                  if depth < 0:
+                      return False
+              return depth == 0
+
+
+          def classify_alternatives(licenses: list[str]) -> str:
+              """A registry list of licences is a choice: the most permissive wins."""
+              found = [lic for lic in licenses if lic and lic.strip()]
+              if not found:
+                  return "review"
+              return min((classify_expression(lic) for lic in found), key=RANK.__getitem__)
+
+
+          @dataclass
+          class Pkg:
+              ecosystem: str
+              name: str
+              version: str
+              scope: str
+              lockfile: str
+              licenses: list[str] = field(default_factory=list)
+              status: str = ""
+              reason: str = ""
+
+
+          # ---------- registry metadata (network) ----------
+
+          def _get_json(url: str) -> dict | None:
+              for attempt in range(3):
+                  try:
+                      req = urllib.request.Request(url, headers={"User-Agent": "sidekick-license-check", "Accept": "application/json"})
+                      with urllib.request.urlopen(req, timeout=20) as r:
+                          return json.load(r)
+                  except urllib.error.HTTPError as e:
+                      if e.code == 404:
+                          return None
+                      if e.code not in (429, 500, 502, 503, 504):
+                          return None
+                  except (urllib.error.URLError, TimeoutError, OSError):
+                      pass
+                  time.sleep(1 + attempt * 2)
+              return None
+
+
+          def npm_registry_licenses(name: str, version: str) -> list[str]:
+              d = _get_json(f"https://registry.npmjs.org/{urllib.parse.quote(name, safe='@')}/{urllib.parse.quote(version)}")
+              return _npm_license_field(d or {})
+
+
+          def _npm_license_field(d: dict) -> list[str]:
+              lic = d.get("license", d.get("licenses"))
+              if isinstance(lic, str):
+                  return [lic]
+              if isinstance(lic, dict):
+                  return [str(lic.get("type", ""))]
+              if isinstance(lic, list):
+                  out = [x if isinstance(x, str) else str(x.get("type", "")) for x in lic]
+                  return [" OR ".join(o for o in out if o)] if out else []
+              return []
+
+
+          def rubygems_licenses(name: str, version: str) -> list[str]:
+              d = _get_json(f"https://rubygems.org/api/v2/rubygems/{urllib.parse.quote(name)}/versions/{urllib.parse.quote(version)}.json")
+              return list((d or {}).get("licenses") or [])
+
+
+          def pypi_licenses(name: str, version: str) -> list[str]:
+              d = _get_json(f"https://pypi.org/pypi/{urllib.parse.quote(name)}/{urllib.parse.quote(version)}/json")
+              info = (d or {}).get("info") or {}
+              if info.get("license_expression"):
+                  return [info["license_expression"]]
+              classifiers = [c.split(" :: ")[-1] for c in info.get("classifiers") or [] if c.startswith("License ::") and c.count("::") >= 2]
+              classifiers = [c for c in classifiers if c not in ("OSI Approved",)]
+              if classifiers:
+                  return classifiers
+              lic = (info.get("license") or "").strip()
+              # A long `license` field is usually the whole licence text; keep only short names.
+              return [lic] if lic and len(lic) <= 60 and "\n" not in lic else []
+
+
+          # ---------- lockfile parsers ----------
+
+          def parse_package_lock(path: Path, rel: str) -> list[Pkg]:
+              d = json.loads(path.read_text())
+              out = []
+              for key, p in (d.get("packages") or {}).items():
+                  if not key or p.get("link") or "node_modules/" not in key:
+                      continue
+                  name = p.get("name") or key.rsplit("node_modules/", 1)[1]
+                  scope = "dev" if p.get("dev") or p.get("devOptional") else "prod"
+                  lic = _npm_license_field(p)
+                  out.append(Pkg("npm", name, p.get("version", ""), scope, rel, lic))
+              return out
+
+
+          def _gemfile_groups(gemfile: Path) -> dict[str, set[str]]:
+              groups: dict[str, set[str]] = {}
+              cur = ["default"]
+              if not gemfile.exists():
+                  return groups
+              for line in gemfile.read_text().splitlines():
+                  s = line.split("#", 1)[0].strip()
+                  m = re.match(r"group\s+(.+?)\s+do\b", s)
+                  if m:
+                      cur = re.findall(r":(\w+)", m.group(1)) or ["default"]
+                      continue
+                  if s == "end":
+                      cur = ["default"]
+                      continue
+                  m = re.match(r"gem\s+['\"]([^'\"]+)['\"](.*)", s)
+                  if m:
+                      g = set(cur)
+                      inline = re.search(r"group[s]?:\s*\[?([^\]]+)\]?", m.group(2))
+                      if inline:
+                          g = set(re.findall(r":(\w+)", inline.group(1))) or g
+                      groups.setdefault(m.group(1), set()).update(g)
+              return groups
+
+
+          def parse_gemfile_lock(path: Path, rel: str) -> list[Pkg]:
+              specs: dict[str, set[str]] = {}
+              deps: dict[str, set[str]] = {}
+              section, cur = None, None
+              for line in path.read_text().splitlines():
+                  if re.match(r"^[A-Z]", line):
+                      section = line.strip()
+                      continue
+                  if section in ("GEM", "GIT", "PATH"):
+                      m = re.match(r"^    (\S+) \(([^)]+)\)$", line)
+                      if m:
+                          ver = re.sub(r"-(x86_64|aarch64|arm64|arm|x86|universal|java)[-\w.]*$", "", m.group(2))
+                          cur = m.group(1)
+                          specs.setdefault(cur, set()).add(ver)
+                          deps.setdefault(cur, set())
+                          continue
+                      m = re.match(r"^      (\S+)", line)
+                      if m and cur:
+                          deps[cur].add(m.group(1))
+              groups = _gemfile_groups(path.with_name("Gemfile"))
+
+              def closure(roots):
+                  seen, stack = set(), list(roots)
+                  while stack:
+                      n = stack.pop()
+                      if n in seen or n not in specs:
+                          continue
+                      seen.add(n)
+                      stack.extend(deps.get(n, ()))
+                  return seen
+
+              prod = closure(g for g, gs in groups.items() if gs & {"default", "production"})
+              out = []
+              for name, versions in specs.items():
+                  scope = "prod" if name in prod or not groups else "dev/test"
+                  for v in versions:
+                      out.append(Pkg("rubygems", name, v, scope, rel))
+              return out
+
+
+          def parse_uv_lock(path: Path, rel: str) -> list[Pkg]:
+              if tomllib is None:
+                  return []
+              d = tomllib.loads(path.read_text())
+              out = []
+              for p in d.get("package", []):
+                  src = p.get("source") or {}
+                  if src.get("editable") or src.get("virtual"):
+                      continue
+                  out.append(Pkg("pypi", p["name"], p.get("version", ""), "unknown", rel))
+              return out
+
+
+          def parse_pip_lock(path: Path, rel: str) -> list[Pkg]:
+              out = []
+              for line in path.read_text().splitlines():
+                  m = re.match(r"^([A-Za-z0-9_.\-]+)(\[[^\]]*\])?==([^\s;\\]+)", line)
+                  if m:
+                      name = re.sub(r"[-_.]+", "-", m.group(1)).lower()
+                      out.append(Pkg("pypi", name, m.group(3).split("+")[0], "prod", rel))
+              return out
+
+
+          PARSERS = {
+              "package-lock.json": parse_package_lock,
+              "Gemfile.lock": parse_gemfile_lock,
+              "uv.lock": parse_uv_lock,
+          }
+
+
+          def discover(root: Path) -> list[tuple[Path, str, callable]]:
+              found = []
+              for dirpath, dirnames, filenames in os.walk(root):
+                  dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+                  for f in sorted(filenames):
+                      parser = PARSERS.get(f)
+                      if parser is None and re.match(r"requirements.*\.lock$", f):
+                          parser = parse_pip_lock
+                      if parser:
+                          p = Path(dirpath) / f
+                          found.append((p, str(p.relative_to(root)), parser))
+              return found
+
+
+          # ---------- exceptions ----------
+
+          def parse_exceptions(text: str) -> dict[tuple[str, str], str]:
+              """Lines of `<ecosystem>:<name>  # <reason>`; blank lines and pure comments ignored."""
+              out = {}
+              for raw in (text or "").splitlines():
+                  line = raw.strip()
+                  if not line or line.startswith("#"):
+                      continue
+                  spec, _, reason = line.partition("#")
+                  eco, _, name = spec.strip().partition(":")
+                  if eco and name:
+                      out[(eco.strip().lower(), name.strip())] = reason.strip() or "no reason given"
+              return out
+
+
+          # ---------- main ----------
+
+          FETCHERS = {"npm": npm_registry_licenses, "rubygems": rubygems_licenses, "pypi": pypi_licenses}
+
+
+          def resolve(pkgs: list[Pkg], offline: bool = False) -> None:
+              todo = sorted({(p.ecosystem, p.name, p.version) for p in pkgs if not p.licenses})
+              meta: dict[tuple[str, str, str], list[str]] = {}
+              if todo and not offline:
+                  with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                      futures = {pool.submit(FETCHERS[e], n, v): (e, n, v) for e, n, v in todo}
+                      for fut in concurrent.futures.as_completed(futures):
+                          meta[futures[fut]] = fut.result()
+              for p in pkgs:
+                  if not p.licenses:
+                      p.licenses = meta.get((p.ecosystem, p.name, p.version), [])
+
+
+          def evaluate(pkgs: list[Pkg], exceptions: dict[tuple[str, str], str]) -> None:
+              for p in pkgs:
+                  reason = exceptions.get((p.ecosystem, p.name))
+                  if reason:
+                      p.status, p.reason = "excepted", reason
+                      continue
+                  p.status = classify_alternatives(p.licenses)
+                  if p.status == "review" and not p.licenses:
+                      p.reason = "no licence declared in lockfile or registry"
+
+
+          def render(pkgs: list[Pkg], lockfiles: list[str], fail_on_block: bool) -> str:
+              def lic(p):
+                  return " | ".join(p.licenses) if p.licenses else "(none found)"
+
+              counts = {s: sum(1 for p in pkgs if p.status == s) for s in ("allow", "review", "block", "excepted")}
+              mode = "blocking" if fail_on_block else "report-only (does not fail the build)"
+              lines = [
+                  "## Licence check",
+                  "",
+                  f"Mode: **{mode}**. Lockfiles read: " + (", ".join(f"`{f}`" for f in lockfiles) or "none found") + ".",
+                  "",
+                  f"| Allowed | Review | Blocked | Excepted |\n|---:|---:|---:|---:|\n| {counts['allow']} | {counts['review']} | {counts['block']} | {counts['excepted']} |",
+                  "",
+                  "Registry licence metadata is a lead, not proof: check a package's own LICENSE before acting on a row.",
+              ]
+              for status, title in (("block", "Blocked (source-available, noncommercial or network-copyleft)"),
+                                    ("review", "Review (GPL/LGPL/EPL, or no recognisable licence)"),
+                                    ("excepted", "Recorded exceptions")):
+                  rows = sorted((p for p in pkgs if p.status == status), key=lambda p: (p.lockfile, p.name, p.version))
+                  if not rows:
+                      continue
+                  lines += ["", f"### {title}", "", "| Package | Licence | Scope | Lockfile | Note |", "|---|---|---|---|---|"]
+                  for p in rows:
+                      note = p.reason.replace("|", "/")
+                      lines.append(f"| `{p.ecosystem}:{p.name}@{p.version}` | {lic(p).replace('|', '/')} | {p.scope} | `{p.lockfile}` | {note} |")
+              return "\n".join(lines) + "\n"
+
+
+          def main(argv: list[str] | None = None) -> int:
+              ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+              ap.add_argument("root", nargs="?", default=".")
+              ap.add_argument("--exceptions", default=os.environ.get("LICENSE_EXCEPTIONS", ""))
+              ap.add_argument("--fail-on-block", action="store_true", default=os.environ.get("FAIL_ON_BLOCK", "").lower() == "true")
+              ap.add_argument("--offline", action="store_true", help="use lockfile metadata only (tests)")
+              ap.add_argument("--json", help="also write rows as JSON to this path")
+              args = ap.parse_args(argv)
+
+              root = Path(args.root).resolve()
+              found = discover(root)
+              pkgs: list[Pkg] = []
+              for path, rel, parser in found:
+                  try:
+                      pkgs += parser(path, rel)
+                  except Exception as e:  # a malformed lockfile must not hide the others
+                      print(f"::warning file={rel}::could not parse {rel}: {e}")
+              resolve(pkgs, offline=args.offline)
+              evaluate(pkgs, parse_exceptions(args.exceptions))
+
+              report = render(pkgs, [rel for _, rel, _ in found], args.fail_on_block)
+              summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary:
+                  with open(summary, "a") as fh:
+                      fh.write(report)
+              print(report)
+              if args.json:
+                  Path(args.json).write_text(json.dumps([p.__dict__ for p in pkgs], indent=1))
+
+              blocked = [p for p in pkgs if p.status == "block"]
+              for p in blocked:
+                  level = "error" if args.fail_on_block else "warning"
+                  print(f"::{level} file={p.lockfile}::{p.ecosystem}:{p.name}@{p.version} is licensed {' | '.join(p.licenses)}, which the org licence policy blocks")
+              return 1 if (blocked and args.fail_on_block) else 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          LICENSE_CHECK_EOF
+          python3 "${RUNNER_TEMP}/license_check.py" .

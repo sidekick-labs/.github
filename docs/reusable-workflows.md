@@ -30,6 +30,10 @@ Available reusable workflows:
   index, orphans; warn → block ratchet) and a weekly report-only `covers:` drift
   report. See [Docs hygiene](#docs-hygiene).
 
+- **`license-check.yml`** — REPORT-ONLY licence check over the caller's
+  lockfiles against the org licence policy; summary in the job summary, never
+  fails unless `fail-on-block: true`. See [Licence check](#licence-check).
+
 > **Removed:** `reusable-sentry-autofix.yml` — the Sentry autofix moved to the
 > one-workflow-per-org model: `sidekick-labs/sre-brain`'s `sentry-sweep.yml` +
 > `sentry-autofix-engine.yml` now run the triage/fix cross-repo via the
@@ -558,3 +562,55 @@ jobs:
 
 The check reports as `Sentry fix-trailer check / Sentry fix-trailer check`.
 Its runner follows the caller's `vars.RUNNER_LABEL`, else `ubuntu-latest`.
+
+## Licence check
+
+`license-check.yml` reads every `package-lock.json`, `Gemfile.lock`, `uv.lock`
+and pip-compile `requirements*.lock` in the calling repo (`node_modules`,
+`vendor`, `.worktrees` and build output skipped). It takes each package's
+declared licence from the lockfile where it carries one, and from the npm,
+RubyGems or PyPI registry otherwise. It needs no paid GitHub feature, only
+outbound HTTPS to those registries.
+
+| Status | Licences | Effect |
+|---|---|---|
+| allow | MIT, ISC, BSD-2/3-Clause, 0BSD, Apache-2.0, BlueOak-1.0.0, Unlicense, CC0-1.0, Python-2.0/PSF-2.0, Ruby, Zlib, MPL-2.0, OFL-1.1, CC-BY-4.0 (data) | counted |
+| review | GPL/LGPL/EPL of any version; anything with no recognisable licence | listed in the summary |
+| block | AGPL, SSPL, BUSL, Commons Clause, Elastic, PolyForm, FSL, CC-BY-NC and other source-available or noncommercial licences | listed, plus a `::warning` annotation (`::error` and a failed job only with `fail-on-block: true`) |
+
+`A OR B` takes the more permissive side, `A AND B` the stricter. A RubyGems
+licence list and PyPI licence classifiers count as alternatives. Google SDK
+terms (Android/iOS) are outside its reach: Gradle and SwiftPM projects here
+have no lockfile it can read.
+
+Registry metadata is a lead, not proof. A `review` row asks someone to read the
+package's own LICENSE.
+
+```yaml
+# .github/workflows/license-check.yml in the consuming repo
+name: License Check
+on:
+  pull_request:
+    paths: ['**/package-lock.json', '**/Gemfile.lock', '**/uv.lock', '**/requirements*.lock', '.github/workflows/license-check.yml']
+  push:
+    branches: [main]
+    paths: ['**/package-lock.json', '**/Gemfile.lock', '**/uv.lock', '**/requirements*.lock']
+  workflow_dispatch:
+permissions: {}
+jobs:
+  license-check:
+    uses: sidekick-labs/.github/.github/workflows/license-check.yml@main
+    permissions:
+      contents: read
+    with:
+      exceptions: |
+        npm:sentry  # Sentry CLI (FSL-1.1-Apache-2.0): build-time sourcemap upload, internal use
+```
+
+Each exception is one `<ecosystem>:<package>  # <reason>` line. It applies to
+every version, and the reason is shown in the summary. Keep exceptions to
+packages a licence review has cleared. The check landed report-only (licence
+audit 2026-11-10). Turning on `fail-on-block` or making it a required check is
+a separate decision. Tests: `tests/license-check-policy.py`, run by
+`test-license-check.yml`.
+
