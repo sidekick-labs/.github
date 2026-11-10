@@ -79,6 +79,13 @@ POLICY = {
     "MPL-2.0": "allow",
     "Mozilla Public License 2.0 (MPL 2.0)": "allow",
     "Apache Software License": "allow",
+    # Long-form names ending in a parenthesised short name: the suffix must survive
+    # (stripping its ")" once made these miss their alias and read as "review").
+    "ISC License (ISCL)": "allow",
+    "The Unlicense (Unlicense)": "allow",
+    "(MIT)": "allow",
+    "((Apache-2.0))": "allow",
+    "GNU Affero General Public License v3 (AGPLv3)": "block",
     # review (warn)
     "GPL-3.0-only": "review",
     "LGPL-3.0-or-later": "review",

@@ -179,8 +179,16 @@ jobs:
               return None
 
 
+          def _unwrap(text: str) -> str:
+              """Drop parentheses that wrap the WHOLE token, never a trailing "(ISCL)"-style suffix."""
+              t = text.strip()
+              while t.startswith("(") and t.endswith(")") and _balanced(t[1:-1]):
+                  t = t[1:-1].strip()
+              return t
+
+
           def classify_token(token: str) -> str:
-              t = token.strip().strip("()").strip()
+              t = _unwrap(token)
               if not t:
                   return "review"
               named = classify_named(t)
