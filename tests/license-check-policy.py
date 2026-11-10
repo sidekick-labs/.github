@@ -117,7 +117,12 @@ def run_fixture(m, *args: str, env_exceptions: str = "") -> tuple[int, str, list
         "brakeman": ["Brakeman Public Use License"],
     }.get(name, [])
     m.FETCHERS["npm"] = lambda name, version: []
-    m.FETCHERS["pypi"] = lambda name, version: []
+    m.FETCHERS["pypi"] = lambda name, version: {
+        "uvicorn": ["BSD-3-Clause"], "torch": ["BSD-3-Clause"],
+        "agpl-thing": ["GNU Affero General Public License v3 or later (AGPLv3+)"],
+        # Classifier lists are ambiguous, not a declared choice: MIT must not hide AGPL.
+        "ambiguous-pkg": ["MIT License", "GNU Affero General Public License v3 (AGPLv3)"],
+    }.get(name, [])
     out_json = pathlib.Path(tempfile.mkdtemp()) / "rows.json"
     os.environ.pop("GITHUB_STEP_SUMMARY", None)
     buf = io.StringIO()
@@ -147,6 +152,14 @@ def test_fixture(m) -> None:
           "::warning file=package-lock.json::npm:agpl-lib@1.0.0" in report)
     check("summary names the mode", "report-only (does not fail the build)" in report)
 
+    check("pip lock: extras, --hash continuations and +local versions parsed",
+          by.get(("pypi", "uvicorn"), {}).get("version") == "0.30.1" and by.get(("pypi", "torch"), {}).get("version") == "2.14.1"
+          and not any(r["name"].startswith("--hash") for r in rows))
+    check("pip lock: long-form AGPL classifier blocked", by.get(("pypi", "agpl-thing"), {}).get("status") == "block")
+    check("uv.lock: editable root skipped", ("pypi", "fixture") not in by)
+    check("PyPI classifier list with a blocked licence is review, not allow",
+          by.get(("pypi", "ambiguous-pkg"), {}).get("status") == "review")
+
     code, report, rows = run_fixture(
         m, env_exceptions="npm:fsl-cli  # build-time internal use\nrubygems:brakeman  # dev/CI tool\n# a comment line\n"
     )
@@ -159,14 +172,47 @@ def test_fixture(m) -> None:
     check("--fail-on-block exits 1 on a blocked, unexcepted package", code == 1, f"exit {code}")
     check("--fail-on-block announces blocks as errors", "::error file=package-lock.json::npm:agpl-lib@1.0.0" in report)
 
-    code, _, _ = run_fixture(m, "--fail-on-block", env_exceptions="npm:fsl-cli # x\nnpm:agpl-lib # x")
+    code, _, _ = run_fixture(m, "--fail-on-block", env_exceptions="npm:fsl-cli # x\nnpm:agpl-lib # x\npypi:agpl-thing # x")
     check("--fail-on-block exits 0 once every block is excepted", code == 0, f"exit {code}")
+
+
+def test_resilience(m) -> None:
+    print("\nregistry failures and hostile metadata\n")
+
+    def boom(name, version):
+        raise ValueError("HTML 200 from a proxy instead of JSON")
+
+    real = dict(m.FETCHERS)
+    m.FETCHERS["rubygems"] = boom
+    m.FETCHERS["npm"] = lambda name, version: []
+    m.FETCHERS["pypi"] = lambda name, version: []
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = m.main([str(FIXTURE)])
+    check("a fetcher that raises does not crash the run (exit 0)", code == 0, f"exit {code}")
+    check("the raising package lands in review instead", "rubygems:rails@8.1.4" in buf.getvalue())
+    m.FETCHERS.update(real)
+
+    class Resp:
+        def __enter__(self): return io.BytesIO(b"<html>not json</html>")
+        def __exit__(self, *a): return False
+    orig_urlopen, orig_sleep = m.urllib.request.urlopen, m.time.sleep
+    m.urllib.request.urlopen = lambda *a, **k: Resp()
+    m.time.sleep = lambda _s: None
+    try:
+        check("_get_json returns None on a non-JSON 200", m._get_json("https://example.invalid/x") is None)
+    finally:
+        m.urllib.request.urlopen, m.time.sleep = orig_urlopen, orig_sleep
+
+    hostile = "MIT\n::error::injected %0A `x` | y"
+    check("clean() strips newlines, %, backticks and pipes", all(c not in m.clean(hostile) for c in "\n%`|"))
 
 
 def main() -> int:
     m = load_module()
     test_policy(m)
     test_fixture(m)
+    test_resilience(m)
     print()
     if failures:
         print(f"{len(failures)} check(s) failed:")

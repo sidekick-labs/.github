@@ -104,6 +104,7 @@ jobs:
 
           import argparse
           import concurrent.futures
+          import http.client
           import json
           import os
           import re
@@ -270,19 +271,22 @@ jobs:
           # ---------- registry metadata (network) ----------
 
           def _get_json(url: str) -> dict | None:
-              for attempt in range(3):
+              """Fetch JSON, retrying transient failures. Never raises: a registry or proxy that
+              answers with an HTML page or a truncated body is a missing lead, not a crash."""
+              attempts = 3
+              for attempt in range(attempts):
                   try:
                       req = urllib.request.Request(url, headers={"User-Agent": "sidekick-license-check", "Accept": "application/json"})
                       with urllib.request.urlopen(req, timeout=20) as r:
-                          return json.load(r)
+                          data = json.load(r)
+                      return data if isinstance(data, dict) else None
                   except urllib.error.HTTPError as e:
-                      if e.code == 404:
-                          return None
                       if e.code not in (429, 500, 502, 503, 504):
                           return None
-                  except (urllib.error.URLError, TimeoutError, OSError):
+                  except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError, ValueError):
                       pass
-                  time.sleep(1 + attempt * 2)
+                  if attempt < attempts - 1:
+                      time.sleep(1 + attempt * 2)
               return None
 
 
@@ -403,6 +407,7 @@ jobs:
 
           def parse_uv_lock(path: Path, rel: str) -> list[Pkg]:
               if tomllib is None:
+                  print(f"::warning file={rel}::{rel} not read: this runner's Python has no tomllib (needs 3.11+)")
                   return []
               d = tomllib.loads(path.read_text())
               out = []
@@ -473,7 +478,10 @@ jobs:
                   with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
                       futures = {pool.submit(FETCHERS[e], n, v): (e, n, v) for e, n, v in todo}
                       for fut in concurrent.futures.as_completed(futures):
-                          meta[futures[fut]] = fut.result()
+                          try:
+                              meta[futures[fut]] = fut.result()
+                          except Exception:  # one bad response must not discard the whole report
+                              meta[futures[fut]] = []
               for p in pkgs:
                   if not p.licenses:
                       p.licenses = meta.get((p.ecosystem, p.name, p.version), [])
@@ -488,11 +496,21 @@ jobs:
                   p.status = classify_alternatives(p.licenses)
                   if p.status == "review" and not p.licenses:
                       p.reason = "no licence declared in lockfile or registry"
+                  # PyPI classifiers are not a declared choice the way an SPDX `OR` is: a package
+                  # tagged both MIT and AGPL is ambiguous, so never let the permissive tag hide it.
+                  if (p.ecosystem == "pypi" and len(p.licenses) > 1 and p.status != "block"
+                          and any(classify_expression(lic) == "block" for lic in p.licenses)):
+                      p.status, p.reason = "review", "classifiers include a blocked licence"
+
+
+          def clean(text: str) -> str:
+              """Registry-supplied text, made safe for a workflow command or a Markdown cell."""
+              return re.sub(r"[\r\n%`|]", " ", text)
 
 
           def render(pkgs: list[Pkg], lockfiles: list[str], fail_on_block: bool) -> str:
               def lic(p):
-                  return " | ".join(p.licenses) if p.licenses else "(none found)"
+                  return clean(" / ".join(p.licenses)) if p.licenses else "(none found)"
 
               counts = {s: sum(1 for p in pkgs if p.status == s) for s in ("allow", "review", "block", "excepted")}
               mode = "blocking" if fail_on_block else "report-only (does not fail the build)"
@@ -513,8 +531,7 @@ jobs:
                       continue
                   lines += ["", f"### {title}", "", "| Package | Licence | Scope | Lockfile | Note |", "|---|---|---|---|---|"]
                   for p in rows:
-                      note = p.reason.replace("|", "/")
-                      lines.append(f"| `{p.ecosystem}:{p.name}@{p.version}` | {lic(p).replace('|', '/')} | {p.scope} | `{p.lockfile}` | {note} |")
+                      lines.append(f"| `{clean(f'{p.ecosystem}:{p.name}@{p.version}')}` | {lic(p)} | {p.scope} | `{clean(p.lockfile)}` | {clean(p.reason)} |")
               return "\n".join(lines) + "\n"
 
 
@@ -550,7 +567,7 @@ jobs:
               blocked = [p for p in pkgs if p.status == "block"]
               for p in blocked:
                   level = "error" if args.fail_on_block else "warning"
-                  print(f"::{level} file={p.lockfile}::{p.ecosystem}:{p.name}@{p.version} is licensed {' | '.join(p.licenses)}, which the org licence policy blocks")
+                  print(f"::{level} file={clean(p.lockfile)}::{clean(f'{p.ecosystem}:{p.name}@{p.version}')} is licensed {clean(' / '.join(p.licenses))}, which the org licence policy blocks")
               return 1 if (blocked and args.fail_on_block) else 0
 
 
