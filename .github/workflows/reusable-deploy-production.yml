@@ -195,6 +195,9 @@ jobs:
           app_id: ${{ inputs.app_id }}
           image_repo: ${{ inputs.image_repo }}
           deploy_sha: ${{ env.DEPLOY_SHA }}
+          # The appspec GET/PUT goes straight to the DO REST API (no doctl in the
+          # spec path), so the action needs the token itself.
+          do_token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
           # Live per-phase thread updates. All no-op unless the caller wired a
           # channel + thread_ts + the bot token (production path only).
           slack_bot_token: ${{ secrets.SLACK_BOT_TOKEN }}

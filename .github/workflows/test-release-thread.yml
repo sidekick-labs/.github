@@ -5,7 +5,8 @@ name: Test release-thread logic
 # (release-thread-logic.sh), the GitHub Deployment STATE decision +
 # do-app-deploy EXIT-trap phase guarantee (deployment-status-logic.sh), and
 # do-app-deploy's outcome-based reconciliation poll loop
-# (do-app-deploy-reconcile-logic.sh), and the post-deploy triage DO-log fetch
+# (do-app-deploy-reconcile-logic.sh), do-app-deploy's appspec patch + spec
+# drift check (do-app-deploy-spec-logic.sh), and the post-deploy triage DO-log fetch
 # gate (do-log-fetch-gate-logic.sh).
 # Several of these shipped bugs to live releases before these tests existed.
 #
@@ -24,6 +25,8 @@ on:
       - '.github/tests/release-thread-logic.sh'
       - '.github/tests/deployment-status-logic.sh'
       - '.github/tests/do-app-deploy-reconcile-logic.sh'
+      - '.github/tests/do-app-deploy-spec-logic.sh'
+      - '.github/tests/fixtures/do-app-spec/**'
       - '.github/workflows/reusable-deploy-staging.yml'
       - '.github/actions/fetch-do-deploy-logs/**'
       - '.github/tests/do-log-fetch-gate-logic.sh'
@@ -39,6 +42,8 @@ on:
       - '.github/tests/release-thread-logic.sh'
       - '.github/tests/deployment-status-logic.sh'
       - '.github/tests/do-app-deploy-reconcile-logic.sh'
+      - '.github/tests/do-app-deploy-spec-logic.sh'
+      - '.github/tests/fixtures/do-app-spec/**'
       - '.github/workflows/reusable-deploy-staging.yml'
       - '.github/actions/fetch-do-deploy-logs/**'
       - '.github/tests/do-log-fetch-gate-logic.sh'
@@ -61,5 +66,7 @@ jobs:
         run: bash .github/tests/deployment-status-logic.sh
       - name: Run do-app-deploy reconcile logic tests
         run: bash .github/tests/do-app-deploy-reconcile-logic.sh
+      - name: Run do-app-deploy spec patch + drift logic tests
+        run: bash .github/tests/do-app-deploy-spec-logic.sh
       - name: Run DO-log fetch gate logic tests
         run: bash .github/tests/do-log-fetch-gate-logic.sh
