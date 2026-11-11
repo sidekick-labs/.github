@@ -30,9 +30,10 @@ Available reusable workflows:
   index, orphans; warn → block ratchet) and a weekly report-only `covers:` drift
   report. See [Docs hygiene](#docs-hygiene).
 
-- **`license-check.yml`** — REPORT-ONLY licence check over the caller's
-  lockfiles against the org licence policy; summary in the job summary, never
-  fails unless `fail-on-block: true`. See [Licence check](#licence-check).
+- **`license-check.yml`** — licence check over the caller's lockfiles against
+  the org licence policy; summary in the job summary, and the job fails on a
+  blocked, unexcepted package (`fail-on-block`, default true since
+  2026-11-25). See [Licence check](#licence-check).
 
 > **Removed:** `reusable-sentry-autofix.yml` — the Sentry autofix moved to the
 > one-workflow-per-org model: `sidekick-labs/sre-brain`'s `sentry-sweep.yml` +
@@ -576,7 +577,7 @@ outbound HTTPS to those registries.
 |---|---|---|
 | allow | MIT, MIT-0 (MIT without the attribution clause), ISC, BSD-2/3-Clause, 0BSD, Apache-2.0, BlueOak-1.0.0, Unlicense, CC0-1.0, Python-2.0/PSF-2.0, Ruby, Zlib, MPL-2.0, OFL-1.1, CC-BY-4.0 (data) | counted |
 | review | GPL/LGPL/EPL of any version; anything with no recognisable licence | listed in the summary |
-| block | AGPL, SSPL, BUSL, Commons Clause, Elastic, PolyForm, FSL, CC-BY-NC and other source-available or noncommercial licences | listed, plus a `::warning` annotation (`::error` and a failed job only with `fail-on-block: true`) |
+| block | AGPL, SSPL, BUSL, Commons Clause, Elastic, PolyForm, FSL, CC-BY-NC and other source-available or noncommercial licences | listed, plus a `::warning` annotation (`::error` and a failed job with `fail-on-block: true`, the default) |
 
 `A OR B` takes the more permissive side, `A AND B` the stricter. A RubyGems
 licence list and PyPI licence classifiers count as alternatives. Google SDK
@@ -607,12 +608,13 @@ jobs:
         npm:sentry  # Sentry CLI (FSL-1.1-Apache-2.0): build-time sourcemap upload, internal use
 ```
 
-**Outputs** (counts, as strings): `allowed`, `review`, `blocked`, `excepted`. Read them from a calling job with `needs.<job>.outputs.blocked`. They never change the job's result: a report-only run with `blocked > 0` still succeeds. The run also uploads the artifact `licence-check-counts` (`counts.json`: `{"blocked": n, "review": n}`, 30-day retention), which sre-brain's compliance watch check (h) reads over the Actions API, where job outputs are not visible.
+**Outputs** (counts, as strings): `allowed`, `review`, `blocked`, `excepted`. Read them from a calling job with `needs.<job>.outputs.blocked`. With the default `fail-on-block: true`, `blocked > 0` fails the job; a caller passing `fail-on-block: false` still succeeds. Either way the run uploads the artifact `licence-check-counts` (`counts.json`: `{"blocked": n, "review": n}`, 30-day retention), which sre-brain's compliance watch check (h) reads over the Actions API, where job outputs are not visible.
 
 Each exception is one `<ecosystem>:<package>  # <reason>` line. It applies to
 every version, and the reason is shown in the summary. Keep exceptions to
 packages a licence review has cleared. The check landed report-only (licence
-audit 2026-11-10). Turning on `fail-on-block` or making it a required check is
-a separate decision. Tests: `tests/license-check-policy.py`, run by
-`test-license-check.yml`.
+audit 2026-11-10) and `fail-on-block` became the default on 2026-11-25, after
+two weeks of runs with zero blocked packages in every caller. Making it a
+required check is a separate decision. Tests: `tests/license-check-policy.py`,
+run by `test-license-check.yml`.
 

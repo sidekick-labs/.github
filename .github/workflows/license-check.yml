@@ -21,9 +21,11 @@ name: License Check
 # The counts are also the workflow's outputs (`allowed`, `review`, `blocked`,
 # `excepted`), and `blocked`/`review` are uploaded as the run artifact
 # `licence-check-counts` (counts.json), which sre-brain's compliance watch reads.
-# The result goes to the job summary. The job does not fail unless the caller
-# sets `fail-on-block: true` -- it lands report-only (licence audit 2026-11-10)
-# and is not a required check. No paid GitHub feature (dependency review /
+# The result goes to the job summary. The job fails when an unexcepted package
+# has a blocked licence (`fail-on-block` defaults to true since 2026-11-25,
+# after two weeks of report-only runs showed zero blocked across every
+# caller; licence audit 2026-11-10). A caller can still pass
+# `fail-on-block: false`. It is not a required check: rulesets are unchanged. No paid GitHub feature (dependency review /
 # GHAS) is used; it needs only outbound HTTPS to the three registries.
 #
 # Consume from a PR workflow:
@@ -50,9 +52,9 @@ on:
         type: string
         default: ''
       fail-on-block:
-        description: 'Fail the job when an unexcepted package has a blocked licence. Off while the check is report-only.'
+        description: 'Fail the job when an unexcepted package has a blocked licence. On by default since 2026-11-25; pass false to report only.'
         type: boolean
-        default: false
+        default: true
     outputs:
       allowed:
         description: 'Number of locked packages whose licence the policy allows.'
@@ -61,7 +63,7 @@ on:
         description: 'Number of packages to review (GPL/LGPL/EPL, or no recognisable licence).'
         value: ${{ jobs.license-check.outputs.review }}
       blocked:
-        description: 'Number of unexcepted packages whose licence the policy blocks. Non-zero is reported, not failed, unless fail-on-block is true.'
+        description: 'Number of unexcepted packages whose licence the policy blocks. Non-zero fails the job unless fail-on-block is false.'
         value: ${{ jobs.license-check.outputs.blocked }}
       excepted:
         description: 'Number of packages covered by a recorded exception.'
