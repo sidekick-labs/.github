@@ -275,16 +275,20 @@ jobs:
       - name: Patch appspec & deploy to DigitalOcean
         id: do_deploy
         # Shared composite action: fetch live appspec, patch every component to
-        # the DOCR image at this SHA, doctl apps update, poll to a terminal
-        # phase. Always exits 0 and reports via outputs — the gate step below is
-        # what fails the job, keeping do_deploy_id available to the always()
-        # status steps. Referenced by explicit repo path (not `./`) so it
-        # resolves from THIS repo regardless of the caller's checkout.
+        # the DOCR image at this SHA, PUT it over the DO REST API (with a spec
+        # drift check), poll to a terminal phase. Always exits 0 and reports via
+        # outputs — the gate step below is what fails the job, keeping
+        # do_deploy_id available to the always() status steps. Referenced by
+        # explicit repo path (not `./`) so it resolves from THIS repo
+        # regardless of the caller's checkout.
         uses: sidekick-labs/.github/.github/actions/do-app-deploy@v3  # moving release tag — see #1/v3 (matches production; do-app-deploy is shared)
         with:
           app_id: ${{ inputs.app_id }}
           image_repo: ${{ inputs.image_repo }}
           deploy_sha: ${{ inputs.deploy_sha }}
+          # The appspec GET/PUT goes straight to the DO REST API (no doctl in the
+          # spec path), so the action needs the token itself.
+          do_token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
 
       - name: Fail the job if the deploy did not succeed
         # Gate on `outcome` rather than `phase` so we don't depend on the exact

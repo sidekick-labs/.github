@@ -1,0 +1,157 @@
+{
+  "alerts": [
+    {
+      "rule": "DEPLOYMENT_FAILED"
+    },
+    {
+      "rule": "DOMAIN_FAILED"
+    }
+  ],
+  "databases": [
+    {
+      "cluster_name": "example-pg",
+      "engine": "PG",
+      "name": "db",
+      "production": true
+    }
+  ],
+  "disable_email_obfuscation": true,
+  "domains": [
+    {
+      "domain": "staging.example.invalid",
+      "type": "PRIMARY",
+      "zone": "example.invalid"
+    }
+  ],
+  "envs": [
+    {
+      "key": "APP_ENV",
+      "scope": "RUN_AND_BUILD_TIME",
+      "value": "staging"
+    }
+  ],
+  "features": [
+    "buildpack-stack=ubuntu-22"
+  ],
+  "ingress": {
+    "rules": [
+      {
+        "component": {
+          "name": "example-web"
+        },
+        "match": {
+          "authority": {
+            "exact": ""
+          },
+          "path": {
+            "prefix": "/"
+          }
+        }
+      }
+    ]
+  },
+  "jobs": [
+    {
+      "envs": [
+        {
+          "key": "SENTRY_RELEASE",
+          "scope": "RUN_TIME",
+          "value": "2222222222222222222222222222222222222222"
+        }
+      ],
+      "image": {
+        "registry_type": "DOCR",
+        "repository": "example-app",
+        "tag": "2222222222222222222222222222222222222222"
+      },
+      "instance_size_slug": "apps-s-1vcpu-0.5gb",
+      "kind": "PRE_DEPLOY",
+      "name": "example-migrate"
+    }
+  ],
+  "maintenance": {
+    "enabled": false,
+    "offline_page_url": "https://example.invalid/maintenance.html"
+  },
+  "name": "example-staging",
+  "region": "sgp",
+  "services": [
+    {
+      "alerts": [
+        {
+          "operator": "GREATER_THAN",
+          "rule": "CPU_UTILIZATION",
+          "value": 80,
+          "window": "FIVE_MINUTES"
+        }
+      ],
+      "envs": [
+        {
+          "key": "DATABASE_URL",
+          "scope": "RUN_TIME",
+          "type": "SECRET",
+          "value": "EV[1:fixture-not-a-real-ciphertext]"
+        },
+        {
+          "key": "LOG_LEVEL",
+          "scope": "RUN_TIME",
+          "value": "info"
+        },
+        {
+          "key": "SENTRY_RELEASE",
+          "scope": "RUN_TIME",
+          "value": "2222222222222222222222222222222222222222"
+        }
+      ],
+      "health_check": {
+        "failure_threshold": 5,
+        "http_path": "/health/ready",
+        "initial_delay_seconds": 30,
+        "period_seconds": 10,
+        "success_threshold": 1,
+        "timeout_seconds": 5
+      },
+      "http_port": 8080,
+      "image": {
+        "registry_type": "DOCR",
+        "repository": "example-app",
+        "tag": "2222222222222222222222222222222222222222"
+      },
+      "instance_count": 1,
+      "instance_size_slug": "apps-s-1vcpu-1gb",
+      "liveness_health_check": {
+        "failure_threshold": 9,
+        "http_path": "/health/alive",
+        "initial_delay_seconds": 30,
+        "period_seconds": 10,
+        "success_threshold": 1,
+        "timeout_seconds": 1
+      },
+      "name": "example-web"
+    }
+  ],
+  "workers": [
+    {
+      "envs": [
+        {
+          "key": "QUEUE",
+          "scope": "RUN_TIME",
+          "value": "default"
+        },
+        {
+          "key": "SENTRY_RELEASE",
+          "scope": "RUN_TIME",
+          "value": "2222222222222222222222222222222222222222"
+        }
+      ],
+      "image": {
+        "registry_type": "DOCR",
+        "repository": "example-app",
+        "tag": "2222222222222222222222222222222222222222"
+      },
+      "instance_count": 1,
+      "instance_size_slug": "apps-s-1vcpu-1gb",
+      "name": "example-worker"
+    }
+  ]
+}

@@ -1,0 +1,48 @@
+{
+  "name": "example-staging",
+  "region": "sgp",
+  "maintenance": {"enabled": false, "offline_page_url": "https://example.invalid/maintenance.html"},
+  "disable_email_obfuscation": true,
+  "features": ["buildpack-stack=ubuntu-22"],
+  "alerts": [{"rule": "DEPLOYMENT_FAILED"}, {"rule": "DOMAIN_FAILED"}],
+  "domains": [{"domain": "staging.example.invalid", "type": "PRIMARY", "zone": "example.invalid"}],
+  "ingress": {"rules": [{"match": {"path": {"prefix": "/"}, "authority": {"exact": ""}}, "component": {"name": "example-web"}}]},
+  "envs": [{"key": "APP_ENV", "value": "staging", "scope": "RUN_AND_BUILD_TIME"}],
+  "databases": [{"name": "db", "engine": "PG", "production": true, "cluster_name": "example-pg"}],
+  "services": [
+    {
+      "name": "example-web",
+      "http_port": 8080,
+      "instance_count": 1,
+      "instance_size_slug": "apps-s-1vcpu-1gb",
+      "image": {"registry_type": "DOCR", "registry": "example-registry", "repository": "example-app", "tag": "1111111111111111111111111111111111111111"},
+      "envs": [
+        {"key": "DATABASE_URL", "value": "EV[1:fixture-not-a-real-ciphertext]", "scope": "RUN_TIME", "type": "SECRET"},
+        {"key": "SENTRY_RELEASE", "value": "1111111111111111111111111111111111111111", "scope": "RUN_TIME"},
+        {"key": "LOG_LEVEL", "value": "info", "scope": "RUN_TIME"}
+      ],
+      "health_check": {"http_path": "/health/ready", "initial_delay_seconds": 30, "period_seconds": 10, "timeout_seconds": 5, "success_threshold": 1, "failure_threshold": 5},
+      "liveness_health_check": {"http_path": "/health/alive", "initial_delay_seconds": 30, "period_seconds": 10, "timeout_seconds": 1, "success_threshold": 1, "failure_threshold": 9},
+      "alerts": [{"rule": "CPU_UTILIZATION", "operator": "GREATER_THAN", "value": 80, "window": "FIVE_MINUTES"}]
+    }
+  ],
+  "workers": [
+    {
+      "name": "example-worker",
+      "instance_count": 1,
+      "instance_size_slug": "apps-s-1vcpu-1gb",
+      "github": {"repo": "example/example-app", "branch": "main", "deploy_on_push": false},
+      "dockerfile_path": "Dockerfile",
+      "source_dir": "/",
+      "envs": [{"key": "QUEUE", "value": "default", "scope": "RUN_TIME"}]
+    }
+  ],
+  "jobs": [
+    {
+      "name": "example-migrate",
+      "kind": "PRE_DEPLOY",
+      "instance_size_slug": "apps-s-1vcpu-0.5gb",
+      "image": {"registry_type": "DOCR", "registry": "example-registry", "repository": "example-app", "tag": "1111111111111111111111111111111111111111"}
+    }
+  ]
+}
