@@ -241,7 +241,19 @@ jobs:
       - name: Install doctl
         uses: digitalocean/action-doctl@3cb3953159719656269e044e0e24ca16dd2a690f # v2.5.2
         with:
+          version: 2.1.0
           token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+      - name: Guard doctl version
+        # action-doctl silently installs doctl 1.98.1 (2023) when GitHub's releases
+        # API errors, even with `version:` set. An old doctl drops spec fields it
+        # doesn't know on a spec read-modify-write, so fail closed here.
+        run: |
+          v=$(doctl version | sed -n 's/^doctl version \([0-9][0-9.]*\).*/\1/p' | head -n1)
+          if [ -z "$v" ] || [ "$(printf '%s\n' 2.1.0 "$v" | sort -V | head -n1)" != 2.1.0 ]; then
+            echo "::error::doctl ${v:-unknown} installed; expected >= 2.1.0 (action-doctl fallback?). Refusing to touch app specs."
+            exit 1
+          fi
 
       - name: Verify image exists in DOCR
         id: image_check
