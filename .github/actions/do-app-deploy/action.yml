@@ -135,6 +135,8 @@ runs:
         # https://github.com/fundbright/delivery-ops/issues/1019#issuecomment-6795304856
         # The patch and the drift check live in spec.sh (tested offline by
         # ../../tests/do-app-deploy-spec-logic.sh).
+        # The token reaches curl as a header file (`-H @<(printf …)`, printf
+        # being a builtin), so it never shows on a command line.
         DO_API_TOKEN="${DO_TOKEN:-${DIGITALOCEAN_ACCESS_TOKEN:-}}"
         if [ -z "$DO_API_TOKEN" ]; then
           echo "::error::do-app-deploy needs a DigitalOcean API token: pass the do_token input (or set DIGITALOCEAN_ACCESS_TOKEN)"
@@ -147,7 +149,7 @@ runs:
         # PUT in the next step is deliberately never retried).
         HTTP_CODE=$(curl -sS --max-time 60 --retry 3 --retry-all-errors \
           -o /tmp/do-app.json -w '%{http_code}' \
-          -H "Authorization: Bearer ${DO_API_TOKEN}" \
+          -H @<(printf 'Authorization: Bearer %s' "$DO_API_TOKEN") \
           "https://api.digitalocean.com/v2/apps/${APP_ID}") || HTTP_CODE="000"
         if [ "${HTTP_CODE:0:1}" != "2" ] || ! jq -e '.app.spec | type == "object"' /tmp/do-app.json >/dev/null 2>&1; then
           echo "::error::GET /v2/apps/${APP_ID} failed (HTTP ${HTTP_CODE}): $(jq -r '.message // empty' /tmp/do-app.json 2>/dev/null || true)"
@@ -343,7 +345,7 @@ runs:
         DEPLOY_KICKOFF_EPOCH=$(date +%s)
         HTTP_CODE=$(curl -sS --max-time 120 -X PUT \
           -o /tmp/do-update.json -w '%{http_code}' \
-          -H "Authorization: Bearer ${DO_API_TOKEN}" \
+          -H @<(printf 'Authorization: Bearer %s' "$DO_API_TOKEN") \
           -H "Content-Type: application/json" \
           --data-binary @/tmp/do-update-body.json \
           "https://api.digitalocean.com/v2/apps/${APP_ID}" 2>/tmp/do-update-stderr) || HTTP_CODE="000"
@@ -442,7 +444,7 @@ runs:
         # shellcheck source=spec.sh
         source "$GITHUB_ACTION_PATH/spec.sh"
         if curl -sS -f --max-time 60 --retry 3 --retry-all-errors -o /tmp/do-app-after.json \
-             -H "Authorization: Bearer ${DO_API_TOKEN}" \
+             -H @<(printf 'Authorization: Bearer %s' "$DO_API_TOKEN") \
              "https://api.digitalocean.com/v2/apps/${APP_ID}" 2>/dev/null \
            && jq -ce '.app.spec | objects' /tmp/do-app-after.json > /tmp/spec.stored.json 2>/dev/null; then
           SPEC_SOURCE="GET /v2/apps/${APP_ID} after the update"
@@ -451,7 +453,9 @@ runs:
           jq -c '.app.spec' /tmp/do-update.json > /tmp/spec.stored.json 2>/dev/null || echo 'null' > /tmp/spec.stored.json
           SPEC_SOURCE="the PUT /v2/apps/${APP_ID} response"
         fi
-        DRIFT=$(spec_drift /tmp/spec.json /tmp/spec.stored.json 2>&1) || DRIFT="${DRIFT:-drift check failed to run}"
+        # jq's stderr goes to a file, never into the message: a parse error can
+        # quote spec fragments, and envs carry secrets.
+        DRIFT=$(spec_drift /tmp/spec.json /tmp/spec.stored.json 2>/tmp/spec-drift-stderr) || DRIFT="${DRIFT:-drift check failed to run}"
         if [ -n "$DRIFT" ]; then
           echo "::error::do-app-deploy: SPEC DRIFT — the appspec DO stored (${SPEC_SOURCE}) differs from the fetched spec plus the image patch at $(printf '%s\n' "$DRIFT" | wc -l | tr -d ' ') path(s): $(printf '%s\n' "$DRIFT" | paste -sd ',' - | sed 's/,/, /g')"
           echo "::group::Spec drift paths"

@@ -89,6 +89,9 @@ So the action:
    (`spec_drift`). Any missing, added or changed path fails the action with
    phase `SPEC_DRIFT` and the list of paths. Values are never printed, because
    env values can be secrets. A passing check logs `Spec drift check passed`.
+   `SPEC_DRIFT` is not a DO phase: the action stops there without polling,
+   and the deployment it started keeps rolling out unmonitored with the
+   drifted spec. Restore the listed fields before the next deploy.
 
 The only normalisation is `image.registry` on DOCR components: the patch
 writes the image block without it, and DO fills in the registry name. Checked
