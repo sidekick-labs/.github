@@ -591,8 +591,7 @@ package's own LICENSE.
 # .github/workflows/license-check.yml in the consuming repo
 name: License Check
 on:
-  pull_request:
-    paths: ['**/package-lock.json', '**/Gemfile.lock', '**/uv.lock', '**/requirements*.lock', '.github/workflows/license-check.yml']
+  pull_request:  # every PR, no paths filter, so it can be a required check (see below)
   push:
     branches: [main]
     paths: ['**/package-lock.json', '**/Gemfile.lock', '**/uv.lock', '**/requirements*.lock']
@@ -617,4 +616,11 @@ audit 2026-11-10) and `fail-on-block` became the default on 2026-11-25, after
 two weeks of runs with zero blocked packages in every caller. Making it a
 required check is a separate decision. Tests: `tests/license-check-policy.py`,
 run by `test-license-check.yml`.
+
+**Run it on every PR.** A required status check that never starts leaves a PR
+waiting forever, so callers don't filter `pull_request` by path. The job's first
+step asks the compare API which files the PR changes. If none is a lockfile or
+the caller workflow, the check is skipped and the job still succeeds under the
+same name (`license-check / Licence check`) in a few seconds. On any doubt (a
+non-PR event, an API error, or 300+ changed files) it runs the full check.
 
