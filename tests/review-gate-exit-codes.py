@@ -151,9 +151,11 @@ def reviewable_script(src):
     return step_script(src, REVIEWABLE_STEP)
 
 
-def run_reviewable(script, files):
+def run_reviewable(script, files, opt_in_content=None, base_ref="main"):
     """Execute the reviewability classifier. `files` is the stubbed
     `gh pr diff --name-only` output; None simulates an unreadable diff.
+    `opt_in_content` is the content of .github/claude-review-paths from the
+    base branch; None simulates the file being absent (gh api exits 1).
     Returns (exit_code, skip_value, step_summary)."""
     with tempfile.TemporaryDirectory() as d:
         out = os.path.join(d, "gh_output")
@@ -162,12 +164,29 @@ def run_reviewable(script, files):
         open(summary, "w").close()
         bindir = os.path.join(d, "bin")
         os.makedirs(bindir)
+        # Write content to files so the stub can serve them without heredoc quoting issues.
+        files_path = os.path.join(d, "pr_files.txt")
+        opt_in_path = os.path.join(d, "opt_in.txt")
+        if files is not None:
+            with open(files_path, "w") as f:
+                f.write(files)
+        if opt_in_content is not None:
+            with open(opt_in_path, "w") as f:
+                f.write(opt_in_content)
         gh = os.path.join(bindir, "gh")
         with open(gh, "w") as fh:
-            if files is None:
-                fh.write("#!/bin/sh\nexit 1\n")
-            else:
-                fh.write("#!/bin/sh\ncat <<'EOF'\n" + files + "\nEOF\n")
+            pr_cmd = "exit 1" if files is None else f"cat {files_path}"
+            opt_cmd = "exit 1" if opt_in_content is None else f"cat {opt_in_path}"
+            fh.write(f"""#!/bin/sh
+case "$1" in
+  api)
+    case "$*" in
+      *claude-review-paths*) {opt_cmd} ;;
+      *) exit 1 ;;
+    esac ;;
+  *) {pr_cmd} ;;
+esac
+""")
         os.chmod(gh, 0o755)
         env = dict(os.environ)
         env.update({
@@ -177,6 +196,7 @@ def run_reviewable(script, files):
             "REPO": "sidekick-labs/example",
             "PR": "1",
             "GH_TOKEN": "stub",
+            "BASE_REF": base_ref,
         })
         proc = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", script], env=env,
                               capture_output=True, text=True)
@@ -959,6 +979,60 @@ def main():
         rc, skip, _ = run_reviewable(rv, tricky)
         check(f"'{tricky}' is NOT an ignored path -> skip=false",
               skip == "false", f"rc={rc} skip={skip!r}")
+
+    # --- caller opt-in paths (.github/claude-review-paths) -------------------
+    print("reviewability classifier — caller opt-in paths (.github/claude-review-paths):")
+
+    # The opt-in mechanism lets a caller mark specific NOT_REVIEWABLE paths as
+    # reviewable without editing the shared classifier. The critical property is
+    # that it can only WIDEN review (make a skipped file reviewed), never NARROW
+    # it (make a reviewable file skipped). And it must not loosen the .github/
+    # invariant.
+
+    rc, skip, _ = run_reviewable(rv,
+        "decisions/product/DEC-001.md",
+        opt_in_content="^(decisions|requirements)/.*\\.md$\n")
+    check("opt-in: .md record matching caller pattern -> skip=false (reviewed despite "
+          "matching NOT_REVIEWABLE's (.*\\.md$) exclusion)",
+          skip == "false", f"rc={rc} skip={skip!r}")
+
+    rc, skip, _ = run_reviewable(rv,
+        "README.md",
+        opt_in_content="^(decisions|requirements)/.*\\.md$\n")
+    check("opt-in: top-level README.md does NOT match the pattern -> skip=true "
+          "(only the caller-matched paths are un-skipped)",
+          rc == 0 and skip == "true", f"rc={rc} skip={skip!r}")
+
+    rc, skip, _ = run_reviewable(rv, "README.md\ndecisions/product/DEC-001.md",
+        opt_in_content="^(decisions|requirements)/.*\\.md$\n")
+    check("opt-in: mixed diff (README + record) -> skip=false (record matches opt-in)",
+          skip == "false", f"rc={rc} skip={skip!r}")
+
+    rc, skip, _ = run_reviewable(rv, "README.md", opt_in_content=None)
+    check("opt-in: absent .github/claude-review-paths -> unchanged skip behavior",
+          rc == 0 and skip == "true", f"rc={rc} skip={skip!r}")
+
+    rc, skip, _ = run_reviewable(rv,
+        "decisions/product/DEC-001.md",
+        opt_in_content="# This is a comment\n\n# Another comment\n\n^(decisions)/.*\\.md$\n")
+    check("opt-in: comment lines and blank lines in the file are ignored; "
+          "pattern on a non-comment line still applies",
+          skip == "false", f"rc={rc} skip={skip!r}")
+
+    rc, skip, _ = run_reviewable(rv,
+        "decisions/product/DEC-001.md",
+        opt_in_content="# Only comments here\n# No patterns at all\n")
+    check("opt-in: file with only comments -> no effective patterns -> skip=true (unchanged)",
+          rc == 0 and skip == "true", f"rc={rc} skip={skip!r}")
+
+    # The .github/ invariant is checked BEFORE the opt-in; opt-in cannot override it
+    # (the opt-in only acts after the NOT_REVIEWABLE check, which comes after .github/).
+    rc, skip, _ = run_reviewable(rv,
+        ".github/workflows/foo.yml",
+        opt_in_content="^\\.github/\n")
+    check("opt-in: .github/ is STILL never skippable even when an opt-in pattern matches "
+          "(.github/ is caught earlier; the opt-in only acts after NOT_REVIEWABLE)",
+          skip == "false", f"rc={rc} skip={skip!r}")
 
     # --- structural: the classifier is wired in front of everything ---------
     print("reviewability structural guards:")

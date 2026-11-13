@@ -155,6 +155,7 @@ runs:
         GH_TOKEN: ${{ inputs.github_token }}
         REPO: ${{ github.repository }}
         PR: ${{ github.event.pull_request.number }}
+        BASE_REF: ${{ github.event.pull_request.base.ref }}
       shell: bash
       run: |
         set -uo pipefail
@@ -183,6 +184,23 @@ runs:
         # paths-ignore semantics: ANY file outside the list makes this reviewable.
         if printf '%s\n' "$files" | grep -qvE "$NOT_REVIEWABLE"; then
           review_it "at least one changed file carries reviewable content"
+        fi
+
+        # Caller-defined opt-in paths (.github/claude-review-paths on the base branch).
+        # Lines starting with # are comments; blank lines are ignored. Each non-empty,
+        # non-comment line is an ERE pattern; a file matching any pattern is reviewable
+        # even if it also matches NOT_REVIEWABLE above. Read from BASE_REF (not HEAD)
+        # so a PR cannot widen its own review scope.
+        if opt_in=$(gh api "repos/${REPO}/contents/.github/claude-review-paths?ref=${BASE_REF}" \
+            -H "Accept: application/vnd.github.raw" 2>/dev/null); then
+          # `grep -v` exits 1 when every line matches the exclusion (all comments / blank).
+          # `|| true` prevents that from tripping `pipefail` and leaving opt_in_patterns empty.
+          opt_in_patterns=$(printf '%s\n' "$opt_in" \
+            | grep -v '^\s*#' | grep -v '^\s*$' \
+            | tr '\n' '|' | sed 's/|$//' || true)
+          if [ -n "$opt_in_patterns" ] && printf '%s\n' "$files" | grep -qE "$opt_in_patterns"; then
+            review_it "matches caller-defined reviewable path (.github/claude-review-paths on ${BASE_REF})"
+          fi
         fi
 
         echo "skip=true" >> "$GITHUB_OUTPUT"
