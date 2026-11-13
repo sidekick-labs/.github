@@ -151,9 +151,11 @@ def reviewable_script(src):
     return step_script(src, REVIEWABLE_STEP)
 
 
-def run_reviewable(script, files):
+def run_reviewable(script, files, additional_reviewable=''):
     """Execute the reviewability classifier. `files` is the stubbed
     `gh pr diff --name-only` output; None simulates an unreadable diff.
+    `additional_reviewable` is an extended regex of paths that override
+    NOT_REVIEWABLE (the caller's opt-in; empty string = disabled, as default).
     Returns (exit_code, skip_value, step_summary)."""
     with tempfile.TemporaryDirectory() as d:
         out = os.path.join(d, "gh_output")
@@ -177,6 +179,7 @@ def run_reviewable(script, files):
             "REPO": "sidekick-labs/example",
             "PR": "1",
             "GH_TOKEN": "stub",
+            "ADDITIONAL_REVIEWABLE": additional_reviewable,
         })
         proc = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", script], env=env,
                               capture_output=True, text=True)
@@ -959,6 +962,58 @@ def main():
         rc, skip, _ = run_reviewable(rv, tricky)
         check(f"'{tricky}' is NOT an ignored path -> skip=false",
               skip == "false", f"rc={rc} skip={skip!r}")
+
+    # -------------------------------------------------------------------------
+    # ADDITIONAL_REVIEWABLE opt-in override.
+    #
+    # A caller (e.g. a brain repo where decisions/ records are *.md files) can
+    # supply a regex so that matching files are treated as reviewable even though
+    # they match NOT_REVIEWABLE. This is strictly additive and opt-in: callers
+    # that don't pass the input behave exactly as before (the env var is empty).
+    # -------------------------------------------------------------------------
+    print("additional_reviewable opt-in override:")
+    BRAIN_PATTERN = r'^(decisions|requirements|convictions|outcomes|personas)/.*\.md$'
+
+    # Without the override, records/*.md are skipped because *.md matches NOT_REVIEWABLE.
+    rc, skip, _ = run_reviewable(rv, "decisions/product/DEC-0001.md")
+    check("record *.md WITHOUT override -> skip=true (baseline: *.md matches NOT_REVIEWABLE)",
+          rc == 0 and skip == "true", f"rc={rc} skip={skip!r}")
+
+    # With the override, those same files are reviewable.
+    rc, skip, _ = run_reviewable(rv, "decisions/product/DEC-0001.md",
+                                 additional_reviewable=BRAIN_PATTERN)
+    check("record *.md WITH matching additional_reviewable -> skip=false",
+          skip == "false", f"rc={rc} skip={skip!r}")
+
+    # The override is a prefix filter — files outside the named directories are unaffected.
+    rc, skip, _ = run_reviewable(rv, "README.md",
+                                 additional_reviewable=BRAIN_PATTERN)
+    check("top-level README.md does NOT match the brain pattern -> skip=true "
+          "(additional_reviewable is a tight prefix, not a blanket md override)",
+          rc == 0 and skip == "true", f"rc={rc} skip={skip!r}")
+
+    # Mixed diff: one record + one generated file. The record matches the override,
+    # so the whole PR is reviewable (consistent with paths-ignore semantics).
+    rc, skip, _ = run_reviewable(rv,
+                                 "decisions/product/DEC-0001.md\nindex.json",
+                                 additional_reviewable=BRAIN_PATTERN)
+    check("record + generated file WITH override -> skip=false (one matching "
+          "file makes the whole PR reviewable)",
+          skip == "false", f"rc={rc} skip={skip!r}")
+
+    # An empty additional_reviewable must not change behaviour (the env var exists
+    # but is empty — the default from the action input).
+    rc, skip, _ = run_reviewable(rv, "README.md\ndocs/architecture.md",
+                                 additional_reviewable='')
+    check("empty additional_reviewable -> skip=true (unchanged from baseline)",
+          rc == 0 and skip == "true", f"rc={rc} skip={skip!r}")
+
+    # The .github/ invariant still wins over additional_reviewable.
+    rc, skip, _ = run_reviewable(rv, ".github/workflows/claude-code-review.yml",
+                                 additional_reviewable=BRAIN_PATTERN)
+    check(".github/ is NEVER skippable even with additional_reviewable set "
+          "(the gate IS the gate)",
+          skip == "false", f"rc={rc} skip={skip!r}")
 
     # --- structural: the classifier is wired in front of everything ---------
     print("reviewability structural guards:")

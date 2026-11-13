@@ -93,6 +93,17 @@ inputs:
       the review prompt.
     required: false
     default: 'sidekick-labs-bot'
+  additional_reviewable:
+    description: >-
+      Extended-regex of paths that are ALWAYS treated as reviewable, even if they
+      also match NOT_REVIEWABLE. Intended for repos where the substance lives in
+      Markdown — e.g. a brain repo where decisions/ and requirements/ are records,
+      not documentation — and those paths would otherwise be skipped by the blanket
+      `(\.md$)` exclusion. Callers that do not pass this input behave exactly as
+      before. Keep the pattern tight; a broad override defeats the savings the
+      exclusion exists to provide.
+    required: false
+    default: ''
 
 outputs:
   verdict:
@@ -155,6 +166,7 @@ runs:
         GH_TOKEN: ${{ inputs.github_token }}
         REPO: ${{ github.repository }}
         PR: ${{ github.event.pull_request.number }}
+        ADDITIONAL_REVIEWABLE: ${{ inputs.additional_reviewable }}
       shell: bash
       run: |
         set -uo pipefail
@@ -178,6 +190,13 @@ runs:
         # The workflow IS the gate. Never skippable, by any classifier.
         if printf '%s\n' "$files" | grep -qE '^\.github/'; then
           review_it "touches .github/ (the gate itself)"
+        fi
+
+        # Caller-supplied override: any file matching ADDITIONAL_REVIEWABLE is treated as
+        # reviewable even if it also matches NOT_REVIEWABLE. Designed for repos where
+        # Markdown is the substance (e.g. brain record directories), not documentation.
+        if [ -n "${ADDITIONAL_REVIEWABLE:-}" ] && printf '%s\n' "$files" | grep -qE "$ADDITIONAL_REVIEWABLE"; then
+          review_it "matches caller's additional_reviewable override"
         fi
 
         # paths-ignore semantics: ANY file outside the list makes this reviewable.

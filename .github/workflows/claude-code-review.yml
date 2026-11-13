@@ -49,6 +49,14 @@ name: Claude Code Review
 
 on:
   workflow_call:
+    inputs:
+      additional_reviewable:
+        description: >-
+          Extended-regex of paths always treated as reviewable, overriding NOT_REVIEWABLE.
+          See the composite action's input of the same name.
+        required: false
+        type: string
+        default: ''
 
 jobs:
   claude_review:
@@ -93,3 +101,4 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           claude_model: ${{ vars.CLAUDE_MODEL || 'claude-sonnet-5-5' }}
           github_token: ${{ github.token }}
+          additional_reviewable: ${{ inputs.additional_reviewable }}
