@@ -345,7 +345,7 @@ runs:
         esac
 
         prefix=""
-        for p in sync/ weekly/ cycle/ quarterly/ direction/; do
+        for p in sync/ weekly/ cycle/ quarterly/ direction/ chore/; do
           case "$HEAD_REF" in "$p"*) prefix="$p"; break ;; esac
         done
         if [ -z "$prefix" ]; then
@@ -370,6 +370,22 @@ runs:
           review_it "sync branch changes paths outside tools/"
         fi
 
+        # `chore/` by the release bot: only version catalog, lockfiles and docs are
+        # expected. `sidekick-labs-bot[bot]` creates `chore/protocol-pin-*` branches
+        # in companion-kit and similar in other repos that change only
+        # `gradle/libs.versions.toml` (and optionally `.md` release notes). Anything
+        # beyond those paths is unexpected source code that must be reviewed.
+        # Three-part test (sre-brain#996):
+        #   1. Bot author (already verified above).
+        #   2. `chore/` prefix (this block).
+        #   3. Files are only version catalog / lockfiles / docs.
+        # A `chore/` PR touching real source is NOT mechanical and falls through to review.
+        VERSION_ONLY_PATTERN='(^gradle/libs[^/]*\.toml$|^gradle/wrapper/|\.lock$|\.md$|^docs/|^CHANGELOG)'
+        if [ "$prefix" = "chore/" ] && printf '%s\n' "$files" | grep -qvE "$VERSION_ONLY_PATTERN"; then
+          printf '%s\n' "$files" | grep -vE "$VERSION_ONLY_PATTERN" | sed 's/^/  non-version: /'
+          review_it "chore/ branch changes non-version-catalog/non-doc paths"
+        fi
+
         echo "skip=true" >> "$GITHUB_OUTPUT"
         n=$(printf '%s\n' "$files" | wc -l | tr -d ' ')
         echo "MECHANICAL: '$HEAD_REF' by $PR_AUTHOR, $n file(s) — skipping Claude review."
@@ -382,6 +398,11 @@ runs:
             echo "**Guarantee that replaces review:** \`sync-check\` asserts these vendored files are"
             echo "**byte-identical** to octo-brain, where the change was reviewed when it landed."
             echo "Reviewing the copy would review the same diff again."
+          elif [ "$prefix" = "chore/" ]; then
+            echo "**Guarantee that replaces review:** This is a release-bot version-catalog bump —"
+            echo "only \`gradle/libs.*.toml\`, lockfiles and docs files are present. The upstream"
+            echo "version was reviewed when it was released; reviewing the pin is reviewing the"
+            echo "same decision twice."
           else
             echo "**Guarantee that replaces review:** beat-regenerated artifact — regenerated, not authored."
           fi
@@ -398,8 +419,9 @@ runs:
         # where a PR merges with NO review at all, the reason has to be legible
         # from the PR itself, forever, next to the merge it authorised.
         #
-        # Volume is low by construction (only bot-authored `sync/` + beat
-        # branches reach here), the comment is idempotent per head SHA, and it
+        # Volume is low by construction (only bot-authored `sync/`, `chore/`
+        # version-bump and beat branches reach here), the comment is idempotent
+        # per head SHA, and it
         # is BEST-EFFORT: a caller that forgot `pull-requests: write` gets a
         # warning, never a failed gate. The `::notice` is the fallback record.
         echo "::notice title=Claude review skipped (mechanical PR)::${HEAD_REF} by ${PR_AUTHOR} — a deterministic gate already provides the guarantee review would. This green check means NO REVIEW WAS NEEDED, not that a review passed."
@@ -420,7 +442,9 @@ runs:
             echo "A deterministic gate already provides the guarantee review would provide, so"
             echo "a reviewer could not add information. \`sync/\` branches are asserted"
             echo "byte-identical to octo-brain by \`sync-check\`, where the diff was reviewed"
-            echo "when it landed; beat branches are regenerated, not authored."
+            echo "when it landed; \`chore/\` version-bump branches change only the version"
+            echo "catalog (reviewed when the upstream version was released); beat branches are"
+            echo "regenerated, not authored."
             echo
             echo "**The green \`Claude Code Review\` on this PR means no review was needed — not"
             echo "that a review passed.** Policy + the three-part test: workspace convention"
