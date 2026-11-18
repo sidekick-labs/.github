@@ -22,7 +22,7 @@ triage verdict with nothing to follow. For every agent,
 **Self-test.** `ledger.py --self-test` runs before every compute. It runs the
 classifier over a planted repository with known wrong verdicts, and the job fails
 unless each one lands in its bad bucket. `tests/outcome-ledger.py` breaks the
-classifier five ways and requires the self-test to go red each time.
+classifier six ways and requires the self-test to go red each time.
 
 **Shape** (schema 1, shared with the fundbright and luminality ledgers; the audit
 merges them):

@@ -84,6 +84,7 @@ FORBIDDEN_BACKOFF = 900   # seconds to back off on a 403/429 (the token is share
 TRIAGE_VERDICTS = ("clean", "minor concern", "likely problem")
 TRIAGE_CATEGORIES = ("code regression", "environment / infra", "flake / transient")
 CONFIDENCES = ("low", "medium", "high")
+RUN_LINK = re.compile(r"/actions/runs/(\d+)")
 
 
 # --------------------------------------------------------------------------- time
@@ -216,9 +217,23 @@ def compute(facts, now, window_days=30, settle_days=7):
                    f"verdict, merged, not reverted after {settle_days} days), reverted (merged "
                    "then reverted), superseded (a later push was reviewed again), "
                    "closed_unmerged.")
+    # A run's `pull_requests` is EMPTY once its PR is merged and its branch is gone
+    # (measured: on sidekick-inference only the dependabot runs carried one). The
+    # reviewer's own tracking comment links its run, so that link is the mapping.
+    # Runs of other workflows (the interactive @claude lane) are not in this index
+    # and are never mapped.
+    runs = [dict(r) for r in facts["review_runs"]]
+    by_id = {r["run_id"]: r for r in runs}
+    for n, cs in comments.items():
+        for c in cs:
+            if c.get("login") != REVIEW_AUTHOR:
+                continue
+            for run_id in RUN_LINK.findall(c.get("body") or ""):
+                if run_id in by_id and by_id[run_id].get("pr") is None:
+                    by_id[run_id]["pr"] = n
     no_verdict = 0
     per_pr = {}
-    for run in facts["review_runs"]:
+    for run in runs:
         at = parse_ts(run.get("created_at"))
         if at is None or at < start or run.get("pr") not in pulls:
             continue
@@ -501,16 +516,13 @@ def collect(api, now, window_days=30, log=print):
     for r in api.paged(f"repos/{repo}/actions/workflows/{REVIEW_WORKFLOW}/runs",
                        {"created": f">={start.date().isoformat()}"}, key="workflow_runs"):
         prs = [x["number"] for x in r.get("pull_requests") or [] if x["number"] in numbers]
-        if prs:
-            runs.append({"run_id": str(r["id"]), "pr": prs[0], "created_at": r["created_at"],
-                         "conclusion": r.get("conclusion"), "head_sha": r["head_sha"]})
+        runs.append({"run_id": str(r["id"]), "pr": prs[0] if prs else None,
+                     "created_at": r["created_at"], "conclusion": r.get("conclusion"),
+                     "head_sha": r["head_sha"]})
 
-    review_prs = {r["pr"] for r in runs}
-    merged_prs = {p["number"] for p in pulls
-                  if p["merged_at"] and (parse_ts(p["merged_at"]) or now) >= start}
-    log(f"comments on {len(review_prs | merged_prs)} PR(s)…")
+    log(f"comments on {len(numbers)} PR(s)…")
     comments = {}
-    for n in sorted(review_prs | merged_prs):
+    for n in sorted(numbers):
         comments[n] = [{"id": c["id"], "login": c["user"]["login"], "user_type": c["user"]["type"],
                         "created_at": c["created_at"], "updated_at": c["updated_at"],
                         "html_url": c["html_url"], "body": c.get("body") or ""}
@@ -659,7 +671,8 @@ def planted_world(now):
                 "message": 'Revert "Add Foo (#1)" (#7)\n\nThis reverts commit ' + "a" * 40 + "."}]
     runs = [
         {"run_id": "101", "pr": 1, "created_at": d(21), "conclusion": "success"},
-        {"run_id": "201", "pr": 2, "created_at": d(19), "conclusion": "failure"},
+        # pr None: the runs API dropped the PR; the reviewer comment links it.
+        {"run_id": "201", "pr": None, "created_at": d(19), "conclusion": "failure"},
         {"run_id": "301", "pr": 3, "created_at": d(17), "conclusion": "success"},  # acked re-run
         {"run_id": "401", "pr": 4, "created_at": d(3), "conclusion": "success"},
         {"run_id": "501", "pr": 5, "created_at": d(5), "conclusion": "success"},
@@ -680,7 +693,9 @@ def planted_world(now):
             c(5, "writer", d(16, 12),
               "/review-ack\n1. false-positive — Foo#bar is only called after the nil guard in x.rb:12",
               "User")],
-        4: [c(6, REVIEW_AUTHOR, d(3), _lane("401", passing))],
+        4: [c(6, REVIEW_AUTHOR, d(3), _lane("401", passing)),
+            # The interactive @claude lane: same author, a run that is not a review run.
+            c(12, REVIEW_AUTHOR, d(2, 12), _lane("999", blocking))],
         5: [c(7, REVIEW_AUTHOR, d(5), _lane("501", passing))],
         6: [c(8, REVIEW_AUTHOR, d(14), _lane("601", blocking)),
             c(9, REVIEW_AUTHOR, d(13), _lane("602", passing)),

@@ -67,6 +67,9 @@ def main():
     check("an ack from a read-only user honoured -> fails",
           bool(mutated(lambda: patch(ledger.review_ack, "WRITE_PERMISSIONS",
                                      {"admin", "maintain", "write", "read"}))))
+    import re as _re  # noqa: PLC0415
+    check("runs not mapped to their PR through the reviewer's run link -> fails",
+          bool(mutated(lambda: patch(ledger, "RUN_LINK", _re.compile(r"(?!x)x")))))
     real_derive = ledger.derive_verdict.derive
 
     def errored_reads_as_pass(*a, **kw):
