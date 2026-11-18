@@ -509,6 +509,7 @@ runs:
         RUN_ID: ${{ github.run_id }}
         RUN_NONCE: ${{ github.run_id }}-${{ github.run_attempt }}
         REVIEW_AUTHOR: ${{ inputs.review_author }}
+        PR_AUTHOR: ${{ github.event.pull_request.user.login }}
       shell: bash
       run: |
         set -uo pipefail
@@ -551,7 +552,8 @@ runs:
         done < "$work/ackers.txt"
 
         if ! result=$(python3 "$parser" --author "$REVIEW_AUTHOR" --run-id "$RUN_ID" \
-             --permissions "$work/permissions.json" < "$work/comments.jsonl"); then
+             --permissions "$work/permissions.json" --pr-author "${PR_AUTHOR:-}" \
+             < "$work/comments.jsonl"); then
           review_anyway "the ack parser failed."
         fi
         acknowledged=$(printf '%s' "$result" | jq -r '.acknowledged' 2>/dev/null || echo false)
@@ -565,6 +567,13 @@ runs:
         fi
 
         acker=$(printf '%s' "$result" | jq -r '.acker')
+        # Recorded, not gated (Jaryl, 18 Nov 2026): the PR author may ack their
+        # own findings, and the outcome ledger reports how often they do.
+        case "$(printf '%s' "$result" | jq -r '.acker_is_pr_author')" in
+          true) self_ack=true; who="the PR author" ;;
+          false) self_ack=false; who="not the PR author" ;;
+          *) self_ack=unknown; who="PR author unknown" ;;
+        esac
         ack_url=$(printf '%s' "$result" | jq -r '.ack_url')
         review_url=$(printf '%s' "$result" | jq -r '.review_url')
         marker="<!-- claude-review-verdict: ACKNOWLEDGED run=${RUN_NONCE} -->"
@@ -572,13 +581,15 @@ runs:
           echo "acknowledged=true"
           echo "verdict=ACKNOWLEDGED"
           echo "marker=${marker}"
+          echo "acker=${acker}"
+          echo "acker_is_pr_author=${self_ack}"
         } >> "$GITHUB_OUTPUT"
         echo "::notice title=Claude Code Review BLOCKING findings acknowledged::${reason} No new review ran on this attempt. Ack: ${ack_url} ${marker}"
         {
           echo "### :ballot_box_with_check: Claude Code Review — BLOCKING findings acknowledged by a human"
           echo
           echo "The review for run \`${RUN_ID}\` (${review_url}) raised BLOCKING findings."
-          echo "\`${acker}\` (write access) acknowledged every one of them in ${ack_url},"
+          echo "\`${acker}\` (write access; ${who}) acknowledged every one of them in ${ack_url},"
           echo "so this re-run is green **without a new review**. This is a human override,"
           echo "not a reviewer pass."
           echo

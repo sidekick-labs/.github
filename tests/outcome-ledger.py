@@ -80,6 +80,22 @@ def main():
     check("an errored review counted as PASS -> fails",
           bool(mutated(lambda: patch(ledger.derive_verdict, "derive", errored_reads_as_pass))))
 
+    real_evaluate = ledger.review_ack.evaluate
+
+    def author_ignored(*a, **kw):
+        kw.pop("pr_author", None)
+        return real_evaluate(*a, **kw)
+    check("the PR author not passed to the ack rule (self-acks unrecorded) -> fails",
+          bool(mutated(lambda: patch(ledger.review_ack, "evaluate", author_ignored))))
+
+    def every_ack_by_author(*a, **kw):
+        out = real_evaluate(*a, **kw)
+        if out["acknowledged"]:
+            out["acker_is_pr_author"] = True
+        return out
+    check("every ack counted as a self-ack -> fails",
+          bool(mutated(lambda: patch(ledger.review_ack, "evaluate", every_ack_by_author))))
+
     real_compute = ledger.compute
 
     def every_run_success(facts, now, *a, **kw):
@@ -97,9 +113,24 @@ def main():
     check("schema 1, repo, generated_at, window_days 30",
           out["schema"] == 1 and out["repo"] == "o/r" and out["window_days"] == 30
           and out["generated_at"].endswith("Z"))
-    check("every agent carries exactly the shared keys",
-          all(set(a) == {"agent", "verdicts", "by_verdict", "outcomes", "unknown", "notes"}
+    shared = {"agent", "verdicts", "by_verdict", "outcomes", "unknown", "notes"}
+    check("every agent carries the shared keys, and only claude-review adds `acks`",
+          all(set(a) == shared | ({"acks"} if a["agent"] == "claude-review" else set())
               for a in out["agents"]))
+    acks = next(a for a in out["agents"] if a["agent"] == "claude-review")["acks"]
+    check("acks: 2 valid acks, 1 by the PR's own author, share 0.5, per-acker breakdown",
+          acks == {"total": 2, "by_pr_author": 1, "not_pr_author": 1, "pr_author_unknown": 0,
+                   "self_ack_share": 0.5, "by_acker": {"writer": {"total": 2, "by_pr_author": 1}}},
+          acks)
+    check("the self-ack share is explained in notes",
+          "self_ack_share" in next(a for a in out["agents"] if a["agent"] == "claude-review")["notes"])
+    legacy = json.loads(json.dumps(facts))
+    for p in legacy["pulls"]:
+        p.pop("author", None)
+    la = next(a for a in ledger.compute(legacy, now)["agents"] if a["agent"] == "claude-review")
+    check("facts without PR authors: acks counted as author-unknown, share null (never guessed)",
+          la["acks"]["pr_author_unknown"] == 2 and la["acks"]["self_ack_share"] is None, la["acks"])
+    check("the summary reports the self-ack share", "self-ack share 50%" in ledger.summary_markdown(out))
     check("unknown reasons are spelled out in notes",
           "PR still open" in next(a for a in out["agents"] if a["agent"] == "claude-review")["notes"])
     empty = ledger.compute({"repo": "o/r", "pulls": [], "commits": [], "review_runs": [],

@@ -83,7 +83,7 @@ def check(label, ok, detail=""):
     if ok:
         print(f"  ok   {label}")
     else:
-        print(f"  FAIL {label}{(' -- ' + detail) if detail else ''}")
+        print(f"  FAIL {label}{(' -- ' + str(detail)) if detail else ''}")
         failures.append(label)
 
 
@@ -478,7 +478,7 @@ def ack_comments(*acks, review=ACK_BLOCKING, run_id=RUN_ID):
     return rows
 
 
-def run_ack_step(script, comments, permissions, gh_ok=True):
+def run_ack_step(script, comments, permissions, gh_ok=True, pr_author="alice"):
     """Execute the ack STEP against a stubbed `gh`. `permissions` maps login ->
     permission; a login absent from it makes the permission lookup fail.
     Returns (exit_code, stdout, step_summary, outputs)."""
@@ -503,7 +503,7 @@ def run_ack_step(script, comments, permissions, gh_ok=True):
                     "GITHUB_STEP_SUMMARY": summary, "GITHUB_ACTION_PATH": ACTION_DIR,
                     "RUNNER_TEMP": d, "REPO": "o/r", "PR": "1", "RUN_ID": RUN_ID,
                     "RUN_NONCE": RUN_ID + "-2", "GH_TOKEN": "stub",
-                    "REVIEW_AUTHOR": REVIEW_AUTHOR})
+                    "REVIEW_AUTHOR": REVIEW_AUTHOR, "PR_AUTHOR": pr_author})
         proc = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", script], env=env,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         outputs = {}
@@ -545,6 +545,18 @@ def ack_section(src):
     check("  ... findings carry the reviewer's titles in the check's numbering",
           "nil dereference" in r["findings"][0]["title"]
           and "transaction" in r["findings"][1]["title"], r["findings"])
+    check("  ... without a PR author, whether the acker is the author is null (not guessed)",
+          r["acker_is_pr_author"] is None, r)
+    evp = lambda cs, author: review_ack.evaluate(cs, REVIEW_AUTHOR, RUN_ID, W, pr_author=author)  # noqa: E731
+    r = evp(ack_comments(("alice", GOOD_ACK)), "alice")
+    check("the PR author may acknowledge their own findings, and it is recorded",
+          r["acknowledged"] and r["acker"] == "alice" and r["acker_is_pr_author"] is True
+          and "(the PR author)" in r["reason"], r)
+    r = evp(ack_comments(("alice", GOOD_ACK)), "Dave")
+    check("an ack by someone else is recorded as not the PR author",
+          r["acknowledged"] and r["acker_is_pr_author"] is False and "not the PR author" in r["reason"], r)
+    check("login comparison is case-insensitive",
+          evp(ack_comments(("alice", GOOD_ACK)), "Alice")["acker_is_pr_author"] is True)
     check("partial ack (1 of 2) -> not acknowledged",
           not ev(ack_comments(("alice", GOOD_ACK.rsplit("\n", 1)[0])))["acknowledged"])
     check("ack numbering a finding that does not exist -> not acknowledged",
@@ -588,6 +600,14 @@ def ack_section(src):
     check("  ... summary names the acker and each finding's human verdict",
           "alice" in summ and "**false-positive**" in summ and "**fixed**" in summ, summ)
     check("  ... and a ::notice, not an ::error", "::notice" in out and "::error" not in out)
+    check("  ... the acker and that they are the PR author are recorded (outputs, summary)",
+          o.get("acker") == "alice" and o.get("acker_is_pr_author") == "true"
+          and "the PR author" in summ, (o, summ))
+    rc, out, summ, o = run_ack_step(script, ack_comments(("alice", GOOD_ACK)), {"alice": "write"},
+                                    pr_author="dave")
+    check("  ... an ack by a non-author is recorded as such",
+          rc == 0 and o.get("acknowledged") == "true" and o.get("acker_is_pr_author") == "false"
+          and "not the PR author" in summ, (o, summ))
     for name, comments, perms, kw in [
         ("no ack", ack_comments(), {}, {}),
         ("read-only acker", ack_comments(("bob", GOOD_ACK)), {"bob": "read"}, {}),

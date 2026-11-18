@@ -41,17 +41,20 @@ WHO MAY ACKNOWLEDGE, AND WHICH ACK COUNTS
 * Only acks created AFTER the reviewer's comment for this run count, and the
   NEWEST authorized one is the one evaluated (a later ack supersedes an earlier
   one, including one that was valid).
-* The PR author is allowed. That is a deliberate choice for a team where most PRs
-  are opened from the one human account; it is listed as an open question on the
-  introducing PR, not settled here.
+* The PR author is allowed (Jaryl's ruling, 18 Nov 2026): most PRs here are opened
+  from the one human account. An agent driving that account can therefore ack as
+  its human, so every ack RECORDS whether the acker is the PR author
+  (`acker_is_pr_author`), and the outcome ledger reports the self-acknowledged
+  share. `null` means the PR author was not supplied.
 
 I/O
 ---
 stdin: JSON lines `{id, login, user_type, created_at, html_url, body}` (the
 composite's `gh api ... | tojson`). `--permissions FILE` is a JSON object
 `{login: permission}`. Prints ONE JSON object:
-`{acknowledged, reason, review_url, ack_url, acker, findings: [{n, title,
-verdict, evidence}], ignored_unauthorized}`. Exit 0 whenever it printed that.
+`{acknowledged, reason, review_url, ack_url, acker, acker_is_pr_author,
+findings: [{n, title, verdict, evidence}], ignored_unauthorized}`. `--pr-author`
+is the PR's opener; without it `acker_is_pr_author` is null. Exit 0 whenever it printed that.
 """
 import argparse
 import json
@@ -121,13 +124,14 @@ def parse_ack(body):
     return {"lines": parsed, "errors": errors}
 
 
-def evaluate(comments, author, run_id, permissions):
+def evaluate(comments, author, run_id, permissions, pr_author=None):
     """Decide whether this run's BLOCKING findings are all acknowledged.
 
     Pure over already-fetched facts, so the outcome ledger replays exactly this
     rule rather than a copy of it."""
     out = {"acknowledged": False, "reason": "", "review_url": "", "ack_url": "",
-           "acker": "", "findings": [], "ignored_unauthorized": 0}
+           "acker": "", "acker_is_pr_author": None, "findings": [],
+           "ignored_unauthorized": 0}
 
     # The reviewer's comment for this run, from ANY attempt: the ack lane only
     # runs on a re-run, so the BLOCKING review is an earlier attempt's.
@@ -171,6 +175,8 @@ def evaluate(comments, author, run_id, permissions):
     ack = acks[-1]
     out["ack_url"] = ack.get("html_url") or ""
     out["acker"] = ack.get("login") or ""
+    if pr_author:
+        out["acker_is_pr_author"] = out["acker"].lower() == pr_author.lower()
     parsed = parse_ack(ack.get("body"))
     problems = list(parsed["errors"])
     extra = sorted(n for n in parsed["lines"] if not 1 <= n <= len(titles))
@@ -189,7 +195,9 @@ def evaluate(comments, author, run_id, permissions):
         out["findings"].append({"n": n, "title": title, "verdict": verdict,
                                 "evidence": evidence})
     out["acknowledged"] = True
-    out["reason"] = f"All {len(titles)} BLOCKING finding(s) acknowledged by {out['acker']}."
+    by = out["acker"] + {True: " (the PR author)", False: " (not the PR author)",
+                         None: ""}[out["acker_is_pr_author"]]
+    out["reason"] = f"All {len(titles)} BLOCKING finding(s) acknowledged by {by}."
     return out
 
 
@@ -198,11 +206,13 @@ def main():
     ap.add_argument("--author", required=True)
     ap.add_argument("--run-id", required=True)
     ap.add_argument("--permissions", required=True)
+    ap.add_argument("--pr-author", default="")
     a = ap.parse_args()
     with open(a.permissions) as fh:
         permissions = json.load(fh)
     comments = [json.loads(l) for l in sys.stdin if l.strip()]
-    print(json.dumps(evaluate(comments, a.author, a.run_id, permissions)))
+    print(json.dumps(evaluate(comments, a.author, a.run_id, permissions,
+                              pr_author=a.pr_author or None)))
 
 
 if __name__ == "__main__":

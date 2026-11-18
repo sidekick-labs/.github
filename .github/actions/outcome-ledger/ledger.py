@@ -24,6 +24,13 @@ JSON document in the shared shape (schema 1):
                  "outcomes": {"<verdict>": {"<outcome>": n}}, "unknown": n,
                  "notes": "..."}]}
 
+One additive key, so schema 1 readers that ignore unknown keys are unaffected:
+`claude-review` also carries `acks` = {"total", "by_pr_author", "not_pr_author",
+"pr_author_unknown", "self_ack_share", "by_acker": {login: {"total",
+"by_pr_author"}}}, counting the valid `/review-ack`s behind its acked_* outcomes.
+`self_ack_share` is by_pr_author / (total - pr_author_unknown), null when that
+is 0. Its meaning is repeated in the agent's `notes`.
+
 THE ONE RULE THAT MATTERS
 -------------------------
 A verdict whose outcome cannot be read counts as `unknown`, never as a good outcome.
@@ -169,6 +176,7 @@ class Tally:
         self.agent, self.notes = agent, notes
         self.by_verdict, self.outcomes, self.unknown = {}, {}, 0
         self.unknown_why = {}
+        self.acks = None  # only the review agent has human acks
 
     def add(self, verdict, outcome=None, unknown_why=None):
         self.by_verdict[verdict] = self.by_verdict.get(verdict, 0) + 1
@@ -180,15 +188,34 @@ class Tally:
         bucket = self.outcomes.setdefault(verdict, {})
         bucket[outcome] = bucket.get(outcome, 0) + 1
 
+    def add_ack(self, acker, is_pr_author):
+        """Record who acknowledged one acked verdict. `is_pr_author` None = the
+        PR's author could not be read."""
+        if self.acks is None:
+            self.acks = {"total": 0, "by_pr_author": 0, "not_pr_author": 0,
+                         "pr_author_unknown": 0, "by_acker": {}}
+        key = {True: "by_pr_author", False: "not_pr_author", None: "pr_author_unknown"}
+        self.acks["total"] += 1
+        self.acks[key[is_pr_author]] += 1
+        who = self.acks["by_acker"].setdefault(acker or "unknown", {"total": 0, "by_pr_author": 0})
+        who["total"] += 1
+        who["by_pr_author"] += 1 if is_pr_author else 0
+
     def render(self):
         notes = self.notes
         if self.unknown_why:
             notes += " Unknown here: " + ", ".join(
                 f"{n} {why}" for why, n in sorted(self.unknown_why.items())) + "."
-        return {"agent": self.agent, "verdicts": sum(self.by_verdict.values()),
-                "by_verdict": dict(sorted(self.by_verdict.items())),
-                "outcomes": {k: dict(sorted(v.items())) for k, v in sorted(self.outcomes.items())},
-                "unknown": self.unknown, "notes": notes}
+        out = {"agent": self.agent, "verdicts": sum(self.by_verdict.values()),
+               "by_verdict": dict(sorted(self.by_verdict.items())),
+               "outcomes": {k: dict(sorted(v.items())) for k, v in sorted(self.outcomes.items())},
+               "unknown": self.unknown, "notes": notes}
+        if self.acks is not None:
+            a = dict(self.acks, by_acker=dict(sorted(self.acks["by_acker"].items())))
+            known = a["total"] - a["pr_author_unknown"]
+            a["self_ack_share"] = round(a["by_pr_author"] / known, 4) if known else None
+            out["acks"] = a
+        return out
 
 
 # --------------------------------------------------------------------------- compute
@@ -216,7 +243,14 @@ def compute(facts, now, window_days=30, settle_days=7):
                    "BLOCKING as the last verdict and no ack), closed_unmerged. PASS: merged (last "
                    f"verdict, merged, not reverted after {settle_days} days), reverted (merged "
                    "then reverted), superseded (a later push was reviewed again), "
-                   "closed_unmerged.")
+                   "closed_unmerged. `acks` (additive to schema 1) counts the valid "
+                   "/review-acks behind the acked_* outcomes and who posted them: by_pr_author "
+                   "is an ack by the PR's own author (allowed, so an agent driving that human's "
+                   "account can ack its own findings), and self_ack_share = by_pr_author / acks "
+                   "whose PR author is known (null if none). A high share means the override "
+                   "is mostly self-certification, not a second pair of eyes.")
+    review.acks = {"total": 0, "by_pr_author": 0, "not_pr_author": 0,
+                   "pr_author_unknown": 0, "by_acker": {}}
     # A run's `pull_requests` is EMPTY once its PR is merged and its branch is gone
     # (measured: on sidekick-inference only the dependabot runs carried one). The
     # reviewer's own tracking comment links its run, so that link is the mapping.
@@ -246,7 +280,8 @@ def compute(facts, now, window_days=30, settle_days=7):
             continue
         ack = None
         if verdict["verdict"] == "BLOCKING":
-            ack = review_ack.evaluate(pr_comments, REVIEW_AUTHOR, run["run_id"], permissions)
+            ack = review_ack.evaluate(pr_comments, REVIEW_AUTHOR, run["run_id"], permissions,
+                                      pr_author=pulls[run["pr"]].get("author"))
         per_pr.setdefault(run["pr"], []).append(
             {"at": at, "verdict": verdict["verdict"], "conclusion": run["conclusion"],
              "ack": ack if ack and ack["acknowledged"] else None})
@@ -265,6 +300,7 @@ def compute(facts, now, window_days=30, settle_days=7):
             if v == "BLOCKING" and r["ack"]:
                 fp = any(f["verdict"] == "false-positive" for f in r["ack"]["findings"])
                 review.add(v, "acked_false_positive" if fp else "acked_fixed")
+                review.add_ack(r["ack"]["acker"], r["ack"]["acker_is_pr_author"])
             elif later:
                 if v == "BLOCKING":
                     review.add(v, "later_pass" if later[0]["verdict"] == "PASS" else "later_blocking")
@@ -537,7 +573,8 @@ def collect(api, now, window_days=30, log=print):
         pulls.append({"number": p["number"], "title": p["title"], "state": p["state"],
                       "created_at": p["created_at"], "merged_at": p.get("merged_at"),
                       "merge_commit_sha": p.get("merge_commit_sha"),
-                      "head_ref": p["head"]["ref"], "body": p.get("body") or ""})
+                      "head_ref": p["head"]["ref"], "body": p.get("body") or "",
+                      "author": (p.get("user") or {}).get("login")})
     numbers = {p["number"] for p in pulls}
 
     log("default-branch commits since the window opened…")
@@ -677,15 +714,16 @@ def planted_world(now):
                 "updated_at": at, "html_url": f"https://github.com/o/r/pull/x#issuecomment-{i}",
                 "body": body}
 
-    def pr(n, title, created, merged, sha, ref, state="closed", body=""):
+    def pr(n, title, created, merged, sha, ref, state="closed", body="", author="writer"):
         return {"number": n, "title": title, "state": state, "created_at": d(created),
                 "merged_at": d(merged) if merged is not None else None,
-                "merge_commit_sha": sha, "head_ref": ref, "body": body}
+                "merge_commit_sha": sha, "head_ref": ref, "body": body, "author": author}
 
     pulls = [
         pr(1, "Add Foo", 21, 20, "a" * 40, "feat/foo"),        # PASS, merged, then REVERTED
         pr(2, "Add Bar", 19, 18, "b" * 40, "feat/bar"),        # BLOCKING merged anyway
-        pr(3, "Add Baz", 17, 16, "c" * 40, "feat/baz"),        # BLOCKING acked false-positive
+        pr(3, "Add Baz", 17, 16, "c" * 40, "feat/baz"),        # BLOCKING acked false-positive BY ITS AUTHOR
+        pr(11, "Add Corge", 16, 15, "2" * 40, "feat/corge", author="someone"),  # acked fixed by a reviewer
         pr(4, "Add Qux", 3, 2, "d" * 40, "feat/qux"),          # PASS merged 2 days ago: unknown
         pr(5, "WIP", 5, None, None, "feat/wip", state="open"),  # PASS on an open PR: unknown
         pr(6, "Add Quux", 14, 12, "e" * 40, "feat/quux"),      # BLOCKING -> PASS -> contradicted
@@ -702,6 +740,7 @@ def planted_world(now):
         # pr None: the runs API dropped the PR; the reviewer comment links it.
         {"run_id": "201", "pr": None, "created_at": d(19), "conclusion": "failure"},
         {"run_id": "301", "pr": 3, "created_at": d(17), "conclusion": "success"},  # acked re-run
+        {"run_id": "1101", "pr": 11, "created_at": d(16), "conclusion": "success"},  # acked re-run
         {"run_id": "401", "pr": 4, "created_at": d(3), "conclusion": "success"},
         {"run_id": "501", "pr": 5, "created_at": d(5), "conclusion": "success"},
         {"run_id": "601", "pr": 6, "created_at": d(14), "conclusion": "failure"},
@@ -721,6 +760,9 @@ def planted_world(now):
             c(5, "writer", d(16, 12),
               "/review-ack\n1. false-positive — Foo#bar is only called after the nil guard in x.rb:12",
               "User")],
+        11: [c(13, REVIEW_AUTHOR, d(16), _lane("1101", blocking)),
+             c(14, "writer", d(15, 12),
+               "/review-ack\n1. fixed — added the nil guard to Foo#bar in 7c1e2d3", "User")],
         4: [c(6, REVIEW_AUTHOR, d(3), _lane("401", passing)),
             # The interactive @claude lane: same author, a run that is not a review run.
             c(12, REVIEW_AUTHOR, d(2, 12), _lane("999", blocking))],
@@ -761,8 +803,12 @@ def planted_world(now):
     expected = {
         "claude-review": {"PASS": {"reverted": 1, "merged": 0, "superseded": 1},
                           "BLOCKING": {"merged_anyway": 1, "acked_false_positive": 1,
-                                       "later_pass": 1},
-                          "unknown": 3, "verdicts": 8},  # #4 fresh, #5 open, run 603 contradicted
+                                       "acked_fixed": 1, "later_pass": 1},
+                          "unknown": 3, "verdicts": 9,  # #4 fresh, #5 open, run 603 contradicted
+                          # #3 acked by its own author "writer"; #11 acked by "writer",
+                          # whose author is "someone": one self-ack of two.
+                          "acks": {"total": 2, "by_pr_author": 1, "not_pr_author": 1,
+                                   "pr_author_unknown": 0, "self_ack_share": 0.5}},
         "post-deploy-triage": {"clean/high": {"reverted": 1, "no_follow_up": 0},
                                "likely problem/high": {"suspect_files_touched_later": 1},
                                "clean/medium": {"no_follow_up": 1},
@@ -797,8 +843,12 @@ def self_test(compute_fn=None, now=None):
         for key in ("unknown", "verdicts"):
             if a[key] != want[key]:
                 failures.append(f"{name}: {key} is {a[key]}, planted {want[key]}")
+        for key, n in want.get("acks", {}).items():
+            got = (a.get("acks") or {}).get(key)
+            if got != n:
+                failures.append(f"{name}: acks.{key} is {got}, planted {n}")
         for verdict, outs in want.items():
-            if verdict in ("unknown", "verdicts"):
+            if verdict in ("unknown", "verdicts", "acks"):
                 continue
             for outcome, n in outs.items():
                 got = a["outcomes"].get(verdict, {}).get(outcome, 0)
@@ -817,6 +867,13 @@ def summary_markdown(ledger):
             outs = ", ".join(f"{k} {x}" for k, x in a["outcomes"].get(v, {}).items())
             lines.append(f"| {a['agent']} | {v} | {n} | {outs} |")
         lines.append(f"| {a['agent']} | **unknown** | {a['unknown']} | of {a['verdicts']} |")
+    for a in ledger["agents"]:
+        k = a.get("acks")
+        if k and k["total"]:
+            share = "n/a" if k["self_ack_share"] is None else f"{k['self_ack_share']:.0%}"
+            lines += ["", f"`{a['agent']}` /review-acks: {k['total']}, by the PR's own author "
+                      f"{k['by_pr_author']} (self-ack share {share}; author unknown "
+                      f"{k['pr_author_unknown']})."]
     return "\n".join(lines) + "\n"
 
 

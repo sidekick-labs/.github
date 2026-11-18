@@ -206,7 +206,9 @@ and then presses **Re-run failed jobs** (which also needs write access).
 - If the ack is valid, the step writes the composite-authored
   `<!-- claude-review-verdict: ACKNOWLEDGED run=<id>-<attempt> -->` marker, a
   `::notice` and a step summary with one row per finding (human verdict, evidence,
-  acker, link to the ack), then skips the review. The check is **green with no
+  acker, link to the ack), then skips the review. It also records whether the
+  acker is the PR author (`acker`, `acker_is_pr_author` step outputs; "the PR
+  author" / "not the PR author" in the summary and notice). The check is **green with no
   model spend**.
 - Otherwise (no ack, an invalid ack, an unauthorized one, unreadable comments) it
   writes `acknowledged=false` and the attempt **reviews from scratch**, exactly as a
@@ -217,12 +219,14 @@ and then presses **Re-run failed jobs** (which also needs write access).
 record. The run's step summary and annotation reproduce it with the marker. The
 outcome ledger (`.github/actions/outcome-ledger`) replays the same `review_ack.evaluate`
 and counts the BLOCKING verdict as `acked_false_positive` (any finding marked
-false-positive) or `acked_fixed`.
+false-positive) or `acked_fixed`, and reports the self-acknowledged share per
+repo (`acks.self_ack_share`; see [outcome-ledger.md](outcome-ledger.md)).
 
-**Known limit.** The PR author may acknowledge their own PR's findings. Agents
-that act with a human's token can post an ack as that human. The permission check
-cannot tell those apart, so the override is exactly as trustworthy as the tokens
-that hold write access.
+**Known limit.** The PR author may acknowledge their own PR's findings (Jaryl's
+ruling, 18 Nov 2026). Agents that act with a human's token can post an ack as that
+human. The permission check cannot tell those apart, so the override is exactly as
+trustworthy as the tokens that hold write access. That is why every ack records
+whether its author opened the PR, and the ledger reports how often they did.
 
 ## Skips stay green, and stay legible
 
