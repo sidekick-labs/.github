@@ -489,6 +489,40 @@ def validate_triage_json(doc, path):
     return verdict, (confidence if confidence in CONFIDENCES else None), files
 
 
+def collect_review_runs(api, start, now, numbers):
+    """Every review run created in [start, now].
+
+    The runs API returns at most 1000 results per query (sidekick-harness runs
+    more than that in 30 days), so the window is walked in date slices and any
+    slice that reaches the cap is split until it does not."""
+    runs, seen = [], set()
+
+    def walk(lo, hi):
+        q = {"created": f"{lo.isoformat()}..{hi.isoformat()}", "per_page": 1}
+        total = api.get(f"repos/{api.repo}/actions/workflows/{REVIEW_WORKFLOW}/runs", q)["total_count"]
+        if total >= 1000 and hi > lo:
+            mid = lo + (hi - lo) // 2
+            walk(lo, mid)
+            walk(mid + dt.timedelta(days=1), hi)
+            return
+        if total >= 1000:
+            raise RuntimeError(f"more than 1000 review runs on {lo}; cannot list them all")
+        if not total:
+            return
+        for r in api.paged(f"repos/{api.repo}/actions/workflows/{REVIEW_WORKFLOW}/runs",
+                           {"created": f"{lo.isoformat()}..{hi.isoformat()}"}, key="workflow_runs"):
+            if r["id"] in seen:
+                continue
+            seen.add(r["id"])
+            prs = [x["number"] for x in r.get("pull_requests") or [] if x["number"] in numbers]
+            runs.append({"run_id": str(r["id"]), "pr": prs[0] if prs else None,
+                         "created_at": r["created_at"], "conclusion": r.get("conclusion"),
+                         "head_sha": r["head_sha"]})
+
+    walk(start.date(), now.date())
+    return runs
+
+
 def collect(api, now, window_days=30, log=print):
     """Gather every fact `compute` needs. Read-only."""
     start = now - dt.timedelta(days=window_days)
@@ -512,13 +546,7 @@ def collect(api, now, window_days=30, log=print):
                for c in api.paged(f"repos/{repo}/commits", {"sha": default, "since": iso(start)})]
 
     log("review runs…")
-    runs = []
-    for r in api.paged(f"repos/{repo}/actions/workflows/{REVIEW_WORKFLOW}/runs",
-                       {"created": f">={start.date().isoformat()}"}, key="workflow_runs"):
-        prs = [x["number"] for x in r.get("pull_requests") or [] if x["number"] in numbers]
-        runs.append({"run_id": str(r["id"]), "pr": prs[0] if prs else None,
-                     "created_at": r["created_at"], "conclusion": r.get("conclusion"),
-                     "head_sha": r["head_sha"]})
+    runs = collect_review_runs(api, start, now, numbers)
 
     log(f"comments on {len(numbers)} PR(s)…")
     comments = {}

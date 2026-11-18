@@ -152,6 +152,34 @@ def main():
           r.when(pr=12, after=ledger.parse_ts("2026-11-11T00:00:00Z")) is None)
     check("unrelated PR not reverted", r.when(pr=13, sha="1234567") is None)
 
+    print("review-run listing beats the API's 1000-result cap:")
+
+    class FakeApi:
+        """1500 runs over 10 days (150/day); any query whose range holds >= 1000
+        runs is truncated to 1000, as the real API does."""
+        repo = "o/r"
+
+        def __init__(self):
+            base = dt.datetime(2026, 11, 1, 12, tzinfo=dt.timezone.utc)
+            self.runs = [{"id": i, "created_at": ledger.iso(base + dt.timedelta(days=i // 150)),
+                          "conclusion": "success", "head_sha": "x", "pull_requests": []}
+                         for i in range(1500)]
+
+        def _in(self, q):
+            lo, hi = q["created"].split("..")
+            return [r for r in self.runs if lo <= r["created_at"][:10] <= hi]
+
+        def get(self, path, q):
+            return {"total_count": len(self._in(q))}
+
+        def paged(self, path, q, key=None):
+            yield from self._in(q)[:1000]
+
+    got = ledger.collect_review_runs(FakeApi(), dt.datetime(2026, 11, 1, tzinfo=dt.timezone.utc),
+                                     dt.datetime(2026, 11, 10, tzinfo=dt.timezone.utc), set())
+    check("all 1500 runs listed, none twice", len(got) == 1500 and len({r["run_id"] for r in got}) == 1500,
+          len(got))
+
     print("composite:")
     try:
         import yaml  # noqa: PLC0415
