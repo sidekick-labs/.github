@@ -1,0 +1,104 @@
+name: 'CI-agent outcome ledger'
+description: >-
+  Counts this repository's CI-agent verdicts (review, post-deploy triage, autofix)
+  against what later happened, in the shared schema-1 ledger shape, and publishes
+  it to an unprotected branch. No model calls. See ledger.py for the rules.
+
+# Two modes, so a caller can keep the read and write tokens in separate jobs:
+#
+#   compute  (job token: contents, pull-requests and actions READ)
+#            runs the planted-wrong-verdict self-test FIRST — a classifier that
+#            has gone blind fails the job and nothing is computed — then reads the
+#            last `window_days` of this repo and uploads `ledger.json` as the
+#            `outcome-ledger` artifact (and into the step summary).
+#   publish  (job token: contents WRITE, nothing else)
+#            downloads that artifact and commits `ledger/<YYYY-MM-DD>.json` and
+#            `ledger/latest.json` to `branch` through the git data API, creating
+#            the branch as an orphan the first time. Only those two paths are
+#            ever written. The branch must NOT be covered by a ruleset; `main`
+#            requires PRs, which is why the ledger does not live there.
+#
+# The audit (rarebit-sre llm-evals) reads `ledger/latest.json` from each repo's
+# branch and merges them, so the shape is fixed: change it only with schema 2.
+
+inputs:
+  mode:
+    description: '`compute` or `publish`.'
+    required: true
+  github_token:
+    description: 'The calling job''s GITHUB_TOKEN.'
+    required: true
+  window_days:
+    description: 'How far back verdicts are counted.'
+    required: false
+    default: '30'
+  settle_days:
+    description: >-
+      How old a good-looking outcome (merged and not reverted, nothing followed a
+      clean triage) must be before it counts as good. Younger ones are `unknown`.
+    required: false
+    default: '7'
+  pace_seconds:
+    description: 'Seconds between API calls.'
+    required: false
+    default: '0.3'
+  branch:
+    description: 'Branch the ledger is published to.'
+    required: false
+    default: 'outcome-ledger'
+
+outputs:
+  ledger_path:
+    description: 'compute: path of the ledger JSON on the runner.'
+    value: ${{ steps.compute.outputs.ledger_path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Compute the ledger (self-test first)
+      id: compute
+      if: inputs.mode == 'compute'
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        REPO: ${{ github.repository }}
+        WINDOW_DAYS: ${{ inputs.window_days }}
+        SETTLE_DAYS: ${{ inputs.settle_days }}
+        PACE: ${{ inputs.pace_seconds }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        out="${RUNNER_TEMP}/outcome-ledger"
+        mkdir -p "$out"
+        python3 "${GITHUB_ACTION_PATH}/ledger.py" --self-test
+        python3 "${GITHUB_ACTION_PATH}/ledger.py" compute --repo "$REPO" \
+          --window-days "$WINDOW_DAYS" --settle-days "$SETTLE_DAYS" --pace "$PACE" \
+          --out "$out/ledger.json"
+        echo "ledger_path=$out/ledger.json" >> "$GITHUB_OUTPUT"
+
+    - name: Upload the ledger
+      if: inputs.mode == 'compute'
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: outcome-ledger
+        path: ${{ steps.compute.outputs.ledger_path }}
+        retention-days: 30
+        if-no-files-found: error
+
+    - name: Download the ledger
+      if: inputs.mode == 'publish'
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        name: outcome-ledger
+        path: ${{ runner.temp }}/outcome-ledger
+
+    - name: Publish to the ledger branch
+      if: inputs.mode == 'publish'
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        REPO: ${{ github.repository }}
+        BRANCH: ${{ inputs.branch }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 "${GITHUB_ACTION_PATH}/ledger.py" publish --repo "$REPO" \
+          --file "${RUNNER_TEMP}/outcome-ledger/ledger.json" --branch "$BRANCH"

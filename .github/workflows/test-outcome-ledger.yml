@@ -1,0 +1,41 @@
+name: Test outcome-ledger logic
+
+# Regression gate for the CI-agent outcome ledger (EVAL-010,
+# `.github/actions/outcome-ledger`). The ledger's whole value is that it never
+# reads an unknown outcome as a good one; `tests/outcome-ledger.py` runs its
+# planted-wrong-verdict self-test and then breaks the classifier six ways
+# (no settle window, reverts unread, a read-only ack honoured, an errored review
+# read as PASS, contradicted conclusions unnoticed, runs left unmapped to their
+# PR) and requires the self-test to
+# go red each time. Network-free.
+#
+# Watches the review composite's parsers too: the ledger imports
+# `derive_verdict.py` and `review_ack.py` rather than copying them.
+on:
+  pull_request:
+    paths:
+      - '.github/actions/outcome-ledger/**'
+      - '.github/actions/claude-review/derive_verdict.py'
+      - '.github/actions/claude-review/review_ack.py'
+      - 'tests/outcome-ledger.py'
+      - '.github/workflows/test-outcome-ledger.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/actions/outcome-ledger/**'
+      - '.github/actions/claude-review/derive_verdict.py'
+      - '.github/actions/claude-review/review_ack.py'
+      - 'tests/outcome-ledger.py'
+      - '.github/workflows/test-outcome-ledger.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  outcome-ledger-logic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - name: Run outcome-ledger tests
+        run: python3 tests/outcome-ledger.py

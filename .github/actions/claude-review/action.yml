@@ -98,14 +98,16 @@ outputs:
   verdict:
     description: >-
       PASS or BLOCKING, as DERIVED by this composite from the reviewer's
-      severity labels. Empty when the lane skipped or the verdict was
-      undeterminable (the job is then red, or green-with-a-skip-reason).
-    value: ${{ steps.derive.outputs.verdict }}
+      severity labels, or ACKNOWLEDGED when a re-run was cleared by a human
+      `/review-ack` (no review ran on that attempt). Empty when the lane skipped
+      or the verdict was undeterminable (the job is then red, or
+      green-with-a-skip-reason).
+    value: ${{ steps.derive.outputs.verdict || steps.ack.outputs.verdict }}
   marker:
     description: >-
-      The composite-authored `<!-- claude-review-verdict: <PASS|BLOCKING>
-      run=<run_id>-<attempt> -->` marker the gate step accepted.
-    value: ${{ steps.derive.outputs.marker }}
+      The composite-authored `<!-- claude-review-verdict:
+      <PASS|BLOCKING|ACKNOWLEDGED> run=<run_id>-<attempt> -->` marker.
+    value: ${{ steps.derive.outputs.marker || steps.ack.outputs.marker }}
 
 runs:
   using: composite
@@ -474,8 +476,137 @@ runs:
             || echo "::warning::Could not post the mechanical-skip notice to PR #${PR} (needs \`pull-requests: write\`); the reason is in the step summary and the run annotation."
         fi
 
+    # ---------------------------------------------------------------------
+    # A HUMAN ACKNOWLEDGEMENT OF THE PREVIOUS ATTEMPT'S BLOCKING FINDINGS
+    # (EVAL-028, modelled on fundbright-web's `/findings-ack`).
+    #
+    # Runs ONLY on a re-run (`run_attempt` > 1) of a run whose review said
+    # BLOCKING. A fresh push is a new run id, so it always gets a fresh review;
+    # an ack can never carry over to code the reviewer has not seen.
+    #
+    # The flow: the check goes red on BLOCKING; a user with WRITE access (or
+    # maintain/admin) posts a `/review-ack` comment with one numbered
+    # `fixed` / `false-positive` line per finding; someone with write access
+    # presses "Re-run failed jobs". This step then re-derives the earlier
+    # attempt's verdict with the same parser (`derive_verdict.py`), checks the
+    # NEWEST authorized ack covers every finding exactly once
+    # (`review_ack.py`), and on success writes the composite-authored
+    # `ACKNOWLEDGED` marker and skips the review entirely (no model spend).
+    #
+    # It can only ever turn a re-run green by skipping the review. Every
+    # failure here — unreadable comments, an unreadable permission, a partial
+    # or malformed ack, no ack at all — writes `acknowledged=false`, and the
+    # attempt reviews from scratch exactly as a re-run did before this step
+    # existed. It never fails the job and never reads a marker from a comment.
+    # ---------------------------------------------------------------------
+    - name: Honour a human acknowledgement of BLOCKING findings
+      id: ack
+      if: steps.reviewable.outputs.skip != 'true' && steps.token-check.outputs.skip != 'true' && github.event.pull_request.user.login != 'dependabot[bot]' && steps.mechanical.outputs.skip != 'true' && github.run_attempt != '1'
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        REPO: ${{ github.repository }}
+        PR: ${{ github.event.pull_request.number }}
+        RUN_ID: ${{ github.run_id }}
+        RUN_NONCE: ${{ github.run_id }}-${{ github.run_attempt }}
+        REVIEW_AUTHOR: ${{ inputs.review_author }}
+        PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+      shell: bash
+      run: |
+        set -uo pipefail
+
+        # `acknowledged` is written EXACTLY ONCE, by one of these two functions.
+        review_anyway() {
+          echo "No acknowledgement applies: $1 Reviewing this attempt from scratch."
+          echo "acknowledged=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        }
+
+        parser="${GITHUB_ACTION_PATH:-}/review_ack.py"
+        if [ ! -f "$parser" ] || ! command -v python3 >/dev/null 2>&1; then
+          review_anyway "the ack parser or python3 is unavailable."
+        fi
+        work="${RUNNER_TEMP:-/tmp}/claude-review-ack"
+        mkdir -p "$work"
+
+        if ! gh api --paginate "repos/${REPO}/issues/${PR}/comments" \
+             --jq '.[] | {id: .id, login: .user.login, user_type: .user.type, created_at: .created_at, html_url: .html_url, body: .body} | tojson' \
+             > "$work/comments.jsonl" 2>/dev/null; then
+          review_anyway "the comments on PR #${PR} could not be read."
+        fi
+
+        # Permission of every human who posted a `/review-ack`. A lookup that
+        # fails leaves the login out of the map, which the parser treats as NOT
+        # authorized.
+        echo '{}' > "$work/permissions.json"
+        jq -r 'select(.user_type == "User" and (.body | test("(^|\n)[[:space:]]*/review-ack"; "i"))) | .login' \
+          "$work/comments.jsonl" 2>/dev/null | sort -u > "$work/ackers.txt" || true
+        while IFS= read -r login; do
+          [ -n "$login" ] || continue
+          perm=$(gh api "repos/${REPO}/collaborators/${login}/permission" --jq '.permission' 2>/dev/null || true)
+          case "$perm" in
+            admin|maintain|write|triage|read|none) ;;
+            *) echo "::notice::Could not read ${login}'s permission on ${REPO}; their /review-ack is not counted."; continue ;;
+          esac
+          jq --arg l "$login" --arg p "$perm" '. + {($l): $p}' "$work/permissions.json" > "$work/p.tmp" \
+            && mv "$work/p.tmp" "$work/permissions.json"
+        done < "$work/ackers.txt"
+
+        if ! result=$(python3 "$parser" --author "$REVIEW_AUTHOR" --run-id "$RUN_ID" \
+             --permissions "$work/permissions.json" --pr-author "${PR_AUTHOR:-}" \
+             < "$work/comments.jsonl"); then
+          review_anyway "the ack parser failed."
+        fi
+        acknowledged=$(printf '%s' "$result" | jq -r '.acknowledged' 2>/dev/null || echo false)
+        reason=$(printf '%s' "$result" | jq -r '.reason // ""' 2>/dev/null || true)
+        ignored=$(printf '%s' "$result" | jq -r '.ignored_unauthorized // 0' 2>/dev/null || echo 0)
+        if [ "${ignored:-0}" != "0" ]; then
+          echo "::warning title=Unauthorized /review-ack ignored::${ignored} /review-ack comment(s) on PR #${PR} came from a bot or from a user without write access and were not counted."
+        fi
+        if [ "$acknowledged" != "true" ]; then
+          review_anyway "$reason"
+        fi
+
+        acker=$(printf '%s' "$result" | jq -r '.acker')
+        # Recorded, not gated (Jaryl, 18 Nov 2026): the PR author may ack their
+        # own findings, and the outcome ledger reports how often they do.
+        case "$(printf '%s' "$result" | jq -r '.acker_is_pr_author')" in
+          true) self_ack=true; who="the PR author" ;;
+          false) self_ack=false; who="not the PR author" ;;
+          *) self_ack=unknown; who="PR author unknown" ;;
+        esac
+        ack_url=$(printf '%s' "$result" | jq -r '.ack_url')
+        review_url=$(printf '%s' "$result" | jq -r '.review_url')
+        marker="<!-- claude-review-verdict: ACKNOWLEDGED run=${RUN_NONCE} -->"
+        {
+          echo "acknowledged=true"
+          echo "verdict=ACKNOWLEDGED"
+          echo "marker=${marker}"
+          echo "acker=${acker}"
+          echo "acker_is_pr_author=${self_ack}"
+        } >> "$GITHUB_OUTPUT"
+        echo "::notice title=Claude Code Review BLOCKING findings acknowledged::${reason} No new review ran on this attempt. Ack: ${ack_url} ${marker}"
+        {
+          echo "### :ballot_box_with_check: Claude Code Review — BLOCKING findings acknowledged by a human"
+          echo
+          echo "The review for run \`${RUN_ID}\` (${review_url}) raised BLOCKING findings."
+          echo "\`${acker}\` (write access; ${who}) acknowledged every one of them in ${ack_url},"
+          echo "so this re-run is green **without a new review**. This is a human override,"
+          echo "not a reviewer pass."
+          echo
+          echo "| # | finding | human verdict | evidence |"
+          echo "|---|---|---|---|"
+          printf '%s' "$result" | jq -r '.findings[] | "| \(.n) | \(.title | gsub("\\|"; "/")) | **\(.verdict)** | \(.evidence | gsub("\\|"; "/")) |"' 2>/dev/null || true
+          echo
+          echo "Composite-authored marker:"
+          echo
+          echo "\`${marker}\`"
+          echo
+          echo "${marker}"
+        } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+        exit 0
+
     - name: Checkout repository
-      if: steps.reviewable.outputs.skip != 'true' && steps.token-check.outputs.skip != 'true' && github.event.pull_request.user.login != 'dependabot[bot]' && steps.mechanical.outputs.skip != 'true'
+      if: steps.reviewable.outputs.skip != 'true' && steps.token-check.outputs.skip != 'true' && github.event.pull_request.user.login != 'dependabot[bot]' && steps.mechanical.outputs.skip != 'true' && steps.ack.outputs.acknowledged != 'true'
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
       with:
         fetch-depth: 1
@@ -486,14 +617,14 @@ runs:
     # the same run id. The value is the runner's clock, written by this step.
     - name: Open the review window
       id: review_window
-      if: steps.reviewable.outputs.skip != 'true' && steps.token-check.outputs.skip != 'true' && github.event.pull_request.user.login != 'dependabot[bot]' && steps.mechanical.outputs.skip != 'true'
+      if: steps.reviewable.outputs.skip != 'true' && steps.token-check.outputs.skip != 'true' && github.event.pull_request.user.login != 'dependabot[bot]' && steps.mechanical.outputs.skip != 'true' && steps.ack.outputs.acknowledged != 'true'
       shell: bash
       run: |
         echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
     - name: Run Claude Code Review
       id: review
-      if: steps.reviewable.outputs.skip != 'true' && steps.token-check.outputs.skip != 'true' && github.event.pull_request.user.login != 'dependabot[bot]' && steps.mechanical.outputs.skip != 'true'
+      if: steps.reviewable.outputs.skip != 'true' && steps.token-check.outputs.skip != 'true' && github.event.pull_request.user.login != 'dependabot[bot]' && steps.mechanical.outputs.skip != 'true' && steps.ack.outputs.acknowledged != 'true'
       # continue-on-error only so the RETRY + verify steps below get to run —
       # NOT because a failure here is acceptable. claude-code-action >=
       # v1.0.168 hard-fails the step when the run's result record carries
@@ -964,9 +1095,9 @@ runs:
           if [ -n "$url" ]; then echo "Source: the reviewer's comment for this run — ${url}"; fi
           if [ "$verdict" = "BLOCKING" ]; then
             echo
-            echo "BLOCKING-labelled findings:"
+            echo "BLOCKING-labelled findings (numbered for \`/review-ack\`):"
             echo
-            printf '%s' "$result" | jq -r '.blocking[] | "- " + .' 2>/dev/null || true
+            printf '%s' "$result" | jq -r '.blocking | to_entries[] | "\(.key + 1). " + .value' 2>/dev/null || true
           fi
           echo
           echo "Composite-authored marker (the only one the gate accepts):"
@@ -1028,8 +1159,17 @@ runs:
             echo "*because* the check set is dense, so a review that objects must be able to"
             echo "hold the merge. Style, simplification and nit findings do **not** land here."
             echo
-            echo "To unblock: fix the finding and push, or reply on the PR explaining why it"
-            echo "is not a defect and re-run the check."
+            echo "To unblock, either fix the finding and push (a new review runs), or, if"
+            echo "you have write access, acknowledge EVERY finding in one PR comment, numbered"
+            echo "as the \`Derive the review verdict\` summary above numbers them, then press"
+            echo "**Re-run failed jobs**. The re-run skips the review and goes green with an"
+            echo "\`ACKNOWLEDGED\` marker; your comment is the permanent record."
+            echo
+            echo '```'
+            echo '/review-ack'
+            echo '1. false-positive — <why the finding is not a defect, with a file:line>'
+            echo '2. fixed — <what changed, and where>'
+            echo '```'
           } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
           exit 1
         fi
