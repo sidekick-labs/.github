@@ -449,6 +449,177 @@ TRANSIENT_5XX = result_record(is_error=True, duration_ms=900, num_turns=1,
 CLEAN_REVIEW = result_record()
 
 
+# --- the /review-ack override (EVAL-028) -----------------------------------
+ACK_STEP = "Honour a human acknowledgement of BLOCKING findings"
+sys.path.insert(0, ACTION_DIR)
+import review_ack  # noqa: E402
+
+ACK_BLOCKING = ("**BLOCKING — nil dereference in Foo#bar**\n\nDetails.\n\n"
+                "**BLOCKING — missing transaction around the transfer**\n\nMore.\n\n"
+                "**ADVISORY — naming**")
+REVIEW_AT = "2026-09-24T10:01:00Z"
+AFTER = "2026-09-24T11:00:00Z"
+GOOD_ACK = ("/review-ack\n"
+            "1. false-positive — Foo#bar is only reached after the nil guard at x.rb:12\n"
+            "2. fixed — wrapped the transfer in a transaction in 4f2a1c9")
+
+
+def ack_comments(*acks, review=ACK_BLOCKING, run_id=RUN_ID):
+    """The reviewer's BLOCKING comment for `run_id`, then each ack as
+    (login, body[, user_type[, created_at]])."""
+    rows = [{"id": 1, "login": REVIEW_AUTHOR, "user_type": "Bot", "created_at": REVIEW_AT,
+             "html_url": "https://github.com/o/r/pull/1#issuecomment-1",
+             "body": lane(review, run_id=run_id)}]
+    for i, a in enumerate(acks, 2):
+        login, body = a[0], a[1]
+        rows.append({"id": i, "login": login, "user_type": a[2] if len(a) > 2 else "User",
+                     "created_at": a[3] if len(a) > 3 else AFTER,
+                     "html_url": f"https://github.com/o/r/pull/1#issuecomment-{i}", "body": body})
+    return rows
+
+
+def run_ack_step(script, comments, permissions, gh_ok=True):
+    """Execute the ack STEP against a stubbed `gh`. `permissions` maps login ->
+    permission; a login absent from it makes the permission lookup fail.
+    Returns (exit_code, stdout, step_summary, outputs)."""
+    with tempfile.TemporaryDirectory() as d:
+        summary, out = os.path.join(d, "summary"), os.path.join(d, "gh_output")
+        open(summary, "w").close()
+        open(out, "w").close()
+        bindir = os.path.join(d, "bin")
+        os.makedirs(bindir)
+        with open(os.path.join(d, "comments.jsonl"), "w") as fh:
+            fh.write("\n".join(json.dumps(c) for c in comments) + "\n")
+        perm_cases = "".join(f"    *collaborators/{l}/permission*) echo {p} ;;\n"
+                             for l, p in permissions.items())
+        gh = os.path.join(bindir, "gh")
+        with open(gh, "w") as fh:
+            fh.write("#!/bin/sh\n" + ("exit 1\n" if not gh_ok else
+                     f'case "$*" in\n    */comments*) cat {d}/comments.jsonl ;;\n'
+                     f'{perm_cases}    *) exit 1 ;;\nesac\n'))
+        os.chmod(gh, 0o755)
+        env = dict(os.environ)
+        env.update({"PATH": bindir + os.pathsep + env["PATH"], "GITHUB_OUTPUT": out,
+                    "GITHUB_STEP_SUMMARY": summary, "GITHUB_ACTION_PATH": ACTION_DIR,
+                    "RUNNER_TEMP": d, "REPO": "o/r", "PR": "1", "RUN_ID": RUN_ID,
+                    "RUN_NONCE": RUN_ID + "-2", "GH_TOKEN": "stub",
+                    "REVIEW_AUTHOR": REVIEW_AUTHOR})
+        proc = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", script], env=env,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        outputs = {}
+        for line in open(out):
+            if "=" in line:
+                k, v = line.rstrip("\n").split("=", 1)
+                outputs[k] = v
+        return proc.returncode, proc.stdout, open(summary).read(), outputs
+
+
+def ack_section(src):
+    print("/review-ack grammar (review_ack.parse_ack):")
+    p = review_ack.parse_ack(GOOD_ACK)
+    check("two numbered lines parse", p and p["lines"] == {
+        1: ("false-positive", "Foo#bar is only reached after the nil guard at x.rb:12"),
+        2: ("fixed", "wrapped the transfer in a transaction in 4f2a1c9")} and not p["errors"], p)
+    check("not an ack -> None", review_ack.parse_ack("LGTM, thanks") is None)
+    check("an ack quoted in a fence is not an ack",
+          review_ack.parse_ack("see:\n```\n/review-ack\n1. fixed — whatever it was\n```") is None)
+    for body, why in [
+        ("/review-ack\n1. wont-fix — we accept the risk here", "verdict outside fixed/false-positive"),
+        ("/review-ack\n1. fixed — ok", "evidence under 10 characters"),
+        ("/review-ack\n1. fixed", "no separator / evidence"),
+        ("/review-ack\n1. fixed — changed x.rb:3 to guard\n1. false-positive — no it is fine really",
+         "a finding acknowledged twice"),
+    ]:
+        check(f"rejects: {why}", bool(review_ack.parse_ack(body)["errors"]))
+    check("`false positive`, colon separator and **bold** verdicts accepted",
+          review_ack.parse_ack("/review-ack\n1) **False Positive**: guarded at x.rb:12 already")
+          ["lines"] == {1: ("false-positive", "guarded at x.rb:12 already")})
+
+    print("/review-ack gate rule (review_ack.evaluate):")
+    W = {"alice": "write"}
+    ev = lambda cs, perms=W: review_ack.evaluate(cs, REVIEW_AUTHOR, RUN_ID, perms)  # noqa: E731
+    r = ev(ack_comments(("alice", GOOD_ACK)))
+    check("writer acks every BLOCKING finding -> acknowledged",
+          r["acknowledged"] and [f["verdict"] for f in r["findings"]] == ["false-positive", "fixed"]
+          and r["acker"] == "alice", r)
+    check("  ... findings carry the reviewer's titles in the check's numbering",
+          "nil dereference" in r["findings"][0]["title"]
+          and "transaction" in r["findings"][1]["title"], r["findings"])
+    check("partial ack (1 of 2) -> not acknowledged",
+          not ev(ack_comments(("alice", GOOD_ACK.rsplit("\n", 1)[0])))["acknowledged"])
+    check("ack numbering a finding that does not exist -> not acknowledged",
+          not ev(ack_comments(("alice", GOOD_ACK + "\n3. fixed — a third thing entirely")))["acknowledged"])
+    check("read-only user -> not acknowledged, and counted as ignored",
+          (lambda x: not x["acknowledged"] and x["ignored_unauthorized"] == 1)(
+              ev(ack_comments(("bob", GOOD_ACK)), {"bob": "read"})))
+    check("permission unreadable (absent from the map) -> not acknowledged (fail closed)",
+          not ev(ack_comments(("carol", GOOD_ACK)), {})["acknowledged"])
+    check("a bot, even with write -> not acknowledged",
+          not ev(ack_comments(("sidekick-labs-bot", GOOD_ACK, "Bot")),
+                 {"sidekick-labs-bot": "write"})["acknowledged"])
+    check("the reviewer acknowledging itself -> not acknowledged",
+          not ev(ack_comments((REVIEW_AUTHOR, GOOD_ACK, "User")),
+                 {REVIEW_AUTHOR: "admin"})["acknowledged"])
+    check("an ack posted BEFORE the review -> not acknowledged",
+          not ev(ack_comments(("alice", GOOD_ACK, "User", "2026-09-24T09:00:00Z")))["acknowledged"])
+    check("the NEWEST authorized ack decides (a later broken ack supersedes a valid one)",
+          not ev(ack_comments(("alice", GOOD_ACK),
+                              ("alice", "/review-ack\n1. fixed — only the first one, sorry",
+                               "User", "2026-09-24T12:00:00Z")))["acknowledged"])
+    check("a PASS review has nothing to acknowledge",
+          not ev(ack_comments(("alice", GOOD_ACK), review="No BLOCKING findings. **ADVISORY — x**"))
+          ["acknowledged"])
+    check("an ack of ANOTHER run's review does not apply to this run",
+          not ev(ack_comments(("alice", GOOD_ACK), run_id="12345"))["acknowledged"])
+    check("an errored review cannot be acknowledged",
+          not review_ack.evaluate(
+              [{"id": 1, "login": REVIEW_AUTHOR, "user_type": "Bot", "created_at": REVIEW_AT,
+                "html_url": "u", "body": lane("x", finished=False)},
+               {"id": 2, "login": "alice", "user_type": "User", "created_at": AFTER,
+                "html_url": "v", "body": GOOD_ACK}], REVIEW_AUTHOR, RUN_ID, W)["acknowledged"])
+
+    print("/review-ack step (executed under bash -e, stubbed gh):")
+    script = step_script(src, ACK_STEP)
+    rc, out, summ, o = run_ack_step(script, ack_comments(("alice", GOOD_ACK)), {"alice": "write"})
+    check("valid ack -> exit 0, acknowledged=true, verdict ACKNOWLEDGED",
+          rc == 0 and o.get("acknowledged") == "true" and o.get("verdict") == "ACKNOWLEDGED", (rc, o, out))
+    check("  ... composite-authored ACKNOWLEDGED marker bound to this run+attempt",
+          o.get("marker") == f"<!-- claude-review-verdict: ACKNOWLEDGED run={RUN_ID}-2 -->", o)
+    check("  ... summary names the acker and each finding's human verdict",
+          "alice" in summ and "**false-positive**" in summ and "**fixed**" in summ, summ)
+    check("  ... and a ::notice, not an ::error", "::notice" in out and "::error" not in out)
+    for name, comments, perms, kw in [
+        ("no ack", ack_comments(), {}, {}),
+        ("read-only acker", ack_comments(("bob", GOOD_ACK)), {"bob": "read"}, {}),
+        ("permission lookup fails", ack_comments(("carol", GOOD_ACK)), {}, {}),
+        ("partial ack", ack_comments(("alice", GOOD_ACK.rsplit("\n", 1)[0])), {"alice": "write"}, {}),
+        ("comments unreadable", ack_comments(("alice", GOOD_ACK)), {"alice": "write"}, {"gh_ok": False}),
+    ]:
+        rc, out, summ, o = run_ack_step(script, comments, perms, **kw)
+        check(f"{name} -> exit 0 with acknowledged=false (review from scratch, never red, never green)",
+              rc == 0 and o.get("acknowledged") == "false" and "marker" not in o, (rc, o, out))
+    rc, out, _, _ = run_ack_step(script, ack_comments(("bob", GOOD_ACK)), {"bob": "read"})
+    check("an unauthorized ack is reported as a ::warning", "::warning" in out, out)
+
+    print("/review-ack structural guards:")
+    ack_blk = strip_comments(step_block(src, ACK_STEP))
+    check("the ack step runs only on a re-run (attempt > 1), so a new push always gets a review",
+          "github.run_attempt != '1'" in ack_blk)
+    check("the ack step can never fail the job (no `exit 1`, not continue-on-error-dependent)",
+          "exit 1" not in ack_blk and "continue-on-error" not in ack_blk)
+    check("the ack step writes `acknowledged` exactly once per path",
+          ack_blk.count('"acknowledged=') == 2, ack_blk.count('"acknowledged='))
+    for name in (CHECKOUT_STEP, WINDOW_STEP, REVIEW_STEP):
+        check(f"'{name}' is skipped when the findings were acknowledged",
+              "steps.ack.outputs.acknowledged != 'true'" in step_block(src, name))
+    ack_pos, review_pos = src.index("- name: " + ACK_STEP), src.index("- name: " + REVIEW_STEP)
+    check("the ack step runs before the review", ack_pos < review_pos)
+    check("the composite's verdict/marker outputs include the ack path",
+          "steps.ack.outputs.verdict" in src and "steps.ack.outputs.marker" in src)
+    check("the BLOCKING summary tells a human how to /review-ack",
+          "/review-ack" in step_block(src, VERDICT_STEP))
+
+
 def main():
     # `src` is the COMPOSITE: every step script under test lives there now.
     with open(ACTION) as fh:
@@ -1098,6 +1269,8 @@ def main():
     # next person to edit the review finds the check unmergeable with no
     # explanation of why.
     # ---------------------------------------------------------------------
+    ack_section(src)
+
     # ---------------------------------------------------------------------
     # IS THE COMPOSITE A VALID COMPOSITE?
     #

@@ -167,6 +167,63 @@ Properties that are deliberate:
   against real review bodies in `tests/fixtures/review-verdict/` (private-repo
   bodies are structure-preserving redactions — this repo is public).
 
+## The human override: `/review-ack` (EVAL-028)
+
+A BLOCKING verdict used to have one way back to green: a new commit and a new
+review. A reviewer that was simply wrong had no override, and nothing recorded how
+often it was wrong. `/review-ack` is that override, modelled on fundbright-web's
+`/findings-ack` but keyed on this gate's own BLOCKING derivation. Only the override
+was ported, not fundbright's separate findings gate.
+
+**How it is used.** The red check's `Derive the review verdict` summary numbers the
+BLOCKING findings. A user with **write, maintain or admin** permission on the repo
+posts one PR comment covering every finding:
+
+```
+/review-ack
+1. false-positive — Foo#bar is only reached after the nil guard at x.rb:12
+2. fixed — wrapped the transfer in a transaction in 4f2a1c9
+```
+
+and then presses **Re-run failed jobs** (which also needs write access).
+
+**What decides it** (`review_ack.py`, pinned by `tests/review-gate-exit-codes.py`):
+
+- The `Honour a human acknowledgement of BLOCKING findings` step runs only on a
+  re-run (`run_attempt` > 1). A new push is a new run id and always gets a fresh
+  review, so an ack never carries over to code the reviewer has not seen.
+- It re-derives the earlier attempt's verdict for the same run id with
+  `derive_verdict.py`. Only a BLOCKING review can be acknowledged.
+- Only comments created after that review count. Of those, the newest one from an
+  authorized human is evaluated. "Authorized" means `user.type == User`, not the
+  review author, and a permission of `admin`, `maintain` or `write` according to
+  `GET /repos/{repo}/collaborators/{login}/permission`. If that lookup fails, the
+  user is not authorized. `author_association` is not used, because under a
+  workflow token it reads `NONE` for private-org members.
+- Each line is `<n>. fixed|false-positive — <evidence of at least 10 characters>`,
+  covering every finding 1..N exactly once. A partial, repeated, out-of-range or
+  malformed ack is invalid as a whole.
+- If the ack is valid, the step writes the composite-authored
+  `<!-- claude-review-verdict: ACKNOWLEDGED run=<id>-<attempt> -->` marker, a
+  `::notice` and a step summary with one row per finding (human verdict, evidence,
+  acker, link to the ack), then skips the review. The check is **green with no
+  model spend**.
+- Otherwise (no ack, an invalid ack, an unauthorized one, unreadable comments) it
+  writes `acknowledged=false` and the attempt **reviews from scratch**, exactly as a
+  re-run did before. The step can never fail the job, and it can only turn a
+  re-run green by way of a valid ack.
+
+**What is recorded, and where.** The ack comment on the PR is the permanent
+record. The run's step summary and annotation reproduce it with the marker. The
+outcome ledger (`.github/actions/outcome-ledger`) replays the same `review_ack.evaluate`
+and counts the BLOCKING verdict as `acked_false_positive` (any finding marked
+false-positive) or `acked_fixed`.
+
+**Known limit.** The PR author may acknowledge their own PR's findings. Agents
+that act with a human's token can post an ack as that human. The permission check
+cannot tell those apart, so the override is exactly as trustworthy as the tokens
+that hold write access.
+
 ## Skips stay green, and stay legible
 
 A skipped lane must still conclude `success`. The skip is **step**-gated, never
