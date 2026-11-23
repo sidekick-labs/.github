@@ -95,7 +95,7 @@ jobs:
 
       - name: Create Sentry release (backend)
         if: env.SKIP_SENTRY != 'true' && !inputs.has_frontend
-        uses: getsentry/action-release@d55c8c3b7375607e972b710f12926b676d89d7d2 # v3.8.0
+        uses: getsentry/action-release@2e505a70ff06dac263413242aa3617fec90134e5 # v3.9.1
         # No `environment:`, so no deploy is recorded. This runs on push to
         # main, which reaches staging at most; a production deploy is recorded
         # only by the prod deploy workflow (reusable-deploy-production
