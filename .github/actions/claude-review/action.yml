@@ -666,6 +666,7 @@ runs:
             introduces, a test that asserts nothing it claims to assert; or an
             injection, authz/authn, secret-handling, SSRF or unsafe-deserialisation
             flaw. The test is: **merging this as-is ships a defect.**
+            In YAML files (workflows, config, fixtures), flag as BLOCKING any unquoted `on`/`off`/`yes`/`no`/`y`/`n` where a string is meant: YAML 1.1 parsers (incl. GitHub Actions inputs and js-yaml/PyYAML defaults) read them as booleans.
           - **ADVISORY** — everything else. Simplification, reuse, naming, style,
             nits, formatting, "consider", speculative performance, extra test
             coverage you would like, documentation. Real value, but not a defect.
@@ -757,6 +758,7 @@ runs:
             introduces, a test that asserts nothing it claims to assert; or an
             injection, authz/authn, secret-handling, SSRF or unsafe-deserialisation
             flaw. The test is: **merging this as-is ships a defect.**
+            In YAML files (workflows, config, fixtures), flag as BLOCKING any unquoted `on`/`off`/`yes`/`no`/`y`/`n` where a string is meant: YAML 1.1 parsers (incl. GitHub Actions inputs and js-yaml/PyYAML defaults) read them as booleans.
           - **ADVISORY** — everything else. Simplification, reuse, naming, style,
             nits, formatting, "consider", speculative performance, extra test
             coverage you would like, documentation. Real value, but not a defect.
